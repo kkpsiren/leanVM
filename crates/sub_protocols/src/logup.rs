@@ -131,46 +131,62 @@ pub fn prove_generic_logup(
         let trace = &traces[table];
         let log_n_rows = trace.log_n_rows;
         let buses = table.bus_interactions();
-        let mem_groups = memory_lookup_groups(&buses);
 
-        let mut next_group = 0;
+        // Coalesce consecutive memory-lookup buses sharing the same `idx_col`
+        // (offsets 0, 1, 2, …) into a single nested par_iter. Per-bus dispatch
+        // wastes time for poseidon (37 buses) because each `par_iter_mut` pays
+        // rayon's sync overhead.
         let mut bus_idx = 0;
         while bus_idx < buses.len() {
-            if next_group < mem_groups.len() && mem_groups[next_group].start_bus == bus_idx {
-                let group = &mem_groups[next_group];
-                let group_len = group.value_cols.len();
-                let col_index = &trace.columns[group.idx_col];
-                let packed_chunk_size = (1 << log_n_rows) / width;
+            let bus = &buses[bus_idx];
+            if bus.is_memory_lookup() {
+                let (idx_col, ofs0, first_val_col) = bus.as_memory_lookup();
+                debug_assert_eq!(ofs0, 0);
+                let mut run_len = 1;
+                while bus_idx + run_len < buses.len() {
+                    let next = &buses[bus_idx + run_len];
+                    if !next.is_memory_lookup() {
+                        break;
+                    }
+                    let (n_idx, n_ofs, n_val) = next.as_memory_lookup();
+                    if n_idx != idx_col || n_ofs != run_len || n_val != first_val_col + run_len {
+                        break;
+                    }
+                    run_len += 1;
+                }
 
-                numerators[offset..][..group_len << log_n_rows]
+                // Memory-lookup buses are Push + multiplicity One, so numerators are
+                // F::ONE across the whole run — a single par_iter_mut fills them all.
+                numerators[offset..][..run_len << log_n_rows]
                     .par_iter_mut()
                     .for_each(|n| *n = F::ONE);
 
-                denominators[offset / width..][..group_len * packed_chunk_size]
+                // Denominators: nested par over (col-in-run, row).
+                let packed_chunk_size = (1 << log_n_rows) / width;
+                let idx_col_ref: &[F] = &trace.columns[idx_col];
+                denominators[offset / width..][..run_len * packed_chunk_size]
                     .par_chunks_exact_mut(packed_chunk_size)
                     .enumerate()
-                    .for_each(|(i, denom_chunk)| {
-                        let i_field = F::from_usize(i);
-                        let col_value = &trace.columns[group.value_cols[i]];
+                    .for_each(|(k, denom_chunk)| {
+                        let k_field = F::from_usize(k);
+                        let val_col_ref: &[F] = &trace.columns[first_val_col + k];
                         denom_chunk.par_iter_mut().enumerate().for_each(|(p, slot)| {
                             *slot = c_packed
                                 - finger_print_packed::<EF>(
                                     memory_domainsep_packed,
                                     &[
-                                        PFPacking::<EF>::from_fn(|w| col_index[src_idx(p, w)] + i_field),
-                                        PFPacking::<EF>::from_fn(|w| col_value[src_idx(p, w)]),
+                                        PFPacking::<EF>::from_fn(|w| idx_col_ref[src_idx(p, w)] + k_field),
+                                        PFPacking::<EF>::from_fn(|w| val_col_ref[src_idx(p, w)]),
                                     ],
                                     &alphas_packed,
                                 );
                         });
                     });
-                offset += group_len << log_n_rows;
-                bus_idx += group_len;
-                next_group += 1;
+                offset += run_len << log_n_rows;
+                bus_idx += run_len;
                 continue;
             }
 
-            let bus = &buses[bus_idx];
             let slice = &mut numerators[offset..][..1 << log_n_rows];
             match bus.multiplicity {
                 BusMultiplicity::One => {

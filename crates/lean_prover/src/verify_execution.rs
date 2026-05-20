@@ -91,23 +91,17 @@ pub fn verify_execution(
         &table_n_vars,
     )?;
     let gkr_point = &logup_statements.gkr_point;
+    // Column claims at the GKR point are no longer pushed to WHIR — they are folded
+    // into the batched AIR sumcheck (see prove_execution.rs). Only the AIR sumcheck
+    // statement is added below.
     let mut committed_statements: CommittedStatements = Default::default();
     for table in ALL_TABLES {
-        let log_n = table_n_vars[&table];
-        committed_statements.insert(
-            table,
-            vec![(
-                MultilinearPoint(from_end(gkr_point, log_n).to_vec()),
-                logup_statements.columns_values[&table].clone(),
-                BTreeMap::new(),
-            )],
-        );
+        committed_statements.insert(table, Vec::new());
     }
 
-    let bus_beta = verifier_state.sample();
-    verifier_state.duplex();
+    // The bus's separate `bus_beta` is gone — `air_alpha_powers[1]` plays that role.
     let air_alpha = verifier_state.sample();
-    let air_alpha_powers: Vec<EF> = air_alpha.powers().collect_n(max_air_constraints() + 1);
+    let air_alpha_powers: Vec<EF> = air_alpha.powers().collect_n(max_total_constraints() + 2);
     verifier_state.duplex();
     let eta: EF = verifier_state.sample(); // batching the sumchecks proving validity of AIR tables
 
@@ -125,19 +119,32 @@ pub fn verify_execution(
     for (table, _) in &tables_sorted {
         let bus_numerator_value = logup_statements.bus_numerators_values[table];
         let bus_denominator_value = logup_statements.bus_denominators_values[table];
+        // Bus = alpha^0·multiplicity + alpha^1·fingerprint (replaces the old combined
+        // `bus_beta` formulation). Both contributions at GKR:
+        //   multiplicity_eval = bus_numerator_value * direction (direction²=1).
+        //   fingerprint_eval  = logup_c - bus_denominator_value.
         let bus_final_value = bus_numerator_value
             * match table.bus_interactions()[0].direction {
                 BusDirection::Pull => EF::NEG_ONE,
                 BusDirection::Push => EF::ONE,
             }
-            + bus_beta * (logup_c - bus_denominator_value);
+            + air_alpha_powers[1] * (logup_c - bus_denominator_value);
 
-        initial_sum += eta_power * bus_final_value;
+        // Column claims now live at alpha^{2+j} (bus consumes alpha^0 and alpha^1).
+        let logup_extra_sum = bus_final_value
+            + table
+                .logup_claim_columns()
+                .iter()
+                .enumerate()
+                .map(|(j, col)| air_alpha_powers[2 + j] * logup_statements.columns_values[table][col])
+                .sum::<EF>();
+
+        initial_sum += eta_power * logup_extra_sum;
 
         verify_data.push(TableVerifyData {
             table: *table,
             eta_power,
-            extra_data: ExtraDataForBuses::new(logup_alphas_eq_poly.clone(), bus_beta, air_alpha_powers.clone()),
+            extra_data: ExtraDataForBuses::new(logup_alphas_eq_poly.clone(), air_alpha_powers.clone()),
         });
 
         eta_power *= eta;

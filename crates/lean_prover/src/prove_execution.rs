@@ -91,14 +91,12 @@ pub fn prove_execution(
     let mut memory_acc = F::zero_vec(memory.len());
     info_span!("Building memory access count").in_scope(|| {
         for (table, trace) in &traces {
-            let buses = table.bus_interactions();
-            for group in memory_lookup_groups(&buses) {
-                let idx_col = &trace.columns[group.idx_col];
-                let n = group.value_cols.len();
-                for idx in idx_col {
-                    let base = idx.to_usize();
-                    for ofs in 0..n {
-                        memory_acc[base + ofs] += F::ONE;
+            for (idx_col, val_cols) in memory_lookup_groups(table) {
+                let n_values = val_cols.len();
+                for i in &trace.columns[idx_col] {
+                    let base = i.to_usize();
+                    for j in 0..n_values {
+                        memory_acc[base + j] += F::ONE;
                     }
                 }
             }
@@ -140,23 +138,21 @@ pub fn prove_execution(
         &traces,
     );
     let gkr_point = &logup_statements.gkr_point;
+    // Table column claims at the GKR point used to live here as the first WHIR
+    // statement per table. They are now folded into the batched AIR sumcheck via
+    // extra degree-1 `col(x)` "constraints" weighted by `alpha^{1+j}`, so only the
+    // AIR-sumcheck-point statement remains (pushed below after the sumcheck).
     let mut committed_statements: CommittedStatements = Default::default();
     for table in ALL_TABLES {
-        let log_n_rows = traces[&table].log_n_rows;
-        committed_statements.insert(
-            table,
-            vec![(
-                MultilinearPoint(from_end(gkr_point, log_n_rows).to_vec()),
-                logup_statements.columns_values[&table].clone(),
-                BTreeMap::new(),
-            )],
-        );
+        committed_statements.insert(table, Vec::new());
     }
 
-    let bus_beta = prover_state.sample();
-    prover_state.duplex();
+    // The bus's separate `bus_beta` is gone — the AIR alpha at `alpha^1` plays its
+    // role as the random combiner between the multiplicity (alpha^0) and the
+    // fingerprint (alpha^1) constraints. Need `+2` slots in `air_alpha_powers`:
+    // one for the bus's extra constraint, one for the trailing buffer.
     let air_alpha = prover_state.sample();
-    let air_alpha_powers: Vec<EF> = air_alpha.powers().collect_n(max_air_constraints() + 1);
+    let air_alpha_powers: Vec<EF> = air_alpha.powers().collect_n(max_total_constraints() + 2);
     prover_state.duplex();
     let air_eta: EF = prover_state.sample();
 
@@ -184,16 +180,29 @@ pub fn prove_execution(
     for (idx, (table, log_n_rows)) in tables_sorted.iter().enumerate() {
         let bus_numerator_value = logup_statements.bus_numerators_values[table];
         let bus_denominator_value = logup_statements.bus_denominators_values[table];
+        // Bus contribution = alpha^0 * multiplicity_eval + alpha^1 * fingerprint_eval.
+        // multiplicity_eval at GKR = `bus_numerator_value * direction` (direction²=1).
+        // fingerprint_eval at GKR = `logup_c - bus_denominator_value`.
         let bus_final_value = bus_numerator_value
             * match table.bus_interactions()[0].direction {
                 BusDirection::Pull => EF::NEG_ONE,
                 BusDirection::Push => EF::ONE,
             }
-            + bus_beta * (logup_c - bus_denominator_value);
+            + air_alpha_powers[1] * (logup_c - bus_denominator_value);
+
+        // Initial sum folds in each logup-column claim at the GKR point. Column claims
+        // now start at `alpha^{2+j}` (bus consumes alpha^0 and alpha^1).
+        let logup_extra_sum = bus_final_value
+            + table
+                .logup_claim_columns()
+                .iter()
+                .enumerate()
+                .map(|(j, col)| air_alpha_powers[2 + j] * logup_statements.columns_values[table][col])
+                .sum::<EF>();
 
         let eq_suffix = from_end(gkr_point, *log_n_rows).to_vec();
 
-        let extra_data = ExtraDataForBuses::new(logup_alphas_eq_poly.clone(), bus_beta, air_alpha_powers.clone());
+        let extra_data = ExtraDataForBuses::new(logup_alphas_eq_poly.clone(), air_alpha_powers.clone());
 
         let mut flat_and_shift: Vec<&[PF<EF>]> = column_refs[idx].to_vec();
         flat_and_shift.extend(shifted_rows[idx].iter().map(Vec::as_slice));
@@ -203,7 +212,7 @@ pub fn prove_execution(
 
         macro_rules! make_session {
             ($t:expr) => {{
-                let session = AirSumcheckSession::new(packed, eq_suffix, bus_final_value, *$t, extra_data, non_padded);
+                let session = AirSumcheckSession::new(packed, eq_suffix, logup_extra_sum, *$t, extra_data, non_padded);
                 Box::new(session) as Box<dyn OuterSumcheckSession<EF> + '_>
             }};
         }

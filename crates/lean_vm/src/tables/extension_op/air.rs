@@ -1,5 +1,6 @@
 use crate::{
-    EF, EXT_OP_FLAG_ADD, EXT_OP_FLAG_IS_BE, EXT_OP_FLAG_MUL, EXT_OP_FLAG_POLY_EQ, ExtraDataForBuses, eval_bus_virtual,
+    ColIndex, EF, EXT_OP_FLAG_ADD, EXT_OP_FLAG_IS_BE, EXT_OP_FLAG_MUL, EXT_OP_FLAG_POLY_EQ, ExtraDataForBuses,
+    bus_fingerprint,
     tables::extension_op::{EXT_OP_LEN_MULTIPLIER, ExtensionOpPrecompile},
 };
 use backend::*;
@@ -29,6 +30,31 @@ pub(super) const COL_VRES: usize = 24;
 pub(super) const COL_MULTIPLICITY_EXTENSION_OP: usize = 29;
 pub(super) const COL_DOMAINSEP_EXTENSION_OP: usize = 30;
 
+/// Sorted committed columns whose GKR-point logup evaluation is folded into the AIR
+/// sumcheck. Materialized as a `&'static` slice so the AIR's per-row evaluation does
+/// not allocate. The three memory-lookup buses cover idx_a (6) + idx_b (7) + idx_r (13)
+/// and the contiguous value ranges COL_VA..COL_VA+5, COL_VB..COL_VB+5, COL_VRES..COL_VRES+5.
+pub const EXTENSION_OP_LOGUP_CLAIM_COLUMNS: &[ColIndex] = &[
+    COL_IDX_A,
+    COL_IDX_B,
+    COL_IDX_RES,
+    COL_VA,
+    COL_VA + 1,
+    COL_VA + 2,
+    COL_VA + 3,
+    COL_VA + 4,
+    COL_VB,
+    COL_VB + 1,
+    COL_VB + 2,
+    COL_VB + 3,
+    COL_VB + 4,
+    COL_VRES,
+    COL_VRES + 1,
+    COL_VRES + 2,
+    COL_VRES + 3,
+    COL_VRES + 4,
+];
+
 use backend::quintic_extension::extension::quintic_mul;
 
 #[inline]
@@ -52,6 +78,14 @@ impl<const BUS: bool> Air for ExtensionOpPrecompile<BUS> {
     }
     fn n_shift_columns(&self) -> usize {
         COL_COMP + 5
+    }
+
+    fn logup_claim_columns(&self) -> &'static [usize] {
+        EXTENSION_OP_LOGUP_CLAIM_COLUMNS
+    }
+
+    fn has_bus(&self) -> bool {
+        BUS
     }
 
     #[inline]
@@ -96,15 +130,25 @@ impl<const BUS: bool> Air for ExtensionOpPrecompile<BUS> {
         let idx_r = flat[COL_IDX_RES];
 
         if BUS {
-            builder.assert_zero_ef(eval_bus_virtual::<AB, EF>(
-                extra_data,
-                multiplicity,
-                aux,
-                &[idx_a, idx_b, idx_r],
-            ));
+            // multiplicity (degree 2 = start * active, non-linear) and the bus
+            // fingerprint (degree 1 in cols but EF-typed, so still emitted via
+            // `assert_zero_ef` — adding a linear-EF builder method to optimize
+            // this is a follow-up).
+            builder.assert_zero(multiplicity);
+            builder.assert_zero_ef(bus_fingerprint::<AB, EF>(extra_data, aux, &[idx_a, idx_b, idx_r]));
         } else {
             builder.declare_values(&[multiplicity]);
             builder.declare_values(&[idx_a, idx_b, idx_r, aux]);
+        }
+        // Round-0 z=0 path: AIR constraints below are zero by validity, skip them.
+        if builder.bus_only() {
+            return;
+        }
+        // Reduce logup column claims at the GKR point into the AIR sumcheck. See the
+        // execution table for the rationale.
+        for &col in EXTENSION_OP_LOGUP_CLAIM_COLUMNS {
+            let val = builder.flat()[col];
+            builder.assert_zero_linear(val);
         }
 
         let is_ee = -(is_be - AB::F::ONE);

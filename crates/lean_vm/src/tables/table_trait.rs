@@ -60,6 +60,14 @@ impl BusInteraction {
     pub fn is_memory_lookup(&self) -> bool {
         matches!(self.domainsep, BusData::Constant(LOGUP_MEMORY_DOMAINSEP))
     }
+
+    /// For memory-lookup buses, returns `(idx_col, offset, val_col)`.
+    pub fn as_memory_lookup(&self) -> (ColIndex, usize, ColIndex) {
+        match self.data.as_slice() {
+            [BusData::ColumnPlusConstant(i, o), BusData::Column(v)] => (*i, *o, *v),
+            _ => panic!("memory-lookup bus must have data = [CPC(index, offset), Column(value)]"),
+        }
+    }
 }
 
 pub fn memory_lookups_consecutive(idx_col: ColIndex, values_start: ColIndex, n: usize) -> Vec<BusInteraction> {
@@ -76,64 +84,22 @@ pub fn memory_lookups_consecutive(idx_col: ColIndex, values_start: ColIndex, n: 
         .collect()
 }
 
-pub fn memory_lookup_groups(buses: &[BusInteraction]) -> Vec<MemoryLookupGroup> {
-    let mut groups: Vec<MemoryLookupGroup> = Vec::new();
-    let mut i = 0;
-    while i < buses.len() {
-        if !buses[i].is_memory_lookup() {
-            i += 1;
-            continue;
+/// Group consecutive memory-lookup buses into `(idx_col, [val_col_0, val_col_1, …])`,
+/// matching the original `LookupIntoMemory` layout.
+pub fn memory_lookup_groups<T: TableT + ?Sized>(table: &T) -> Vec<(ColIndex, Vec<ColIndex>)> {
+    let mut groups: Vec<(ColIndex, Vec<ColIndex>)> = Vec::new();
+    for bus in table.bus_interactions().iter().filter(|b| b.is_memory_lookup()) {
+        let (idx_col, offset, val_col) = bus.as_memory_lookup();
+        if offset == 0 {
+            groups.push((idx_col, vec![val_col]));
+        } else {
+            let last = groups.last_mut().expect("non-zero offset must follow offset=0");
+            assert_eq!(last.0, idx_col, "memory bus run must share index column");
+            assert_eq!(last.1.len(), offset, "memory bus offsets must be consecutive 0,1,2,…");
+            last.1.push(val_col);
         }
-        let (idx_col, first_ofs) = match buses[i].data[0] {
-            BusData::ColumnPlusConstant(c, ofs) => (c, ofs),
-            _ => unreachable!("memory-lookup bus shape is enforced by memory_lookups_consecutive"),
-        };
-        if first_ofs != 0 {
-            let value_col = match buses[i].data[1] {
-                BusData::Column(c) => c,
-                _ => unreachable!("memory-lookup bus shape is enforced by memory_lookups_consecutive"),
-            };
-            groups.push(MemoryLookupGroup {
-                start_bus: i,
-                idx_col,
-                value_cols: vec![value_col],
-            });
-            i += 1;
-            continue;
-        }
-        let mut value_cols = Vec::new();
-        let start = i;
-        let mut expected_ofs = 0;
-        while i < buses.len() && buses[i].is_memory_lookup() {
-            let ok = matches!(
-                buses[i].data[0],
-                BusData::ColumnPlusConstant(c, ofs) if c == idx_col && ofs == expected_ofs
-            );
-            if !ok {
-                break;
-            }
-            let value_col = match buses[i].data[1] {
-                BusData::Column(c) => c,
-                _ => unreachable!("memory-lookup bus shape is enforced by memory_lookups_consecutive"),
-            };
-            value_cols.push(value_col);
-            i += 1;
-            expected_ofs += 1;
-        }
-        groups.push(MemoryLookupGroup {
-            start_bus: start,
-            idx_col,
-            value_cols,
-        });
     }
     groups
-}
-
-#[derive(Debug)]
-pub struct MemoryLookupGroup {
-    pub start_bus: usize,
-    pub idx_col: ColIndex,
-    pub value_cols: Vec<ColIndex>,
 }
 
 #[derive(Debug, Default)]
@@ -161,21 +127,19 @@ pub fn sort_tables_by_height(tables_log_heights: &BTreeMap<Table, usize>) -> Vec
 
 #[derive(Debug, Default)]
 pub struct ExtraDataForBuses<EF: ExtensionField<PF<EF>>> {
-    // GKR quotient challenges
+    // GKR quotient challenges (no separate `bus_beta` anymore — the AIR alpha at
+    // `alpha^1` plays that role as the random combiner between the bus's two
+    // constraints: `multiplicity` (alpha^0) and `fingerprint` (alpha^1)).
     pub logup_alphas_eq_poly: Vec<EF>,
     pub logup_alphas_eq_poly_packed: Vec<EFPacking<EF>>,
-    pub bus_beta: EF,
-    pub bus_beta_packed: EFPacking<EF>,
     pub alpha_powers: Vec<EF>,
 }
 impl<EF: ExtensionField<PF<EF>>> ExtraDataForBuses<EF> {
-    pub fn new(logup_alphas_eq_poly: Vec<EF>, bus_beta: EF, alpha_powers: Vec<EF>) -> Self {
+    pub fn new(logup_alphas_eq_poly: Vec<EF>, alpha_powers: Vec<EF>) -> Self {
         let logup_alphas_eq_poly_packed = logup_alphas_eq_poly.iter().map(|a| EFPacking::<EF>::from(*a)).collect();
         Self {
             logup_alphas_eq_poly,
             logup_alphas_eq_poly_packed,
-            bus_beta,
-            bus_beta_packed: EFPacking::<EF>::from(bus_beta),
             alpha_powers,
         }
     }
@@ -194,17 +158,12 @@ impl AlphaPowers<EF> for ExtraDataForBuses<EF> {
 }
 
 impl<EF: ExtensionField<PF<EF>>> ExtraDataForBuses<EF> {
-    pub fn transmute_bus_data<NewEF: 'static>(&self) -> (&Vec<NewEF>, &NewEF) {
+    pub fn transmute_bus_data<NewEF: 'static>(&self) -> &Vec<NewEF> {
         if TypeId::of::<NewEF>() == TypeId::of::<EF>() {
-            unsafe { transmute::<(&Vec<EF>, &EF), (&Vec<NewEF>, &NewEF)>((&self.logup_alphas_eq_poly, &self.bus_beta)) }
+            unsafe { transmute::<&Vec<EF>, &Vec<NewEF>>(&self.logup_alphas_eq_poly) }
         } else {
             assert_eq!(TypeId::of::<NewEF>(), TypeId::of::<EFPacking<EF>>());
-            unsafe {
-                transmute::<(&Vec<EFPacking<EF>>, &EFPacking<EF>), (&Vec<NewEF>, &NewEF)>((
-                    &self.logup_alphas_eq_poly_packed,
-                    &self.bus_beta_packed,
-                ))
-            }
+            unsafe { transmute::<&Vec<EFPacking<EF>>, &Vec<NewEF>>(&self.logup_alphas_eq_poly_packed) }
         }
     }
 }
@@ -232,5 +191,14 @@ pub trait TableT: Air {
 
     fn is_execution_table(&self) -> bool {
         false
+    }
+
+    /// Total number of `assert_zero` / `assert_zero_ef` calls the AIR makes
+    /// (excluding the primary bus, which uses `alpha^0`):
+    /// `Air::logup_claim_columns().len()` extra degree-1 constraints + `n_constraints()`
+    /// AIR constraints.
+    fn n_total_constraints(&self) -> usize {
+        // `Air::logup_claim_columns` is inherited via `TableT: Air`.
+        <Self as backend::Air>::logup_claim_columns(self).len() + self.n_constraints()
     }
 }

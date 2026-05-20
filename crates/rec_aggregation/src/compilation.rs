@@ -274,6 +274,7 @@ fn build_replacements(log_inner_bytecode: usize, bytecode_zero_eval: F) -> BTree
     let mut air_degrees = vec![];
     let mut n_air_columns = vec![];
     let mut n_air_shift_columns = vec![];
+    let mut logup_claim_columns_str = vec![];
     for table in ALL_TABLES {
         let mut table_domseps = vec![];
         let mut table_data_cols = vec![];
@@ -325,6 +326,15 @@ fn build_replacements(log_inner_bytecode: usize, bytecode_zero_eval: F) -> BTree
         air_degrees.push(table.degree_air().to_string());
         n_air_columns.push(table.n_columns().to_string());
         n_air_shift_columns.push(table.n_shift_columns().to_string());
+
+        // Sorted committed columns whose GKR-point evals are folded into the batched
+        // AIR sumcheck (alpha^{2+j} weights). Matches `Air::logup_claim_columns`.
+        let this_logup_cols = table
+            .logup_claim_columns()
+            .iter()
+            .map(|c| c.to_string())
+            .collect::<Vec<_>>();
+        logup_claim_columns_str.push(format!("[{}]", this_logup_cols.join(", ")));
     }
     replacements.insert(
         "ONE_BUSES_DOMSEPS_PLACEHOLDER".to_string(),
@@ -347,12 +357,16 @@ fn build_replacements(log_inner_bytecode: usize, bytecode_zero_eval: F) -> BTree
         format!("[{}]", num_cols_air.join(", ")),
     );
     replacements.insert(
+        "LOGUP_CLAIM_COLUMNS_PLACEHOLDER".to_string(),
+        format!("[{}]", logup_claim_columns_str.join(", ")),
+    );
+    replacements.insert(
         "EXECUTION_TABLE_INDEX_PLACEHOLDER".to_string(),
         Table::execution().index().to_string(),
     );
     replacements.insert(
         "MAX_NUM_AIR_CONSTRAINTS_PLACEHOLDER".to_string(),
-        max_air_constraints().to_string(),
+        max_total_constraints().to_string(),
     );
     replacements.insert(
         "AIR_DEGREES_PLACEHOLDER".to_string(),
@@ -493,7 +507,7 @@ where
     let mut ctx = AirCodegenCtx::new();
 
     let mut res = format!(
-        "def evaluate_air_constraints_table_{}({}, air_alpha_powers, bus_beta, logup_alphas_eq_poly):\n",
+        "def evaluate_air_constraints_table_{}({}, air_alpha_powers, logup_alphas_eq_poly):\n",
         table.table().index(),
         AIR_INNER_VALUES_VAR
     );
@@ -505,7 +519,9 @@ where
         eval_air_constraint(*constraint, Some(&dest), &mut ctx, &mut res);
     }
 
-    // first: bus data
+    // Bus: emitted as TWO constraints, alpha^0 · multiplicity + alpha^1 · fingerprint.
+    // The AIR alpha at `alpha^1` takes over the role the previous separate `bus_beta`
+    // played as random combiner. Remaining AIR + logup-claim constraints start at `alpha^2`.
     let multiplicity = eval_air_constraint(bus_multiplicity, None, &mut ctx, &mut res);
     res += &format!("\n    buff = Array(DIM * {})", bus_real_data.len());
     for (i, data) in bus_real_data.iter().enumerate() {
@@ -513,24 +529,27 @@ where
         res += &format!("\n    copy_5({}, buff + DIM * {})", data_str, i);
     }
     let domainsep_str = eval_air_constraint(*bus_domainsep, None, &mut ctx, &mut res);
-    // bus_res = sum(buff[i] * logup_alphas_eq_poly[i]) + disc * logup_alphas_eq_poly.last()
-    res += "\n    bus_res_init = Array(DIM)";
+    // fingerprint = Σ buff[i] · logup_alphas_eq_poly[i] + domainsep · logup_alphas_last
+    res += "\n    fingerprint_init = Array(DIM)";
     res += &format!(
-        "\n    dot_product_ee(buff, logup_alphas_eq_poly, bus_res_init, {})",
+        "\n    dot_product_ee(buff, logup_alphas_eq_poly, fingerprint_init, {})",
         bus_real_data.len()
     );
     res += &format!(
-        "\n    bus_res: Mut = add_extension_ret(mul_extension_ret({}, logup_alphas_eq_poly + {} * DIM), bus_res_init)",
+        "\n    fingerprint: Mut = add_extension_ret(mul_extension_ret({}, logup_alphas_eq_poly + {} * DIM), fingerprint_init)",
         domainsep_str,
         (1 << LOG_MAX_BUS_WIDTH) - 1
     );
-    res += "\n    bus_res = mul_extension_ret(bus_res, bus_beta)";
-    res += &format!("\n    sum: Mut = add_extension_ret(bus_res, {})", multiplicity);
+    // sum starts with alpha^0 · multiplicity (= multiplicity) + alpha^1 · fingerprint.
+    res += &format!(
+        "\n    sum: Mut = add_extension_ret({}, mul_extension_ret(air_alpha_powers + DIM, fingerprint))",
+        multiplicity
+    );
 
-    // Batch constraint weighting: single dot_product_ee(alpha_powers, constraints_buf, result, n_constraints)
+    // Remaining AIR constraints weighted by alpha^{2+i}.
     res += "\n    weighted_constraints = Array(DIM)";
     res += &format!(
-        "\n    dot_product_ee(air_alpha_powers + DIM, constraints_buf, weighted_constraints, {})",
+        "\n    dot_product_ee(air_alpha_powers + 2 * DIM, constraints_buf, weighted_constraints, {})",
         n_constraints
     );
     res += "\n    sum = add_extension_ret(sum, weighted_constraints)";

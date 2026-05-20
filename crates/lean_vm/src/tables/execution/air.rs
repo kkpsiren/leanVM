@@ -1,9 +1,34 @@
-use crate::{EF, ExecutionTable, ExtraDataForBuses, eval_bus_virtual};
+use crate::{ColIndex, EF, ExecutionTable, ExtraDataForBuses, bus_fingerprint};
 use backend::*;
 
 pub const N_RUNTIME_COLUMNS: usize = 8;
 pub const N_INSTRUCTION_COLUMNS: usize = 12;
 pub const N_TOTAL_EXECUTION_COLUMNS: usize = N_INSTRUCTION_COLUMNS + N_RUNTIME_COLUMNS;
+
+/// Sorted committed columns whose GKR-point logup evaluation is folded into the AIR
+/// sumcheck. Materialized as a `&'static` slice so the AIR's per-row evaluation does
+/// not allocate (the trait method just clones from this).
+pub const EXECUTION_LOGUP_CLAIM_COLUMNS: &[ColIndex] = &[
+    COL_PC,
+    COL_MEM_ADDRESS_A,
+    COL_MEM_ADDRESS_B,
+    COL_MEM_ADDRESS_C,
+    COL_MEM_VALUE_A,
+    COL_MEM_VALUE_B,
+    COL_MEM_VALUE_C,
+    COL_OPERAND_A,
+    COL_OPERAND_B,
+    COL_OPERAND_C,
+    COL_FLAG_A,
+    COL_FLAG_B,
+    COL_FLAG_C,
+    COL_FLAG_C_FP,
+    COL_FLAG_AB_FP,
+    COL_MUL,
+    COL_JUMP,
+    COL_AUX,
+    COL_PRECOMPILE_DOMAINSEP,
+];
 
 // Committed columns (IMPORTANT: they must be the first columns)
 pub const COL_PC: usize = 0;
@@ -52,6 +77,14 @@ impl<const BUS: bool> Air for ExecutionTable<BUS> {
         13
     }
 
+    fn logup_claim_columns(&self) -> &'static [usize] {
+        EXECUTION_LOGUP_CLAIM_COLUMNS
+    }
+
+    fn has_bus(&self) -> bool {
+        BUS
+    }
+
     #[inline]
     fn eval<AB: AirBuilder>(&self, builder: &mut AB, extra_data: &Self::ExtraData) {
         let flat = builder.flat();
@@ -97,15 +130,33 @@ impl<const BUS: bool> Air for ExecutionTable<BUS> {
         let multiplicity = -(add + mul + deref + jump - AB::F::ONE);
 
         if BUS {
-            builder.assert_zero_ef(eval_bus_virtual::<AB, EF>(
-                extra_data,
-                multiplicity,
-                domainsep,
-                &[nu_a, nu_b, nu_c],
-            ));
+            // Bus split into two constraints (alpha^0 + alpha^1):
+            // - multiplicity (degree 2 in cols here — not linear, so plain `assert_zero`)
+            // - fingerprint = `Σ alphas[i]·data[i] + alphas_last·domainsep` (degree 2 here)
+            //   The AIR alpha at `alpha^1` plays the role the separate `bus_beta` used to.
+            builder.assert_zero(multiplicity);
+            builder.assert_zero_ef(bus_fingerprint::<AB, EF>(extra_data, domainsep, &[nu_a, nu_b, nu_c]));
         } else {
             builder.declare_values(&[multiplicity]);
             builder.declare_values(&[nu_a, nu_b, nu_c, domainsep]);
+        }
+        // Round-0 z=0 path: every AIR constraint below evaluates to zero by AIR
+        // validity at the actual table row values, so we skip their expression
+        // computation entirely. (constraint_index stays inconsistent past this
+        // point but the caller only reads `folder.accumulator` afterwards.)
+        if builder.bus_only() {
+            return;
+        }
+        // Reduce logup column claims at the GKR point into the AIR sumcheck: each
+        // logup-claim column becomes an extra degree-1 "constraint" `col(x)` weighted
+        // by the next alpha power. The session is started with an initial sum that
+        // accounts for the corresponding GKR-point evaluation, so column evals appear
+        // at the AIR sumcheck point and the WHIR statement at the GKR point is gone.
+        // Marked as linear so the AIR sumcheck prover can evaluate them twice per row
+        // (z=0 and slope) instead of once per z-point.
+        for &col in EXECUTION_LOGUP_CLAIM_COLUMNS {
+            let val = builder.flat()[col];
+            builder.assert_zero_linear(val);
         }
 
         builder.assert_zero(one_minus_flag_a_and_flag_ab_fp * (addr_a - fp_plus_operand_a));

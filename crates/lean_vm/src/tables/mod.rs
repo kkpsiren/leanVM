@@ -14,7 +14,7 @@ mod execution;
 pub use execution::*;
 
 mod utils;
-pub(crate) use utils::*;
+pub use utils::*;
 
 // In logup interractions, the `domainsep` is the last entry of every tuple going into
 // the bus. It separates the two precompile tables from each other (Poseidon16 is odd,

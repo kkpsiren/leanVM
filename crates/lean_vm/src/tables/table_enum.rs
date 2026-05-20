@@ -99,6 +99,13 @@ impl Air for Table {
     fn n_shift_columns(&self) -> usize {
         delegate_to_inner!(self, n_shift_columns)
     }
+    fn logup_claim_columns(&self) -> &'static [usize] {
+        // Use the BUS=true Air impl on each inner table.
+        delegate_to_inner!(self, logup_claim_columns)
+    }
+    fn has_bus(&self) -> bool {
+        delegate_to_inner!(self, has_bus)
+    }
     fn eval<AB: AirBuilder>(&self, _: &mut AB, _: &Self::ExtraData) {
         unreachable!()
     }
@@ -106,6 +113,18 @@ impl Air for Table {
 
 pub fn max_air_constraints() -> usize {
     ALL_TABLES.iter().map(|table| table.n_constraints()).max().unwrap()
+}
+
+/// Max over all tables of `n_total_constraints` = number of `assert_zero` /
+/// `assert_zero_ef` calls (excluding the bus's `alpha^0`). Sizes the `air_alpha_powers`
+/// vector so that the bus contribution + logup column claims + AIR constraints all
+/// have their own alpha power.
+pub fn max_total_constraints() -> usize {
+    ALL_TABLES
+        .iter()
+        .map(|table| table.n_total_constraints())
+        .max()
+        .unwrap()
 }
 
 #[cfg(test)]

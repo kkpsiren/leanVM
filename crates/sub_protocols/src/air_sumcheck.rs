@@ -31,7 +31,7 @@ use tracing::info_span;
 
 const ENDIANNESS_PIVOT_AIR: usize = 12;
 
-pub trait OuterSumcheckSession<EF: ExtensionField<PF<EF>>>: Debug {
+pub trait OuterSumcheckSession<EF: ExtensionField<PF<EF>>>: Debug + Send + Sync {
     fn initial_n_vars(&self) -> usize;
     fn sum(&self) -> EF;
     fn bare_degree(&self) -> usize;
@@ -246,6 +246,7 @@ where
             &split_eq,
             self.folding_bit_packed(),
             active_count_pairs,
+            self.rounds_done == 0,
         );
         let mut p_evals: Vec<EF> = p_evals_raw
             .into_iter()
@@ -315,6 +316,7 @@ fn compute_raw_poly<'a, EF, A>(
     split_eq: &SplitEq<EF>,
     fold_bit: usize, // in storage
     active_count_pairs: usize,
+    is_first_round: bool,
 ) -> Vec<EF>
 where
     EF: ExtensionField<PF<EF>>,
@@ -322,6 +324,15 @@ where
     A::ExtraData: AlphaPowers<EF>,
 {
     let unpack_sum_packed = |s: EFPacking<EF>| -> EF { EFPacking::<EF>::to_ext_iter([s]).sum::<EF>() };
+    // `BusOnly` at z=0 is sound only in round 0: column values are then actual
+    // table rows, so every AIR constraint evaluates to zero by AIR validity. The
+    // AIR's `eval` short-circuits after the bus via `builder.bus_only()`,
+    // skipping the cost of computing every high-degree constraint expression.
+    let mode_at_z0 = if is_first_round {
+        FolderMode::BusOnly
+    } else {
+        FolderMode::HighOnly
+    };
 
     if let Some((low_degree, low_n_constraints)) = computation.low_degree_air() {
         match multilinears {
@@ -336,6 +347,7 @@ where
                     low_degree,
                     low_n_constraints,
                     unpack_sum_packed,
+                    mode_at_z0,
                 );
             }
             MleGroupRef::ExtensionPacked(cols) => {
@@ -349,6 +361,7 @@ where
                     low_degree,
                     low_n_constraints,
                     unpack_sum_packed,
+                    mode_at_z0,
                 );
             }
             _ => {}
@@ -363,8 +376,9 @@ where
             extra_data,
             fold_bit,
             active_count_pairs,
-            A::eval_packed_base,
+            A::eval_packed_base_with_mode,
             unpack_sum_packed,
+            mode_at_z0,
         ),
         MleGroupRef::ExtensionPacked(cols) => compute_raw_poly_impl::<EF, A, EFPacking<EF>, EFPacking<EF>, _, _>(
             cols,
@@ -373,8 +387,9 @@ where
             extra_data,
             fold_bit,
             active_count_pairs,
-            A::eval_packed_extension,
+            A::eval_packed_extension_with_mode,
             unpack_sum_packed,
+            mode_at_z0,
         ),
         MleGroupRef::Base(cols) => compute_raw_poly_impl::<EF, A, PF<EF>, EF, _, _>(
             cols,
@@ -383,8 +398,9 @@ where
             extra_data,
             fold_bit,
             active_count_pairs,
-            A::eval_base,
+            A::eval_base_with_mode,
             |s| s,
+            mode_at_z0,
         ),
         MleGroupRef::Extension(cols) => compute_raw_poly_impl::<EF, A, EF, EF, _, _>(
             cols,
@@ -393,8 +409,9 @@ where
             extra_data,
             fold_bit,
             active_count_pairs,
-            A::eval_extension,
+            A::eval_extension_with_mode,
             |s| s,
+            mode_at_z0,
         ),
     }
 }
@@ -410,6 +427,7 @@ fn compute_raw_poly_degree_split<EF, A, IF, GetEq, UnpackSum>(
     low_degree: usize,
     low_n_constraints: usize,
     unpack_sum: UnpackSum,
+    mode_at_z0: FolderMode,
 ) -> Vec<EF>
 where
     EF: ExtensionField<PF<EF>>,
@@ -437,6 +455,26 @@ where
     let hi_zs: Vec<_> = ((low_degree + 2)..=degree).map(PF::<EF>::from_usize).collect();
     let hi_zs_halved: Vec<_> = hi_zs.iter().map(|&tz| tz.halve()).collect();
     let lagrange_coeffs = lagrange_basis_evals(&low_zs, &hi_zs);
+    // Precompute z-values for the degree-1 (linear) contribution. `acc[0]` is z = 0;
+    // `acc[i]` for i >= 1 corresponds to z = i + 1 (we skip z = 1 in sumcheck).
+    let z_values_for_linear: Vec<PFPacking<EF>> = (0..degree)
+        .map(|i| {
+            let z = if i == 0 { 0 } else { i + 1 };
+            PFPacking::<EF>::from(PF::<EF>::from_usize(z))
+        })
+        .collect();
+    // Linear (degree-1) part is a bare dot product over the AIR's known
+    // logup-claim columns; precompute the broadcast alphas once per call.
+    // `alpha_offset` is 1 when the AIR opens with a bus `assert_zero_ef`.
+    let linear_cols = computation.logup_claim_columns();
+    // The bus consumes 2 alpha slots now (multiplicity at alpha^0, fingerprint at
+    // alpha^1), so column claims start at alpha^{2+j} when `has_bus()`.
+    let alpha_offset = if computation.has_bus() { 2 } else { 0 };
+    let linear_alphas: Vec<EFPacking<EF>> = linear_cols
+        .iter()
+        .enumerate()
+        .map(|(j, _)| EFPacking::<EF>::from(extra_data.alpha_powers()[alpha_offset + j]))
+        .collect();
 
     let acc = (0..active_count_pairs)
         .into_par_iter()
@@ -471,46 +509,66 @@ where
                     diff.push(hi - lo);
                 }
 
-                // Phase 1: full AIR constraints
+                // Linear part: by linearity, `lin(z) = lin(0) + z·lin_slope`. We
+                // compute both via a direct dot product over the AIR's known
+                // logup-claim columns, skipping the `Air::eval` cost entirely.
+                let mut linear_at_0 = EFPacking::<EF>::ZERO;
+                let mut linear_slope = EFPacking::<EF>::ZERO;
+                for (j, &col) in linear_cols.iter().enumerate() {
+                    let alpha = linear_alphas[j];
+                    linear_at_0 += alpha * point[col];
+                    linear_slope += alpha * diff[col];
+                }
+                let linear_at =
+                    |z_idx: usize| -> EFPacking<EF> { linear_at_0 + linear_slope * z_values_for_linear[z_idx] };
 
-                // z = 0: full eval, capture post-block state.
+                // Phase 1: full AIR constraints (sans column claims — HighOnly mode,
+                // except z=0 in round 0 which uses BusOnly: the low-degree block
+                // still runs to capture the post-partial-round state, but final
+                // full rounds + outside-block assertions are skipped because their
+                // expressions vanish by AIR validity at actual row values).
+
+                // z = 0: high eval, capture post-block state.
                 {
                     let mut folder = ConstraintFolderPacked::new(&point[..n_flat], &point[n_flat..], extra_data);
+                    folder.mode = mode_at_z0;
                     folder.cached_state = Some(state_0);
                     Air::eval(computation, &mut folder, extra_data);
-                    acc[0] += folder.accumulator * partial_eq;
+                    acc[0] += (folder.accumulator + linear_at(0)) * partial_eq;
                     low_evals[0] = folder.accumulator_low;
                     state_0 = folder.cached_state.unwrap();
                 }
 
-                // z = 2: advance `point` by 2·diff, full eval, capture post-block state.
+                // z = 2: advance `point` by 2·diff, high eval, capture post-block state.
                 // Together with `state_0` this pins down the linear `state(z)` (linear when we "omit" the low degree constraints of the block)
                 for k in 0..n_cols {
                     point[k] += diff[k].double();
                 }
                 {
                     let mut folder = ConstraintFolderPacked::new(&point[..n_flat], &point[n_flat..], extra_data);
+                    folder.mode = FolderMode::HighOnly;
                     folder.cached_state = Some(state_2);
                     Air::eval(computation, &mut folder, extra_data);
-                    acc[1] += folder.accumulator * partial_eq;
+                    acc[1] += (folder.accumulator + linear_at(1)) * partial_eq;
                     low_evals[1] = folder.accumulator_low;
                     state_2 = folder.cached_state.unwrap();
                 }
 
-                // z = 3, …, d_low+1: still doing full eval
+                // z = 3, …, d_low+1: still doing high eval
                 for z_idx in 2..n_full {
                     for k in 0..n_cols {
                         point[k] += diff[k];
                     }
                     let mut folder = ConstraintFolderPacked::new(&point[..n_flat], &point[n_flat..], extra_data);
+                    folder.mode = FolderMode::HighOnly;
                     Air::eval(computation, &mut folder, extra_data);
-                    acc[z_idx] += folder.accumulator * partial_eq;
+                    acc[z_idx] += (folder.accumulator + linear_at(z_idx)) * partial_eq;
                     low_evals[z_idx] = folder.accumulator_low;
                 }
 
                 // Phase 2: skip the low degree constraints of the block
                 // For each skipped point, assemble Constraints(z) = high(z) + low(z):
-                //   -high(z): run folder with `skip_low = true`
+                //   -high(z): run folder with `skip_low = true` (+ HighOnly, so column claims are still skipped)
                 //   -low(z): deduce it via Lagrange-interpolation from previous computations
                 for t in 0..n_skip {
                     for k in 0..n_cols {
@@ -524,6 +582,7 @@ where
                     }
 
                     let mut folder = ConstraintFolderPacked::new(&point[..n_flat], &point[n_flat..], extra_data);
+                    folder.mode = FolderMode::HighOnly;
                     folder.skip_low = true;
                     folder.cached_state = Some(cached_buf);
                     folder.low_ci_count = low_n_constraints;
@@ -536,7 +595,7 @@ where
                         low_interpolated += low_evals[i] * PFPacking::<EF>::from(*lc);
                     }
 
-                    acc[n_full + t] += (folder.accumulator + low_interpolated) * partial_eq;
+                    acc[n_full + t] += (folder.accumulator + low_interpolated + linear_at(n_full + t)) * partial_eq;
                 }
 
                 (acc, point, diff, low_evals, state_0, state_2, cached_buf)
@@ -564,15 +623,24 @@ fn compute_raw_poly_impl<EF, A, IF, EFT, GetEq, UnpackSum>(
     extra_data: &A::ExtraData,
     fold_bit: usize,
     active_count_pairs: usize,
-    eval_fn: impl Fn(&A, &[IF], &A::ExtraData) -> EFT + Sync + Send,
+    eval_fn: impl Fn(&A, &[IF], &A::ExtraData, FolderMode) -> EFT + Sync + Send,
     unpack_sum: UnpackSum,
+    mode_at_z0: FolderMode,
 ) -> Vec<EF>
 where
     EF: ExtensionField<PF<EF>>,
     A: Air + 'static,
     A::ExtraData: AlphaPowers<EF>,
     IF: Copy + Send + Sync + Sub<Output = IF> + AddAssign + PrimeCharacteristicRing,
-    EFT: Copy + Send + Sync + Add<Output = EFT> + AddAssign + Mul<Output = EFT> + PrimeCharacteristicRing,
+    EFT: Copy
+        + Send
+        + Sync
+        + Add<Output = EFT>
+        + AddAssign
+        + Mul<Output = EFT>
+        + Mul<IF, Output = EFT>
+        + PrimeCharacteristicRing
+        + From<EF>,
     GetEq: Fn(usize) -> EFT + Sync + Send,
     UnpackSum: Fn(EFT) -> EF + Sync + Send,
 {
@@ -580,6 +648,21 @@ where
     let n_cols = cols.len();
     let stride = 1usize << fold_bit;
     let lo_mask = stride - 1;
+
+    // Direct linear contribution: `lin(point) = Σ alpha^{alpha_offset+j} · point[col_j]`
+    // is a bare dot product, so we don't need an `Air::eval` call to get it. (The
+    // `assert_zero_linear` calls inside `eval` are bypassed in `HighOnly` mode.)
+    // `alpha_offset` is 1 when the AIR opens with a bus `assert_zero_ef` (it consumes
+    // `alpha^0`) and 0 otherwise — see `Air::has_bus`.
+    let linear_cols = computation.logup_claim_columns();
+    // The bus consumes 2 alpha slots now (multiplicity at alpha^0, fingerprint at
+    // alpha^1), so column claims start at alpha^{2+j} when `has_bus()`.
+    let alpha_offset = if computation.has_bus() { 2 } else { 0 };
+    let linear_alphas: Vec<EFT> = linear_cols
+        .iter()
+        .enumerate()
+        .map(|(j, _)| EFT::from(extra_data.alpha_powers()[alpha_offset + j]))
+        .collect();
 
     let acc = (0..active_count_pairs)
         .into_par_iter()
@@ -605,16 +688,38 @@ where
                     point.push(lo);
                     diff.push(hi - lo);
                 }
-                // z = 0 then (skip z = 1) z = 2, 3, …, degree.
-                acc[0] += eval_fn(computation, &point, extra_data) * partial_eq;
+                // Direct dot product for the linear part.
+                let mut linear_at_0 = EFT::ZERO;
+                let mut linear_slope = EFT::ZERO;
+                for (j, &col) in linear_cols.iter().enumerate() {
+                    let alpha_eft = linear_alphas[j];
+                    linear_at_0 += alpha_eft * point[col];
+                    linear_slope += alpha_eft * diff[col];
+                }
+
+                // z = 0: linear contribution is `linear_at_0`. In round 0 `mode_at_z0`
+                // is `BusOnly`, which makes the AIR's `eval` early-return after the
+                // bus assertions — skipping the high-degree AIR constraints' expression
+                // computation entirely (they evaluate to zero by AIR validity here).
+                let high_at_0 = eval_fn(computation, &point, extra_data, mode_at_z0);
+                acc[0] += (high_at_0 + linear_at_0) * partial_eq;
+                // advance to z = 1 (no eval here — z = 1 is recovered from the sum).
                 for k in 0..n_cols {
                     point[k] += diff[k];
                 }
-                for acc_z in &mut acc[1..] {
+                // z = 2, 3, …, degree. `linear_contrib` is the running
+                // `linear_at_0 + z·linear_slope`; we jump it by `2·slope` for the
+                // first step (z = 0 → z = 2) and add `slope` for every subsequent z.
+                let mut linear_contrib = linear_at_0 + linear_slope + linear_slope;
+                for (z_idx, acc_z) in acc.iter_mut().enumerate().skip(1) {
                     for k in 0..n_cols {
                         point[k] += diff[k];
                     }
-                    *acc_z += eval_fn(computation, &point, extra_data) * partial_eq;
+                    let high_at_z = eval_fn(computation, &point, extra_data, FolderMode::HighOnly);
+                    *acc_z += (high_at_z + linear_contrib) * partial_eq;
+                    if z_idx + 1 < degree {
+                        linear_contrib += linear_slope;
+                    }
                 }
                 (acc, point, diff)
             },
@@ -633,6 +738,44 @@ where
     acc.into_iter().map(unpack_sum).collect()
 }
 
+/// Adaptive parallel map over the active sessions of the current round.
+///
+/// `rayon::join` is documented as "potentially parallel": when the calling
+/// worker is the only idle one (because the inner `par_iter` of an
+/// already-running session is keeping every other worker busy), `join` runs the
+/// second closure inline on the current thread instead of spawning. This is
+/// exactly what we need:
+///   - early rounds: every session's inner `par_iter` saturates cores by itself,
+///     so `join` collapses to sequential — no nested-par_iter contention (~10%
+///     regression on a 16-thread x86 machine).
+///   - late rounds & high-bandwidth machines: inner `par_iter` underutilizes
+///     cores, so `join` spreads sessions across the idle workers.
+///
+/// `par_iter_mut` does not collapse the same way — it eagerly recursively
+/// splits the slice and queues every leaf, which keeps the contention even
+/// when no worker is free.
+fn join_map_sessions<'a, EF, F, R>(
+    sessions: &mut [Box<dyn OuterSumcheckSession<EF> + 'a>],
+    out: &mut [R],
+    f: &F,
+) where
+    EF: ExtensionField<PF<EF>>,
+    F: Fn(&mut Box<dyn OuterSumcheckSession<EF> + 'a>) -> R + Sync,
+    R: Send,
+{
+    debug_assert_eq!(sessions.len(), out.len());
+    match sessions.len() {
+        0 => {}
+        1 => out[0] = f(&mut sessions[0]),
+        _ => {
+            let mid = sessions.len() / 2;
+            let (sl, sr) = sessions.split_at_mut(mid);
+            let (ol, or) = out.split_at_mut(mid);
+            rayon::join(|| join_map_sessions(sl, ol, f), || join_map_sessions(sr, or, f));
+        }
+    }
+}
+
 pub fn prove_batched_air_sumcheck<'a, EF: ExtensionField<PF<EF>>>(
     prover_state: &mut impl FSProver<EF>,
     sessions: &mut [Box<dyn OuterSumcheckSession<EF> + 'a>],
@@ -646,20 +789,27 @@ pub fn prove_batched_air_sumcheck<'a, EF: ExtensionField<PF<EF>>>(
     let mut k: Vec<EF> = vec![EF::ONE; sessions.len()];
 
     for round in 0..n_rounds {
-        let mut combined_coeffs = EF::zero_vec(max_full_degree + 1);
         let mut bare_polys: Vec<Option<DensePolynomial<EF>>> = vec![None; sessions.len()];
+        join_map_sessions(sessions, &mut bare_polys, &|session| {
+            let join_round = n_rounds - session.initial_n_vars();
+            if round < join_round {
+                None
+            } else {
+                Some(session.compute_bare_round_poly())
+            }
+        });
 
-        for (idx, session) in sessions.iter_mut().enumerate() {
+        let mut combined_coeffs = EF::zero_vec(max_full_degree + 1);
+        for (idx, session) in sessions.iter().enumerate() {
             let join_round = n_rounds - session.initial_n_vars();
             if round < join_round {
                 combined_coeffs[1] += eta_powers[idx] * k[idx] * session.sum();
             } else {
-                let bare_poly = session.compute_bare_round_poly();
+                let bare_poly = bare_polys[idx].as_ref().unwrap();
                 let full_coeffs = expand_bare_to_full(&bare_poly.coeffs, session.eq_alpha());
                 for (i, &c) in full_coeffs.iter().enumerate() {
                     combined_coeffs[i] += eta_powers[idx] * k[idx] * c;
                 }
-                bare_polys[idx] = Some(bare_poly);
             }
         }
 
@@ -667,6 +817,10 @@ pub fn prove_batched_air_sumcheck<'a, EF: ExtensionField<PF<EF>>>(
         let challenge = prover_state.sample();
         challenges.push(challenge);
 
+        // `process_challenge` is also internally rayon-parallel, but routing it
+        // through `join_map_sessions` showed a measurable regression in the
+        // bench: folding multiple sessions concurrently competes for memory
+        // bandwidth on x86, and the inner par_iter already saturates cores.
         for (idx, session) in sessions.iter_mut().enumerate() {
             let join_round = n_rounds - session.initial_n_vars();
             if round < join_round {

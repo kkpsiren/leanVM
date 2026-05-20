@@ -14,12 +14,55 @@ pub trait SumcheckComputation<EF: ExtensionField<PF<EF>>>: Sync {
     fn eval_extension(&self, point_f: &[EF], extra_data: &Self::ExtraData) -> EF;
     fn eval_packed_base(&self, point_f: &[PFPacking<EF>], extra_data: &Self::ExtraData) -> EFPacking<EF>;
     fn eval_packed_extension(&self, point_f: &[EFPacking<EF>], extra_data: &Self::ExtraData) -> EFPacking<EF>;
+
+    /// Same as `eval_*`, but lets the AIR sumcheck prover restrict which assertions
+    /// the constraint folder accumulates (linear vs high-degree). The default impl
+    /// ignores `mode`; the blanket impl for any `A: Air` honors it via the folder.
+    #[inline(always)]
+    fn eval_base_with_mode(&self, point_f: &[PF<EF>], extra_data: &Self::ExtraData, _mode: FolderMode) -> EF {
+        self.eval_base(point_f, extra_data)
+    }
+
+    #[inline(always)]
+    fn eval_extension_with_mode(&self, point_f: &[EF], extra_data: &Self::ExtraData, _mode: FolderMode) -> EF {
+        self.eval_extension(point_f, extra_data)
+    }
+
+    #[inline(always)]
+    fn eval_packed_base_with_mode(
+        &self,
+        point_f: &[PFPacking<EF>],
+        extra_data: &Self::ExtraData,
+        _mode: FolderMode,
+    ) -> EFPacking<EF> {
+        self.eval_packed_base(point_f, extra_data)
+    }
+
+    #[inline(always)]
+    fn eval_packed_extension_with_mode(
+        &self,
+        point_f: &[EFPacking<EF>],
+        extra_data: &Self::ExtraData,
+        _mode: FolderMode,
+    ) -> EFPacking<EF> {
+        self.eval_packed_extension(point_f, extra_data)
+    }
 }
 
 macro_rules! impl_air_eval {
     ($self:expr, $point_f:expr, $extra_data:expr, $folder_ty:ident) => {{
         let n_cols = $self.n_columns();
         let mut folder = $folder_ty::new(&$point_f[..n_cols], &$point_f[n_cols..], $extra_data);
+        Air::eval($self, &mut folder, $extra_data);
+        folder.accumulator
+    }};
+}
+
+macro_rules! impl_air_eval_with_mode {
+    ($self:expr, $point_f:expr, $extra_data:expr, $folder_ty:ident, $mode:expr) => {{
+        let n_cols = $self.n_columns();
+        let mut folder = $folder_ty::new(&$point_f[..n_cols], &$point_f[n_cols..], $extra_data);
+        folder.mode = $mode;
         Air::eval($self, &mut folder, $extra_data);
         folder.accumulator
     }};
@@ -51,6 +94,36 @@ where
     #[inline(always)]
     fn eval_packed_extension(&self, point_f: &[EFPacking<EF>], extra_data: &Self::ExtraData) -> EFPacking<EF> {
         impl_air_eval!(self, point_f, extra_data, ConstraintFolderPacked)
+    }
+
+    #[inline(always)]
+    fn eval_base_with_mode(&self, point_f: &[PF<EF>], extra_data: &Self::ExtraData, mode: FolderMode) -> EF {
+        impl_air_eval_with_mode!(self, point_f, extra_data, ConstraintFolder, mode)
+    }
+
+    #[inline(always)]
+    fn eval_extension_with_mode(&self, point_f: &[EF], extra_data: &Self::ExtraData, mode: FolderMode) -> EF {
+        impl_air_eval_with_mode!(self, point_f, extra_data, ConstraintFolder, mode)
+    }
+
+    #[inline(always)]
+    fn eval_packed_base_with_mode(
+        &self,
+        point_f: &[PFPacking<EF>],
+        extra_data: &Self::ExtraData,
+        mode: FolderMode,
+    ) -> EFPacking<EF> {
+        impl_air_eval_with_mode!(self, point_f, extra_data, ConstraintFolderPacked, mode)
+    }
+
+    #[inline(always)]
+    fn eval_packed_extension_with_mode(
+        &self,
+        point_f: &[EFPacking<EF>],
+        extra_data: &Self::ExtraData,
+        mode: FolderMode,
+    ) -> EFPacking<EF> {
+        impl_air_eval_with_mode!(self, point_f, extra_data, ConstraintFolderPacked, mode)
     }
 
     fn degree(&self) -> usize {

@@ -23,6 +23,10 @@ ONE_BUSES_DATA_COLS = ONE_BUSES_DATA_COLS_PLACEHOLDER  # [[[_; num_data]; num_bu
 ONE_BUSES_DATA_OFFSETS = ONE_BUSES_DATA_OFFSETS_PLACEHOLDER  # [[[_; num_data]; num_buses]; N_TABLES]
 ONE_BUSES_NEW_COLS = ONE_BUSES_NEW_COLS_PLACEHOLDER  # [[[_; n_new]; num_buses]; N_TABLES]
 
+# Sorted committed columns per table whose GKR-point evaluation is folded into the
+# batched AIR sumcheck (one extra degree-1 "constraint" each, weighted by alpha^{2+j}).
+LOGUP_CLAIM_COLUMNS = LOGUP_CLAIM_COLUMNS_PLACEHOLDER  # [[_; ?]; N_TABLES]
+
 NUM_COLS_AIR = NUM_COLS_AIR_PLACEHOLDER
 
 AIR_DEGREES = AIR_DEGREES_PLACEHOLDER  # [_; N_TABLES]
@@ -279,26 +283,27 @@ def continue_recursion_ordered(
 ):
     bus_numerators_values = DynArray([])
     bus_denominators_values = DynArray([])
-    pcs_points = DynArray([])  # [[_; N]; N_TABLES]
+    pcs_points = DynArray([])  # [[_; N]; N_TABLES] — the AIR-sumcheck-point claim (only)
     pcs_values = DynArray([])  # [[[[] or [_]; num cols]; N]; N_TABLES]
     pcs_values_shift = DynArray([])  # same structure, for next_mle-weighted column evals
     for i in unroll(0, N_TABLES):
         pcs_points.push(DynArray([]))
         pcs_values.push(DynArray([]))
-        pcs_values[i].push(DynArray([]))
         pcs_values_shift.push(DynArray([]))
-        pcs_values_shift[i].push(DynArray([]))
+    # Per-column storage for the GKR-point column evaluations. They no longer open a
+    # WHIR statement: they fold into the AIR initial sum (alpha^{2+j} weights) and
+    # the AIR sumcheck reduces them to evaluations at the AIR sumcheck point.
+    gkr_col_evals = DynArray([])  # [[[] or [_]; num cols]; N_TABLES]
+    for i in unroll(0, N_TABLES):
+        gkr_col_evals.push(DynArray([]))
         for _ in unroll(0, NUM_COLS_AIR[i]):
-            pcs_values[i][0].push(DynArray([]))
-            pcs_values_shift[i][0].push(DynArray([]))
+            gkr_col_evals[i].push(DynArray([]))
 
     for sorted_pos in unroll(0, N_TABLES):
         table_index = sorted_table_index(sorted_pos, second_table, third_table)
 
         log_n_rows = table_log_heights[table_index]
         n_rows = table_heights[table_index]
-        inner_point = point_gkr + (n_vars_logup_gkr - log_n_rows) * DIM
-        pcs_points[table_index].push(inner_point)
 
         # Bus (data flow between tables — Multiplicity::Column)
         prefix = multilinear_location_prefix(offset / n_rows, n_vars_logup_gkr - log_n_rows, point_gkr)
@@ -315,7 +320,9 @@ def continue_recursion_ordered(
 
         offset += n_rows
 
-        # Multiplicity::One buses (bytecode lookup + memory lookups).
+        # Multiplicity::One buses (bytecode lookup + memory lookups). The unique column
+        # evals received here are stored in `gkr_col_evals` (later folded into the AIR
+        # sumcheck initial sum) — they no longer open a WHIR statement at the GKR point.
         for one_bus_idx in unroll(0, len(ONE_BUSES_DOMSEPS[table_index])):
             domsep = ONE_BUSES_DOMSEPS[table_index][one_bus_idx]
             n_new = len(ONE_BUSES_NEW_COLS[table_index][one_bus_idx])
@@ -325,14 +332,14 @@ def continue_recursion_ordered(
 
             for i in unroll(0, n_new):
                 new_col = ONE_BUSES_NEW_COLS[table_index][one_bus_idx][i]
-                debug_assert(len(pcs_values[table_index][0][new_col]) == 0)
-                pcs_values[table_index][0][new_col].push(new_evals + i * DIM)
+                debug_assert(len(gkr_col_evals[table_index][new_col]) == 0)
+                gkr_col_evals[table_index][new_col].push(new_evals + i * DIM)
 
             data_evals = Array(n_data * DIM)
             for i in unroll(0, n_data):
                 data_col = ONE_BUSES_DATA_COLS[table_index][one_bus_idx][i]
                 data_ofs = ONE_BUSES_DATA_OFFSETS[table_index][one_bus_idx][i]
-                src = pcs_values[table_index][0][data_col][0]
+                src = gkr_col_evals[table_index][data_col][0]
                 if data_ofs == 0:
                     copy_5(src, data_evals + i * DIM)
                 if data_ofs != 0:
@@ -361,10 +368,8 @@ def continue_recursion_ordered(
 
     # VERIFY BUS AND AIR — back-loaded batched sumcheck (see https://hackmd.io/s/HyxaupAAA)
 
-    fs, bus_beta = fs_sample_ef(fs)
-    fs = fs_duplex(fs)
     fs, air_alpha = fs_sample_ef(fs)
-    air_alpha_powers = powers_const(air_alpha, MAX_NUM_AIR_CONSTRAINTS + 1)
+    air_alpha_powers = powers_const(air_alpha, MAX_NUM_AIR_CONSTRAINTS + 2)
     fs = fs_duplex(fs)
     fs, eta = fs_sample_ef(fs)
     eta_powers = powers_const(eta, N_TABLES)
@@ -378,11 +383,21 @@ def continue_recursion_ordered(
         bus_final_value: Mut = bus_numerator_value
         if table_index != EXECUTION_TABLE_INDEX:
             bus_final_value = opposite_extension_ret(bus_final_value)
+        # alpha^1 · (logup_c - bus_denominator) replaces `bus_beta · (logup_c - bus_denominator)`.
         bus_final_value = add_extension_ret(
             bus_final_value,
-            mul_extension_ret(bus_beta, sub_extension_ret(logup_c, bus_denominator_value)),
+            mul_extension_ret(air_alpha_powers + DIM, sub_extension_ret(logup_c, bus_denominator_value)),
         )
-        initial_sum = add_extension_ret(initial_sum, mul_extension_ret(eta_powers + sorted_pos * DIM, bus_final_value))
+        # Column claims now start at alpha^{2+j} (bus consumes alpha^0 and alpha^1).
+        logup_extra_sum: Mut = bus_final_value
+        for j in unroll(0, len(LOGUP_CLAIM_COLUMNS[table_index])):
+            col = LOGUP_CLAIM_COLUMNS[table_index][j]
+            col_eval = gkr_col_evals[table_index][col][0]
+            logup_extra_sum = add_extension_ret(
+                logup_extra_sum,
+                mul_extension_ret(air_alpha_powers + (2 + j) * DIM, col_eval),
+            )
+        initial_sum = add_extension_ret(initial_sum, mul_extension_ret(eta_powers + sorted_pos * DIM, logup_extra_sum))
 
     n_max = log_n_cycles # extension table is always the biggest
     # Batched AIR sumcheck:
@@ -398,9 +413,13 @@ def continue_recursion_ordered(
 
         fs, inner_evals = fs_receive_ef_inlined(fs, n_flat_columns + n_shift_columns)
 
-        air_constraints_eval = evaluate_air_constraints(table_index, inner_evals, air_alpha_powers, bus_beta, logup_alphas_eq_poly)
+        # `air_constraints_eval` now also includes the logup column claims (the AIR's
+        # symbolic `assert_zero_linear(flat[col])` calls), evaluated at the AIR sumcheck point.
+        air_constraints_eval = evaluate_air_constraints(table_index, inner_evals, air_alpha_powers, logup_alphas_eq_poly)
 
-        bus_point = pcs_points[table_index][0]
+        # The original GKR-derived point (`inner_point`) is no longer stored in
+        # `pcs_points` since the GKR-point WHIR claim is gone. Recompute it inline.
+        bus_point = point_gkr + (n_vars_logup_gkr - log_n_rows) * DIM
         eq_val = poly_eq_extension_dynamic_ret(bus_point, all_challenges, log_n_rows)
 
         k_t = product_first_n(all_challenges + log_n_rows * DIM, n_max - log_n_rows)
@@ -766,16 +785,16 @@ def compute_total_gkr_n_vars(log_memory, log_bytecode_padded, tables_heights):
     return log2_ceil_runtime(total)
 
 
-def evaluate_air_constraints(table_index, inner_evals, air_alpha_powers, bus_beta, logup_alphas_eq_poly):
+def evaluate_air_constraints(table_index, inner_evals, air_alpha_powers, logup_alphas_eq_poly):
     res: Imu
     debug_assert(table_index < N_TABLES)
     match table_index:
         case 0:
-            res = evaluate_air_constraints_table_0(inner_evals, air_alpha_powers, bus_beta, logup_alphas_eq_poly)
+            res = evaluate_air_constraints_table_0(inner_evals, air_alpha_powers, logup_alphas_eq_poly)
         case 1:
-            res = evaluate_air_constraints_table_1(inner_evals, air_alpha_powers, bus_beta, logup_alphas_eq_poly)
+            res = evaluate_air_constraints_table_1(inner_evals, air_alpha_powers, logup_alphas_eq_poly)
         case 2:
-            res = evaluate_air_constraints_table_2(inner_evals, air_alpha_powers, bus_beta, logup_alphas_eq_poly)
+            res = evaluate_air_constraints_table_2(inner_evals, air_alpha_powers, logup_alphas_eq_poly)
     return res
 
 

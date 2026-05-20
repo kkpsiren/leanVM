@@ -112,6 +112,32 @@ pub const POSEIDON_16_COL_OUTPUT_RIGHT: ColIndex = num_cols_poseidon_16() - 8;
 pub const POSEIDON_16_COL_INDEX_INPUT_LEFT: ColIndex = num_cols_poseidon_16();
 pub const POSEIDON_16_COL_DOMAINSEP: ColIndex = num_cols_poseidon_16() + 1;
 
+/// Sorted committed columns whose GKR-point logup evaluation is folded into the AIR
+/// sumcheck. Materialized as a `&'static` slice so the AIR's per-row evaluation does
+/// not allocate. The four memory-lookup buses cover the index columns
+/// (right=1, res=2, eff_left_first=6, eff_left_second=7), the 16 input value cols
+/// `POSEIDON_16_COL_INPUT_START..+16`, and the 16 output value cols
+/// `POSEIDON_16_COL_OUTPUT_LEFT..+16`.
+const _POSEIDON_16_LOGUP_CLAIM_COLUMNS_ARRAY: [ColIndex; 36] = {
+    let mut arr = [0usize; 36];
+    arr[0] = POSEIDON_16_COL_INDEX_INPUT_RIGHT;
+    arr[1] = POSEIDON_16_COL_INDEX_INPUT_RES;
+    arr[2] = POSEIDON_16_COL_EFFECTIVE_INDEX_LEFT_FIRST;
+    arr[3] = POSEIDON_16_COL_EFFECTIVE_INDEX_LEFT_SECOND;
+    let mut i = 0;
+    while i < 16 {
+        arr[4 + i] = POSEIDON_16_COL_INPUT_START + i;
+        i += 1;
+    }
+    let mut i = 0;
+    while i < 16 {
+        arr[20 + i] = POSEIDON_16_COL_OUTPUT_LEFT + i;
+        i += 1;
+    }
+    arr
+};
+pub const POSEIDON_16_LOGUP_CLAIM_COLUMNS: &[ColIndex] = &_POSEIDON_16_LOGUP_CLAIM_COLUMNS_ARRAY;
+
 pub const POSEIDON16_NAME: &str = "poseidon16_compress";
 pub const POSEIDON16_HALF_NAME: &str = "poseidon16_compress_half";
 pub const POSEIDON16_HARDCODED_LEFT_NAME: &str = "poseidon16_compress_hardcoded_left";
@@ -310,6 +336,12 @@ impl<const BUS: bool> Air for Poseidon16Precompile<BUS> {
     fn n_constraints(&self) -> usize {
         BUS as usize + 99
     }
+    fn logup_claim_columns(&self) -> &'static [usize] {
+        POSEIDON_16_LOGUP_CLAIM_COLUMNS
+    }
+    fn has_bus(&self) -> bool {
+        BUS
+    }
     fn eval<AB: AirBuilder>(&self, builder: &mut AB, extra_data: &Self::ExtraData) {
         let cols: Poseidon1Cols16<AB::IF> = {
             let flat = builder.flat();
@@ -333,17 +365,26 @@ impl<const BUS: bool> Air for Poseidon16Precompile<BUS> {
         let index_a =
             cols.effective_index_left_second - one_minus_flag_hardcoded_left * AB::F::from_usize(HALF_DIGEST_LEN);
 
-        // Bus: data = [a, b, res], domainsep
+        // Bus split: multiplicity is just `cols.multiplicity` (linear, single column —
+        // a follow-up could route it through `assert_zero_linear` + LOGUP_CLAIM_COLUMNS
+        // to fold it into the linear dot product); fingerprint is degree 2 in cols
+        // (`domainsep_reconstructed` has `flag_hardcoded_left * offset_hardcoded_left`).
         if BUS {
-            builder.assert_zero_ef(eval_bus_virtual::<AB, EF>(
+            builder.assert_zero(cols.multiplicity);
+            builder.assert_zero_ef(bus_fingerprint::<AB, EF>(
                 extra_data,
-                cols.multiplicity,
                 domainsep_reconstructed,
                 &[index_a, cols.index_b, cols.index_res],
             ));
         } else {
             builder.declare_values(std::slice::from_ref(&cols.multiplicity));
             builder.declare_values(&[index_a, cols.index_b, cols.index_res, domainsep_reconstructed]);
+        }
+        // Reduce logup column claims at the GKR point into the AIR sumcheck. See the
+        // execution table for the rationale.
+        for &col in POSEIDON_16_LOGUP_CLAIM_COLUMNS {
+            let val = builder.flat()[col];
+            builder.assert_zero_linear(val);
         }
 
         builder.assert_bool(cols.multiplicity);
@@ -421,6 +462,15 @@ fn eval_poseidon1_16<AB: AirBuilder>(builder: &mut AB, local: &Poseidon1Cols16<A
             sparse_mat_air_16(state, &first_rows[round], &v_vecs[round]);
         }
     });
+
+    // Round-0 z=0: post-block state is captured (degree-split phase 2 needs it),
+    // but the final full rounds + last-2-full-rounds below would only emit assertions
+    // that are zero by AIR validity at actual row values. Skip their expression
+    // computation (16-wide MDS + 16 cubes per full-round call) — biggest single
+    // savings inside the poseidon AIR.
+    if builder.bus_only() {
+        return;
+    }
 
     let final_constants = poseidon1_final_constants();
     for round in 0..HALF_FINAL_FULL_ROUNDS - 1 {
