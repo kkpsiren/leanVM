@@ -114,7 +114,7 @@ def recursion(inner_public_memory, bytecode_hash_domsep):
     retrieved_numerators_value: Mut = opposite_extension_ret(mul_extension_ret(memory_and_acc_prefix, value_acc))
 
     value_index = mle_of_01234567_etc(point_gkr + (n_vars_logup_gkr - log_memory) * DIM, log_memory)
-    fingerprint_memory = fingerprint_2(LOGUP_MEMORY_DOMAINSEP, value_memory, value_index, logup_alphas_eq_poly)
+    fingerprint_memory = fingerprint_2(LOGUP_MEMORY_DOMAINSEP, value_index, value_memory, logup_alphas_eq_poly)
     retrieved_denominators_value: Mut = mul_extension_ret(memory_and_acc_prefix, sub_extension_ret(logup_c, fingerprint_memory))
 
     offset: Mut = two_exp(log_memory)
@@ -356,8 +356,8 @@ def continue_recursion_ordered(
                 retrieved_numerators_value = add_extension_ret(retrieved_numerators_value, pref)
                 fingerp = fingerprint_2(
                     LOGUP_MEMORY_DOMAINSEP,
-                    value_eval,
                     add_base_extension_ret(i, index_eval),
+                    value_eval,
                     logup_alphas_eq_poly,
                 )
                 retrieved_denominators_value = add_extension_ret(
@@ -406,7 +406,7 @@ def continue_recursion_ordered(
             bus_final_value = opposite_extension_ret(bus_final_value)
         bus_final_value = add_extension_ret(
             bus_final_value,
-            mul_extension_ret(bus_beta, sub_extension_ret(bus_denominator_value, logup_c)),
+            mul_extension_ret(bus_beta, sub_extension_ret(logup_c, bus_denominator_value)),
         )
         initial_sum = add_extension_ret(initial_sum, mul_extension_ret(eta_powers + sorted_pos * DIM, bus_final_value))
 

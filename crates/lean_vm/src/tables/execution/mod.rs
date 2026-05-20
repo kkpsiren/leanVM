@@ -25,34 +25,21 @@ impl<const BUS: bool> TableT for ExecutionTable<BUS> {
         N_TOTAL_EXECUTION_COLUMNS + N_TEMPORARY_EXEC_COLUMNS
     }
 
-    fn lookups(&self) -> Vec<LookupIntoMemory> {
-        vec![
-            LookupIntoMemory {
-                index: COL_MEM_ADDRESS_A,
-                values: vec![COL_MEM_VALUE_A],
-            },
-            LookupIntoMemory {
-                index: COL_MEM_ADDRESS_B,
-                values: vec![COL_MEM_VALUE_B],
-            },
-            LookupIntoMemory {
-                index: COL_MEM_ADDRESS_C,
-                values: vec![COL_MEM_VALUE_C],
-            },
-        ]
-    }
-
-    fn bus(&self) -> Bus {
-        Bus {
+    fn buses(&self) -> Vec<Bus> {
+        let mut buses = vec![Bus {
             direction: BusDirection::Push,
-            multiplicity: COL_IS_PRECOMPILE,
+            multiplicity: Multiplicity::Column(COL_IS_PRECOMPILE),
             domainsep: BusData::Column(COL_PRECOMPILE_DOMAINSEP),
             data: vec![
                 BusData::Column(COL_EXEC_NU_A),
                 BusData::Column(COL_EXEC_NU_B),
                 BusData::Column(COL_EXEC_NU_C),
             ],
-        }
+        }];
+        buses.extend(memory_lookups_consecutive(COL_MEM_ADDRESS_A, COL_MEM_VALUE_A, 1));
+        buses.extend(memory_lookups_consecutive(COL_MEM_ADDRESS_B, COL_MEM_VALUE_B, 1));
+        buses.extend(memory_lookups_consecutive(COL_MEM_ADDRESS_C, COL_MEM_VALUE_C, 1));
+        buses
     }
 
     fn padding_row(&self, zero_vec_ptr: usize, _null_hash_ptr: usize, ending_pc: usize) -> Vec<F> {

@@ -273,25 +273,17 @@ fn build_replacements(log_inner_bytecode: usize, bytecode_zero_eval: F) -> BTree
     let mut n_air_columns = vec![];
     let mut n_air_shift_columns = vec![];
     for table in ALL_TABLES {
-        let this_look_f_indexes_str = table
-            .lookups()
-            .iter()
-            .map(|lookup_f| lookup_f.index.to_string())
-            .collect::<Vec<_>>();
+        let lookup_groups = memory_lookup_groups(&table);
+
+        let this_look_f_indexes_str = lookup_groups.iter().map(|(idx, _)| idx.to_string()).collect::<Vec<_>>();
         lookup_indexes_str.push(format!("[{}]", this_look_f_indexes_str.join(", ")));
         num_cols_air.push(table.n_columns().to_string());
-        let this_lookup_f_values_str = table
-            .lookups()
+        let this_lookup_f_values_str = lookup_groups
             .iter()
-            .map(|lookup_f| {
+            .map(|(_, vals)| {
                 format!(
                     "[{}]",
-                    lookup_f
-                        .values
-                        .iter()
-                        .map(|v| v.to_string())
-                        .collect::<Vec<_>>()
-                        .join(", ")
+                    vals.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(", ")
                 )
             })
             .collect::<Vec<_>>();
