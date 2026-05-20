@@ -112,6 +112,32 @@ pub const POSEIDON_16_COL_OUTPUT_RIGHT: ColIndex = num_cols_poseidon_16() - 8;
 pub const POSEIDON_16_COL_INDEX_INPUT_LEFT: ColIndex = num_cols_poseidon_16();
 pub const POSEIDON_16_COL_DOMAINSEP: ColIndex = num_cols_poseidon_16() + 1;
 
+/// Sorted committed columns whose GKR-point logup evaluation is folded into the AIR
+/// sumcheck. Materialized as a `&'static` slice so the AIR's per-row evaluation does
+/// not allocate. The four memory-lookup buses cover the index columns
+/// (right=1, res=2, eff_left_first=6, eff_left_second=7), the 16 input value cols
+/// `POSEIDON_16_COL_INPUT_START..+16`, and the 16 output value cols
+/// `POSEIDON_16_COL_OUTPUT_LEFT..+16`.
+const _POSEIDON_16_LOGUP_CLAIM_COLUMNS_ARRAY: [ColIndex; 36] = {
+    let mut arr = [0usize; 36];
+    arr[0] = POSEIDON_16_COL_INDEX_INPUT_RIGHT;
+    arr[1] = POSEIDON_16_COL_INDEX_INPUT_RES;
+    arr[2] = POSEIDON_16_COL_EFFECTIVE_INDEX_LEFT_FIRST;
+    arr[3] = POSEIDON_16_COL_EFFECTIVE_INDEX_LEFT_SECOND;
+    let mut i = 0;
+    while i < 16 {
+        arr[4 + i] = POSEIDON_16_COL_INPUT_START + i;
+        i += 1;
+    }
+    let mut i = 0;
+    while i < 16 {
+        arr[20 + i] = POSEIDON_16_COL_OUTPUT_LEFT + i;
+        i += 1;
+    }
+    arr
+};
+pub const POSEIDON_16_LOGUP_CLAIM_COLUMNS: &[ColIndex] = &_POSEIDON_16_LOGUP_CLAIM_COLUMNS_ARRAY;
+
 pub const POSEIDON16_NAME: &str = "poseidon16_compress";
 pub const POSEIDON16_HALF_NAME: &str = "poseidon16_compress_half";
 pub const POSEIDON16_HARDCODED_LEFT_NAME: &str = "poseidon16_compress_hardcoded_left";
@@ -140,6 +166,10 @@ impl<const BUS: bool> TableT for Poseidon16Precompile<BUS> {
 
     fn n_columns_total(&self) -> usize {
         num_cols_total_poseidon_16()
+    }
+
+    fn logup_claim_columns(&self) -> Vec<ColIndex> {
+        POSEIDON_16_LOGUP_CLAIM_COLUMNS.to_vec()
     }
 
     fn buses(&self) -> Vec<Bus> {
@@ -344,6 +374,12 @@ impl<const BUS: bool> Air for Poseidon16Precompile<BUS> {
         } else {
             builder.declare_values(std::slice::from_ref(&cols.multiplicity));
             builder.declare_values(&[index_a, cols.index_b, cols.index_res, domainsep_reconstructed]);
+        }
+        // Reduce logup column claims at the GKR point into the AIR sumcheck. See the
+        // execution table for the rationale.
+        for &col in POSEIDON_16_LOGUP_CLAIM_COLUMNS {
+            let val = builder.flat()[col];
+            builder.assert_zero(val);
         }
 
         builder.assert_bool(cols.multiplicity);

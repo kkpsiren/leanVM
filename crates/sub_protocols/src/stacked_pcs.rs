@@ -1,7 +1,7 @@
 use backend::*;
 use lean_vm::{
-    ALL_TABLES, BusData, COL_PC, CommittedStatements, LOGUP_MEMORY_DOMAINSEP, MIN_LOG_MEMORY_SIZE,
-    MIN_LOG_N_ROWS_PER_TABLE, N_INSTRUCTION_COLUMNS, STARTING_PC, sort_tables_by_height,
+    ALL_TABLES, COL_PC, CommittedStatements, MIN_LOG_MEMORY_SIZE, MIN_LOG_N_ROWS_PER_TABLE, STARTING_PC,
+    sort_tables_by_height,
 };
 use lean_vm::{EF, F, Table, TableT, TableTrace};
 use std::collections::BTreeMap;
@@ -204,33 +204,13 @@ pub fn min_stacked_n_vars(log_bytecode: usize) -> usize {
 }
 
 pub fn total_whir_statements() -> usize {
-    6 // memory + memory_acc + public_memory + bytecode_acc + pc_start + pc_end
-     + ALL_TABLES
+    // 6 = memory + memory_acc + public_memory + bytecode_acc + pc_start + pc_end.
+    // Per-table contributions are just the AIR-sumcheck-point columns (flat + shift):
+    // memory/bytecode-lookup column claims at the GKR point used to add a separate
+    // statement per claim column, but those are now folded into the batched AIR
+    // sumcheck (see prove_execution.rs / verify_execution.rs).
+    6 + ALL_TABLES
         .iter()
-        .map(|table| {
-            // AIR
-            table.n_columns()
-            + table.n_shift_columns()
-            // Lookups into memory (deduped across buses of the same table).
-            + memory_lookup_column_count(*table)
-        })
+        .map(|table| table.n_columns() + table.n_shift_columns())
         .sum::<usize>()
-        // bytecode lookup
-        + 1 // PC
-        + N_INSTRUCTION_COLUMNS
-}
-
-fn memory_lookup_column_count(table: Table) -> usize {
-    let mut seen = std::collections::BTreeSet::<usize>::new();
-    for bus in table.buses() {
-        if !matches!(bus.domainsep, BusData::Constant(LOGUP_MEMORY_DOMAINSEP)) {
-            continue;
-        }
-        for entry in &bus.data {
-            if let Some(c) = entry.column() {
-                seen.insert(c);
-            }
-        }
-    }
-    seen.len()
 }

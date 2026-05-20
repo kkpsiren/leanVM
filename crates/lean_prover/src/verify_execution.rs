@@ -91,23 +91,18 @@ pub fn verify_execution(
         &table_n_vars,
     )?;
     let gkr_point = &logup_statements.gkr_point;
+    // Column claims at the GKR point are no longer pushed to WHIR — they are folded
+    // into the batched AIR sumcheck (see prove_execution.rs). Only the AIR sumcheck
+    // statement is added below.
     let mut committed_statements: CommittedStatements = Default::default();
     for table in ALL_TABLES {
-        let log_n = table_n_vars[&table];
-        committed_statements.insert(
-            table,
-            vec![(
-                MultilinearPoint(from_end(gkr_point, log_n).to_vec()),
-                logup_statements.columns_values[&table].clone(),
-                BTreeMap::new(),
-            )],
-        );
+        committed_statements.insert(table, Vec::new());
     }
 
     let bus_beta = verifier_state.sample();
     verifier_state.duplex();
     let air_alpha = verifier_state.sample();
-    let air_alpha_powers: Vec<EF> = air_alpha.powers().collect_n(max_air_constraints() + 1);
+    let air_alpha_powers: Vec<EF> = air_alpha.powers().collect_n(max_total_constraints() + 1);
     verifier_state.duplex();
     let eta: EF = verifier_state.sample(); // batching the sumchecks proving validity of AIR tables
 
@@ -132,7 +127,17 @@ pub fn verify_execution(
             }
             + bus_beta * (logup_c - bus_denominator_value);
 
-        initial_sum += eta_power * bus_final_value;
+        // Initial sum folds in each logup-column claim at the GKR point with the same
+        // alpha power the AIR constraint folder uses (alpha^{1+j}).
+        let logup_extra_sum = bus_final_value
+            + table
+                .logup_claim_columns()
+                .iter()
+                .enumerate()
+                .map(|(j, col)| air_alpha_powers[1 + j] * logup_statements.columns_values[table][col])
+                .sum::<EF>();
+
+        initial_sum += eta_power * logup_extra_sum;
 
         verify_data.push(TableVerifyData {
             table: *table,

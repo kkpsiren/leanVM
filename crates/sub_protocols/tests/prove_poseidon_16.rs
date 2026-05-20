@@ -3,7 +3,7 @@ use std::time::Instant;
 use backend::*;
 use lean_vm::{
     EF, ExtraDataForBuses, F, POSEIDON_16_COL_EFFECTIVE_INDEX_LEFT_FIRST, POSEIDON_16_COL_EFFECTIVE_INDEX_LEFT_SECOND,
-    POSEIDON_16_COL_INPUT_START, POSEIDON_16_COL_MULTIPLICITY, Poseidon16Precompile, fill_trace_poseidon_16,
+    POSEIDON_16_COL_INPUT_START, POSEIDON_16_COL_MULTIPLICITY, Poseidon16Precompile, TableT, fill_trace_poseidon_16,
     num_cols_poseidon_16,
 };
 use rand::{RngExt, SeedableRng, rngs::StdRng};
@@ -37,7 +37,10 @@ fn prove_air_poseidon_16(log_n_rows: usize) {
     fill_trace_poseidon_16(&mut trace);
 
     let air = Poseidon16Precompile::<false>;
-    let n_constraints = air.n_constraints();
+    let logup_claim_columns = air.logup_claim_columns();
+    // The AIR adds `assert_zero(flat[col])` per logup-claim column on top of its
+    // structural constraints, so size `air_alpha_powers` accordingly.
+    let n_constraints = air.n_constraints() + logup_claim_columns.len();
     let air_degree = air.degree_air();
 
     let whir_config_builder = WhirConfigBuilder {
@@ -67,16 +70,27 @@ fn prove_air_poseidon_16(log_n_rows: usize) {
     let alpha = prover_state.sample();
     let air_alpha_powers: Vec<EF> = alpha.powers().collect_n(n_constraints + 1);
     // BUS=false => `logup_alphas_eq_poly` and `bus_beta` are unused; only `alpha_powers` matter.
-    let extra_data = ExtraDataForBuses::new(Vec::new(), EF::ZERO, air_alpha_powers);
+    let extra_data = ExtraDataForBuses::new(Vec::new(), EF::ZERO, air_alpha_powers.clone());
     prover_state.duplex();
     let eq_factor: Vec<EF> = prover_state.sample_vec(log_n_rows);
     let column_refs: Vec<&[F]> = trace.iter().map(Vec::as_slice).collect();
     let packed = MleGroupRef::<EF>::Base(column_refs).pack();
 
+    // With column claims folded into the AIR sumcheck, the initial sum equals
+    // `Σ_j alpha^{j} · col_j(eq_factor)`. BUS=false means the bus's `assert_zero_ef`
+    // is replaced by no-op `declare_values`, so the column claims start at
+    // `constraint_index = 0` (alpha^0); AIR constraints are zero on the hypercube.
+    let eq_point = MultilinearPoint(eq_factor.clone());
+    let initial_sum: EF = logup_claim_columns
+        .iter()
+        .enumerate()
+        .map(|(j, &col)| air_alpha_powers[j] * trace[col].evaluate(&eq_point))
+        .sum();
+
     let mut sessions: Vec<Box<dyn OuterSumcheckSession<EF> + '_>> = vec![Box::new(AirSumcheckSession::new(
         packed,
         eq_factor,
-        EF::ZERO,
+        initial_sum,
         air,
         extra_data,
         n_rows,
@@ -109,15 +123,23 @@ fn prove_air_poseidon_16(log_n_rows: usize) {
 
     let alpha = verifier_state.sample();
     let air_alpha_powers: Vec<EF> = alpha.powers().collect_n(n_constraints + 1);
-    let extra_data = ExtraDataForBuses::new(Vec::new(), EF::ZERO, air_alpha_powers);
+    let extra_data = ExtraDataForBuses::new(Vec::new(), EF::ZERO, air_alpha_powers.clone());
 
     verifier_state.duplex();
     let eq_factor_v: Vec<EF> = verifier_state.sample_vec(log_n_rows);
 
+    // Match the prover's initial sum (column claims start at alpha^0 since BUS=false).
+    let eq_point_v = MultilinearPoint(eq_factor_v.clone());
+    let initial_sum_v: EF = logup_claim_columns
+        .iter()
+        .enumerate()
+        .map(|(j, &col)| air_alpha_powers[j] * trace[col].evaluate(&eq_point_v))
+        .sum();
+
     let Evaluation {
         point: sumcheck_air_point_v,
         value: claimed_air_final_value,
-    } = sumcheck_verify(&mut verifier_state, log_n_rows, air_degree + 1, EF::ZERO, None).unwrap();
+    } = sumcheck_verify(&mut verifier_state, log_n_rows, air_degree + 1, initial_sum_v, None).unwrap();
 
     let col_evals_v: Vec<EF> = verifier_state.next_extension_scalars_vec(n_cols).unwrap();
     let constraint_eval =

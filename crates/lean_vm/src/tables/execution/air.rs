@@ -1,9 +1,34 @@
-use crate::{EF, ExecutionTable, ExtraDataForBuses, eval_bus_virtual};
+use crate::{ColIndex, EF, ExecutionTable, ExtraDataForBuses, eval_bus_virtual};
 use backend::*;
 
 pub const N_RUNTIME_COLUMNS: usize = 8;
 pub const N_INSTRUCTION_COLUMNS: usize = 12;
 pub const N_TOTAL_EXECUTION_COLUMNS: usize = N_INSTRUCTION_COLUMNS + N_RUNTIME_COLUMNS;
+
+/// Sorted committed columns whose GKR-point logup evaluation is folded into the AIR
+/// sumcheck. Materialized as a `&'static` slice so the AIR's per-row evaluation does
+/// not allocate (the trait method just clones from this).
+pub const EXECUTION_LOGUP_CLAIM_COLUMNS: &[ColIndex] = &[
+    COL_PC,
+    COL_MEM_ADDRESS_A,
+    COL_MEM_ADDRESS_B,
+    COL_MEM_ADDRESS_C,
+    COL_MEM_VALUE_A,
+    COL_MEM_VALUE_B,
+    COL_MEM_VALUE_C,
+    COL_OPERAND_A,
+    COL_OPERAND_B,
+    COL_OPERAND_C,
+    COL_FLAG_A,
+    COL_FLAG_B,
+    COL_FLAG_C,
+    COL_FLAG_C_FP,
+    COL_FLAG_AB_FP,
+    COL_MUL,
+    COL_JUMP,
+    COL_AUX,
+    COL_PRECOMPILE_DOMAINSEP,
+];
 
 // Committed columns (IMPORTANT: they must be the first columns)
 pub const COL_PC: usize = 0;
@@ -106,6 +131,15 @@ impl<const BUS: bool> Air for ExecutionTable<BUS> {
         } else {
             builder.declare_values(&[multiplicity]);
             builder.declare_values(&[nu_a, nu_b, nu_c, domainsep]);
+        }
+        // Reduce logup column claims at the GKR point into the AIR sumcheck: each
+        // logup-claim column becomes an extra degree-1 "constraint" `col(x)` weighted
+        // by the next alpha power. The session is started with an initial sum that
+        // accounts for the corresponding GKR-point evaluation, so column evals appear
+        // at the AIR sumcheck point and the WHIR statement at the GKR point is gone.
+        for &col in EXECUTION_LOGUP_CLAIM_COLUMNS {
+            let val = builder.flat()[col];
+            builder.assert_zero(val);
         }
 
         builder.assert_zero(one_minus_flag_a_and_flag_ab_fp * (addr_a - fp_plus_operand_a));

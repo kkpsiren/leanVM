@@ -21,6 +21,10 @@ EXECUTION_TABLE_INDEX = EXECUTION_TABLE_INDEX_PLACEHOLDER
 LOOKUPS_INDEXES = LOOKUPS_INDEXES_PLACEHOLDER  # [[_; ?]; N_TABLES]
 LOOKUPS_VALUES = LOOKUPS_VALUES_PLACEHOLDER  # [[[_; ?]; ?]; N_TABLES]
 
+# Sorted committed columns per table whose GKR-point evaluation is folded into the
+# batched AIR sumcheck (one extra degree-1 "constraint" each, weighted by alpha^{1+j}).
+LOGUP_CLAIM_COLUMNS = LOGUP_CLAIM_COLUMNS_PLACEHOLDER  # [[_; ?]; N_TABLES]
+
 NUM_COLS_AIR = NUM_COLS_AIR_PLACEHOLDER
 
 AIR_DEGREES = AIR_DEGREES_PLACEHOLDER  # [_; N_TABLES]
@@ -277,20 +281,22 @@ def continue_recursion_ordered(
 ):
     bus_numerators_values = DynArray([])
     bus_denominators_values = DynArray([])
-    pcs_points = DynArray([])  # [[_; N]; N_TABLES]
-    for i in unroll(0, N_TABLES):
-        pcs_points.push(DynArray([]))
+    pcs_points = DynArray([])  # [[_; N]; N_TABLES] — the AIR-sumcheck-point claim (only)
     pcs_values = DynArray([])  # [[[[] or [_]; num cols]; N]; N_TABLES]
     pcs_values_shift = DynArray([])  # same structure, for next_mle-weighted column evals
     for i in unroll(0, N_TABLES):
+        pcs_points.push(DynArray([]))
         pcs_values.push(DynArray([]))
-        pcs_values[i].push(DynArray([]))
         pcs_values_shift.push(DynArray([]))
-        pcs_values_shift[i].push(DynArray([]))
+    # Per-column storage for the GKR-point column evaluations. They no longer open a
+    # WHIR statement: they fold into the AIR initial sum (alpha^{1+j} weights) and
+    # the AIR sumcheck reduces them to evaluations at the AIR sumcheck point.
+    gkr_col_evals = DynArray([])  # [[[] or [_]; num cols]; N_TABLES]
+    for i in unroll(0, N_TABLES):
+        gkr_col_evals.push(DynArray([]))
         total_num_cols = NUM_COLS_AIR[i]
         for _ in unroll(0, total_num_cols):
-            pcs_values[i][0].push(DynArray([]))
-            pcs_values_shift[i][0].push(DynArray([]))
+            gkr_col_evals[i].push(DynArray([]))
 
     for sorted_pos in unroll(0, N_TABLES):
         table_index: Imu
@@ -304,19 +310,17 @@ def continue_recursion_ordered(
 
         log_n_rows = table_log_heights[table_index]
         n_rows = table_heights[table_index]
-        inner_point = point_gkr + (n_vars_logup_gkr - log_n_rows) * DIM
-        pcs_points[table_index].push(inner_point)
 
         if table_index == EXECUTION_TABLE_INDEX:
             # 0] Bytecode lookup
             bytecode_prefix = multilinear_location_prefix(offset / n_rows, n_vars_logup_gkr - log_n_rows, point_gkr)
 
             fs, eval_on_pc = fs_receive_ef_inlined(fs, 1)
-            pcs_values[EXECUTION_TABLE_INDEX][0][COL_PC].push(eval_on_pc)
+            gkr_col_evals[EXECUTION_TABLE_INDEX][COL_PC].push(eval_on_pc)
             fs, instr_evals = fs_receive_ef_inlined(fs, N_INSTRUCTION_COLUMNS)
             for i in unroll(0, N_INSTRUCTION_COLUMNS):
                 global_index = N_COMMITTED_EXEC_COLUMNS + i
-                pcs_values[EXECUTION_TABLE_INDEX][0][global_index].push(instr_evals + i * DIM)
+                gkr_col_evals[EXECUTION_TABLE_INDEX][global_index].push(instr_evals + i * DIM)
             retrieved_numerators_value = add_extension_ret(retrieved_numerators_value, bytecode_prefix)
             fingerp = fingerprint_bytecode(instr_evals, eval_on_pc, logup_alphas_eq_poly)
             retrieved_denominators_value = add_extension_ret(
@@ -344,13 +348,13 @@ def continue_recursion_ordered(
         for lookup_f_index in unroll(0, len(LOOKUPS_INDEXES[table_index])):
             col_index = LOOKUPS_INDEXES[table_index][lookup_f_index]
             fs, index_eval = fs_receive_ef_inlined(fs, 1)
-            debug_assert(len(pcs_values[table_index][0][col_index]) == 0)
-            pcs_values[table_index][0][col_index].push(index_eval)
+            debug_assert(len(gkr_col_evals[table_index][col_index]) == 0)
+            gkr_col_evals[table_index][col_index].push(index_eval)
             for i in unroll(0, len(LOOKUPS_VALUES[table_index][lookup_f_index])):
                 fs, value_eval = fs_receive_ef_inlined(fs, 1)
                 col_index = LOOKUPS_VALUES[table_index][lookup_f_index][i]
-                debug_assert(len(pcs_values[table_index][0][col_index]) == 0)
-                pcs_values[table_index][0][col_index].push(value_eval)
+                debug_assert(len(gkr_col_evals[table_index][col_index]) == 0)
+                gkr_col_evals[table_index][col_index].push(value_eval)
 
                 pref = multilinear_location_prefix(offset / n_rows, n_vars_logup_gkr - log_n_rows, point_gkr)  # TODO there is some duplication here
                 retrieved_numerators_value = add_extension_ret(retrieved_numerators_value, pref)
@@ -408,7 +412,17 @@ def continue_recursion_ordered(
             bus_final_value,
             mul_extension_ret(bus_beta, sub_extension_ret(logup_c, bus_denominator_value)),
         )
-        initial_sum = add_extension_ret(initial_sum, mul_extension_ret(eta_powers + sorted_pos * DIM, bus_final_value))
+        # Fold logup column claims (at the GKR point) into the per-table initial sum.
+        # Order matches `TableT::logup_claim_columns`: alpha^{1+j} for the j-th column.
+        logup_extra_sum: Mut = bus_final_value
+        for j in unroll(0, len(LOGUP_CLAIM_COLUMNS[table_index])):
+            col = LOGUP_CLAIM_COLUMNS[table_index][j]
+            col_eval = gkr_col_evals[table_index][col][0]
+            logup_extra_sum = add_extension_ret(
+                logup_extra_sum,
+                mul_extension_ret(air_alpha_powers + (1 + j) * DIM, col_eval),
+            )
+        initial_sum = add_extension_ret(initial_sum, mul_extension_ret(eta_powers + sorted_pos * DIM, logup_extra_sum))
 
     n_max = log_n_cycles # extension table is always the biggest
     # Batched AIR sumcheck:
@@ -430,9 +444,13 @@ def continue_recursion_ordered(
 
         fs, inner_evals = fs_receive_ef_inlined(fs, n_flat_columns + n_shift_columns)
 
+        # `air_constraints_eval` now also includes the logup column claims (the AIR's
+        # symbolic `assert_zero(flat[col])` calls), evaluated at the AIR sumcheck point.
         air_constraints_eval = evaluate_air_constraints(table_index, inner_evals, air_alpha_powers, bus_beta, logup_alphas_eq_poly)
 
-        bus_point = pcs_points[table_index][0]
+        # The original GKR-derived point (`inner_point`) is no longer stored in
+        # `pcs_points` since the GKR-point WHIR claim is gone. Recompute it inline.
+        bus_point = point_gkr + (n_vars_logup_gkr - log_n_rows) * DIM
         eq_val = poly_eq_extension_dynamic_ret(bus_point, all_challenges, log_n_rows)
 
         k_t = product_first_n(all_challenges + log_n_rows * DIM, n_max - log_n_rows)

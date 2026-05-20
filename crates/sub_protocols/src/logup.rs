@@ -444,7 +444,8 @@ pub fn verify_generic_logup(
                 let domainsep_eval = resolve_ef(bus.domainsep);
                 assert!(matches!(bus.multiplicity, Multiplicity::One));
                 retrieved_numerators_value += pref * bus.direction.to_field_flag();
-                retrieved_denominators_value += pref * (c - finger_print(domainsep_eval, &bus_data_evals, alphas_eq_poly));
+                retrieved_denominators_value +=
+                    pref * (c - finger_print(domainsep_eval, &bus_data_evals, alphas_eq_poly));
             }
             offset += 1 << log_n_rows;
         }
@@ -518,4 +519,3 @@ where
 {
     dst.par_iter_mut().enumerate().for_each(|(p, slot)| *slot = build(p));
 }
-

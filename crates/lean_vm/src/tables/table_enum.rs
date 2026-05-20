@@ -82,6 +82,9 @@ impl TableT for Table {
     fn n_columns_total(&self) -> usize {
         delegate_to_inner!(self, n_columns_total)
     }
+    fn logup_claim_columns(&self) -> Vec<ColIndex> {
+        delegate_to_inner!(self, logup_claim_columns)
+    }
 }
 
 impl Air for Table {
@@ -111,6 +114,18 @@ pub fn max_bus_width_including_bytecode() -> usize {
 
 pub fn max_air_constraints() -> usize {
     ALL_TABLES.iter().map(|table| table.n_constraints()).max().unwrap()
+}
+
+/// Max over all tables of `n_total_constraints` = number of `assert_zero` /
+/// `assert_zero_ef` calls (excluding the bus's `alpha^0`). Sizes the `air_alpha_powers`
+/// vector so that the bus contribution + logup column claims + AIR constraints all
+/// have their own alpha power.
+pub fn max_total_constraints() -> usize {
+    ALL_TABLES
+        .iter()
+        .map(|table| table.n_total_constraints())
+        .max()
+        .unwrap()
 }
 
 #[cfg(test)]

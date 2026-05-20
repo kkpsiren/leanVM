@@ -272,6 +272,7 @@ fn build_replacements(log_inner_bytecode: usize, bytecode_zero_eval: F) -> BTree
     let mut air_degrees = vec![];
     let mut n_air_columns = vec![];
     let mut n_air_shift_columns = vec![];
+    let mut logup_claim_columns_str = vec![];
     for table in ALL_TABLES {
         let lookup_groups = memory_lookup_groups(&table);
 
@@ -291,6 +292,15 @@ fn build_replacements(log_inner_bytecode: usize, bytecode_zero_eval: F) -> BTree
         air_degrees.push(table.degree_air().to_string());
         n_air_columns.push(table.n_columns().to_string());
         n_air_shift_columns.push(table.n_shift_columns().to_string());
+
+        // Sorted list of committed columns whose GKR-point evals are folded into the
+        // batched AIR sumcheck (alpha^{1+j} weights). Matches `TableT::logup_claim_columns`.
+        let this_logup_cols = table
+            .logup_claim_columns()
+            .iter()
+            .map(|c| c.to_string())
+            .collect::<Vec<_>>();
+        logup_claim_columns_str.push(format!("[{}]", this_logup_cols.join(", ")));
     }
     replacements.insert(
         "LOOKUPS_INDEXES_PLACEHOLDER".to_string(),
@@ -305,12 +315,16 @@ fn build_replacements(log_inner_bytecode: usize, bytecode_zero_eval: F) -> BTree
         format!("[{}]", num_cols_air.join(", ")),
     );
     replacements.insert(
+        "LOGUP_CLAIM_COLUMNS_PLACEHOLDER".to_string(),
+        format!("[{}]", logup_claim_columns_str.join(", ")),
+    );
+    replacements.insert(
         "EXECUTION_TABLE_INDEX_PLACEHOLDER".to_string(),
         Table::execution().index().to_string(),
     );
     replacements.insert(
         "MAX_NUM_AIR_CONSTRAINTS_PLACEHOLDER".to_string(),
-        max_air_constraints().to_string(),
+        max_total_constraints().to_string(),
     );
     replacements.insert(
         "AIR_DEGREES_PLACEHOLDER".to_string(),
