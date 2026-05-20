@@ -82,9 +82,6 @@ impl TableT for Table {
     fn n_columns_total(&self) -> usize {
         delegate_to_inner!(self, n_columns_total)
     }
-    fn logup_claim_columns(&self) -> Vec<ColIndex> {
-        delegate_to_inner!(self, logup_claim_columns)
-    }
 }
 
 impl Air for Table {
@@ -100,6 +97,10 @@ impl Air for Table {
     }
     fn n_shift_columns(&self) -> usize {
         delegate_to_inner!(self, n_shift_columns)
+    }
+    fn logup_claim_columns(&self) -> &'static [usize] {
+        // Use the BUS=true Air impl on each inner table.
+        delegate_to_inner!(self, logup_claim_columns)
     }
     fn eval<AB: AirBuilder>(&self, _: &mut AB, _: &Self::ExtraData) {
         unreachable!()

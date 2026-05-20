@@ -29,6 +29,18 @@ pub trait Air: Send + Sync + 'static {
     fn low_degree_air(&self) -> Option<(usize, usize)> {
         None
     }
+
+    /// Sorted committed column indices that `eval` accumulates via
+    /// `assert_zero_linear` (degree-1, constant alpha indices `1..1 + len()` —
+    /// alpha^0 is reserved for the bus).
+    ///
+    /// The AIR sumcheck prover uses this to compute the linear-degree contribution
+    /// at a row via a direct dot product, instead of running the full `eval` once
+    /// per z-point. Returning `&[]` means the AIR has no linear-folded constraints
+    /// and the prover stays on the original code path.
+    fn logup_claim_columns(&self) -> &'static [usize] {
+        &[]
+    }
 }
 
 pub trait AirBuilder: Sized {
@@ -55,6 +67,15 @@ pub trait AirBuilder: Sized {
 
     fn assert_zero(&mut self, x: Self::IF);
     fn assert_zero_ef(&mut self, x: Self::EF);
+
+    /// Assert a degree-1 (linear in columns) constraint. The constraint-folder path
+    /// uses this to keep linear constraints in a separate accumulator: per row, a
+    /// linear constraint's contribution at z is `lin(z=0) + z·lin_slope` (by
+    /// linearity), so two cheap evaluations suffice instead of one per z-point.
+    /// Builders that don't take advantage of this fall back to `assert_zero`.
+    fn assert_zero_linear(&mut self, x: Self::IF) {
+        self.assert_zero(x);
+    }
 
     fn assert_eq(&mut self, x: Self::IF, y: Self::IF) {
         self.assert_zero(x - y);

@@ -77,6 +77,10 @@ impl<const BUS: bool> Air for ExecutionTable<BUS> {
         13
     }
 
+    fn logup_claim_columns(&self) -> &'static [usize] {
+        EXECUTION_LOGUP_CLAIM_COLUMNS
+    }
+
     #[inline]
     fn eval<AB: AirBuilder>(&self, builder: &mut AB, extra_data: &Self::ExtraData) {
         let flat = builder.flat();
@@ -137,9 +141,11 @@ impl<const BUS: bool> Air for ExecutionTable<BUS> {
         // by the next alpha power. The session is started with an initial sum that
         // accounts for the corresponding GKR-point evaluation, so column evals appear
         // at the AIR sumcheck point and the WHIR statement at the GKR point is gone.
+        // Marked as linear so the AIR sumcheck prover can evaluate them twice per row
+        // (z=0 and slope) instead of once per z-point.
         for &col in EXECUTION_LOGUP_CLAIM_COLUMNS {
             let val = builder.flat()[col];
-            builder.assert_zero(val);
+            builder.assert_zero_linear(val);
         }
 
         builder.assert_zero(one_minus_flag_a_and_flag_ab_fp * (addr_a - fp_plus_operand_a));

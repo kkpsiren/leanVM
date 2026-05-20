@@ -185,33 +185,12 @@ pub trait TableT: Air {
         false
     }
 
-    /// Committed AIR columns whose logup-derived evaluation (at the GKR point) is folded
-    /// into the batched AIR sumcheck. Each one becomes an extra degree-1 "constraint"
-    /// `col(x)` weighted by `alpha^{1 + j}` (alpha^0 being the bus). After the sumcheck
-    /// they are produced at the AIR sumcheck point, removing a WHIR statement at the
-    /// GKR-derived point.
-    ///
-    /// The default impl collects every committed column referenced by any non-primary
-    /// (memory-lookup) bus. Tables with bytecode lookups (execution) override to also
-    /// include the columns whose values fingerprint the bytecode bus.
-    fn logup_claim_columns(&self) -> Vec<ColIndex> {
-        let mut cols = std::collections::BTreeSet::<ColIndex>::new();
-        for bus in self.buses().iter().skip(1) {
-            for entry in &bus.data {
-                if let Some(col) = entry.column()
-                    && col < self.n_columns()
-                {
-                    cols.insert(col);
-                }
-            }
-        }
-        cols.into_iter().collect()
-    }
-
     /// Total number of `assert_zero` / `assert_zero_ef` calls the AIR makes
     /// (excluding the primary bus, which uses `alpha^0`):
-    /// `logup_claim_columns().len()` extra degree-1 constraints + `n_constraints()` AIR constraints.
+    /// `Air::logup_claim_columns().len()` extra degree-1 constraints + `n_constraints()`
+    /// AIR constraints.
     fn n_total_constraints(&self) -> usize {
-        self.logup_claim_columns().len() + self.n_constraints()
+        // `Air::logup_claim_columns` is inherited via `TableT: Air`.
+        <Self as backend::Air>::logup_claim_columns(self).len() + self.n_constraints()
     }
 }

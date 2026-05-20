@@ -363,7 +363,7 @@ where
             extra_data,
             fold_bit,
             active_count_pairs,
-            A::eval_packed_base,
+            A::eval_packed_base_with_mode,
             unpack_sum_packed,
         ),
         MleGroupRef::ExtensionPacked(cols) => compute_raw_poly_impl::<EF, A, EFPacking<EF>, EFPacking<EF>, _, _>(
@@ -373,7 +373,7 @@ where
             extra_data,
             fold_bit,
             active_count_pairs,
-            A::eval_packed_extension,
+            A::eval_packed_extension_with_mode,
             unpack_sum_packed,
         ),
         MleGroupRef::Base(cols) => compute_raw_poly_impl::<EF, A, PF<EF>, EF, _, _>(
@@ -383,7 +383,7 @@ where
             extra_data,
             fold_bit,
             active_count_pairs,
-            A::eval_base,
+            A::eval_base_with_mode,
             |s| s,
         ),
         MleGroupRef::Extension(cols) => compute_raw_poly_impl::<EF, A, EF, EF, _, _>(
@@ -393,7 +393,7 @@ where
             extra_data,
             fold_bit,
             active_count_pairs,
-            A::eval_extension,
+            A::eval_extension_with_mode,
             |s| s,
         ),
     }
@@ -437,6 +437,22 @@ where
     let hi_zs: Vec<_> = ((low_degree + 2)..=degree).map(PF::<EF>::from_usize).collect();
     let hi_zs_halved: Vec<_> = hi_zs.iter().map(|&tz| tz.halve()).collect();
     let lagrange_coeffs = lagrange_basis_evals(&low_zs, &hi_zs);
+    // Precompute z-values for the degree-1 (linear) contribution. `acc[0]` is z = 0;
+    // `acc[i]` for i >= 1 corresponds to z = i + 1 (we skip z = 1 in sumcheck).
+    let z_values_for_linear: Vec<PFPacking<EF>> = (0..degree)
+        .map(|i| {
+            let z = if i == 0 { 0 } else { i + 1 };
+            PFPacking::<EF>::from(PF::<EF>::from_usize(z))
+        })
+        .collect();
+    // Linear (degree-1) part is a bare dot product over the AIR's known
+    // logup-claim columns; precompute the broadcast alphas once per call.
+    let linear_cols = computation.logup_claim_columns();
+    let linear_alphas: Vec<EFPacking<EF>> = linear_cols
+        .iter()
+        .enumerate()
+        .map(|(j, _)| EFPacking::<EF>::from(extra_data.alpha_powers()[1 + j]))
+        .collect();
 
     let acc = (0..active_count_pairs)
         .into_par_iter()
@@ -471,46 +487,62 @@ where
                     diff.push(hi - lo);
                 }
 
-                // Phase 1: full AIR constraints
+                // Linear part: by linearity, `lin(z) = lin(0) + z·lin_slope`. We
+                // compute both via a direct dot product over the AIR's known
+                // logup-claim columns, skipping the `Air::eval` cost entirely.
+                let mut linear_at_0 = EFPacking::<EF>::ZERO;
+                let mut linear_slope = EFPacking::<EF>::ZERO;
+                for (j, &col) in linear_cols.iter().enumerate() {
+                    let alpha = linear_alphas[j];
+                    linear_at_0 += alpha * point[col];
+                    linear_slope += alpha * diff[col];
+                }
+                let linear_at =
+                    |z_idx: usize| -> EFPacking<EF> { linear_at_0 + linear_slope * z_values_for_linear[z_idx] };
 
-                // z = 0: full eval, capture post-block state.
+                // Phase 1: full AIR constraints (sans column claims — HighOnly mode)
+
+                // z = 0: high eval, capture post-block state.
                 {
                     let mut folder = ConstraintFolderPacked::new(&point[..n_flat], &point[n_flat..], extra_data);
+                    folder.mode = FolderMode::HighOnly;
                     folder.cached_state = Some(state_0);
                     Air::eval(computation, &mut folder, extra_data);
-                    acc[0] += folder.accumulator * partial_eq;
+                    acc[0] += (folder.accumulator + linear_at(0)) * partial_eq;
                     low_evals[0] = folder.accumulator_low;
                     state_0 = folder.cached_state.unwrap();
                 }
 
-                // z = 2: advance `point` by 2·diff, full eval, capture post-block state.
+                // z = 2: advance `point` by 2·diff, high eval, capture post-block state.
                 // Together with `state_0` this pins down the linear `state(z)` (linear when we "omit" the low degree constraints of the block)
                 for k in 0..n_cols {
                     point[k] += diff[k].double();
                 }
                 {
                     let mut folder = ConstraintFolderPacked::new(&point[..n_flat], &point[n_flat..], extra_data);
+                    folder.mode = FolderMode::HighOnly;
                     folder.cached_state = Some(state_2);
                     Air::eval(computation, &mut folder, extra_data);
-                    acc[1] += folder.accumulator * partial_eq;
+                    acc[1] += (folder.accumulator + linear_at(1)) * partial_eq;
                     low_evals[1] = folder.accumulator_low;
                     state_2 = folder.cached_state.unwrap();
                 }
 
-                // z = 3, …, d_low+1: still doing full eval
+                // z = 3, …, d_low+1: still doing high eval
                 for z_idx in 2..n_full {
                     for k in 0..n_cols {
                         point[k] += diff[k];
                     }
                     let mut folder = ConstraintFolderPacked::new(&point[..n_flat], &point[n_flat..], extra_data);
+                    folder.mode = FolderMode::HighOnly;
                     Air::eval(computation, &mut folder, extra_data);
-                    acc[z_idx] += folder.accumulator * partial_eq;
+                    acc[z_idx] += (folder.accumulator + linear_at(z_idx)) * partial_eq;
                     low_evals[z_idx] = folder.accumulator_low;
                 }
 
                 // Phase 2: skip the low degree constraints of the block
                 // For each skipped point, assemble Constraints(z) = high(z) + low(z):
-                //   -high(z): run folder with `skip_low = true`
+                //   -high(z): run folder with `skip_low = true` (+ HighOnly, so column claims are still skipped)
                 //   -low(z): deduce it via Lagrange-interpolation from previous computations
                 for t in 0..n_skip {
                     for k in 0..n_cols {
@@ -524,6 +556,7 @@ where
                     }
 
                     let mut folder = ConstraintFolderPacked::new(&point[..n_flat], &point[n_flat..], extra_data);
+                    folder.mode = FolderMode::HighOnly;
                     folder.skip_low = true;
                     folder.cached_state = Some(cached_buf);
                     folder.low_ci_count = low_n_constraints;
@@ -536,7 +569,7 @@ where
                         low_interpolated += low_evals[i] * PFPacking::<EF>::from(*lc);
                     }
 
-                    acc[n_full + t] += (folder.accumulator + low_interpolated) * partial_eq;
+                    acc[n_full + t] += (folder.accumulator + low_interpolated + linear_at(n_full + t)) * partial_eq;
                 }
 
                 (acc, point, diff, low_evals, state_0, state_2, cached_buf)
@@ -564,7 +597,7 @@ fn compute_raw_poly_impl<EF, A, IF, EFT, GetEq, UnpackSum>(
     extra_data: &A::ExtraData,
     fold_bit: usize,
     active_count_pairs: usize,
-    eval_fn: impl Fn(&A, &[IF], &A::ExtraData) -> EFT + Sync + Send,
+    eval_fn: impl Fn(&A, &[IF], &A::ExtraData, FolderMode) -> EFT + Sync + Send,
     unpack_sum: UnpackSum,
 ) -> Vec<EF>
 where
@@ -572,7 +605,15 @@ where
     A: Air + 'static,
     A::ExtraData: AlphaPowers<EF>,
     IF: Copy + Send + Sync + Sub<Output = IF> + AddAssign + PrimeCharacteristicRing,
-    EFT: Copy + Send + Sync + Add<Output = EFT> + AddAssign + Mul<Output = EFT> + PrimeCharacteristicRing,
+    EFT: Copy
+        + Send
+        + Sync
+        + Add<Output = EFT>
+        + AddAssign
+        + Mul<Output = EFT>
+        + Mul<IF, Output = EFT>
+        + PrimeCharacteristicRing
+        + From<EF>,
     GetEq: Fn(usize) -> EFT + Sync + Send,
     UnpackSum: Fn(EFT) -> EF + Sync + Send,
 {
@@ -580,6 +621,16 @@ where
     let n_cols = cols.len();
     let stride = 1usize << fold_bit;
     let lo_mask = stride - 1;
+
+    // Direct linear contribution: `lin(point) = Σ alpha^{1+j} · point[col_j]` is a
+    // bare dot product, so we don't need an `Air::eval` call to get it. (The
+    // `assert_zero_linear` calls inside `eval` are bypassed in `HighOnly` mode.)
+    let linear_cols = computation.logup_claim_columns();
+    let linear_alphas: Vec<EFT> = linear_cols
+        .iter()
+        .enumerate()
+        .map(|(j, _)| EFT::from(extra_data.alpha_powers()[1 + j]))
+        .collect();
 
     let acc = (0..active_count_pairs)
         .into_par_iter()
@@ -605,16 +656,35 @@ where
                     point.push(lo);
                     diff.push(hi - lo);
                 }
-                // z = 0 then (skip z = 1) z = 2, 3, …, degree.
-                acc[0] += eval_fn(computation, &point, extra_data) * partial_eq;
+                // Direct dot product for the linear part.
+                let mut linear_at_0 = EFT::ZERO;
+                let mut linear_slope = EFT::ZERO;
+                for (j, &col) in linear_cols.iter().enumerate() {
+                    let alpha_eft = linear_alphas[j];
+                    linear_at_0 += alpha_eft * point[col];
+                    linear_slope += alpha_eft * diff[col];
+                }
+
+                // z = 0: linear contribution is `linear_at_0`.
+                let high_at_0 = eval_fn(computation, &point, extra_data, FolderMode::HighOnly);
+                acc[0] += (high_at_0 + linear_at_0) * partial_eq;
+                // advance to z = 1 (no eval here — z = 1 is recovered from the sum).
                 for k in 0..n_cols {
                     point[k] += diff[k];
                 }
-                for acc_z in &mut acc[1..] {
+                // z = 2, 3, …, degree. `linear_contrib` is the running
+                // `linear_at_0 + z·linear_slope`; we jump it by `2·slope` for the
+                // first step (z = 0 → z = 2) and add `slope` for every subsequent z.
+                let mut linear_contrib = linear_at_0 + linear_slope + linear_slope;
+                for (z_idx, acc_z) in acc.iter_mut().enumerate().skip(1) {
                     for k in 0..n_cols {
                         point[k] += diff[k];
                     }
-                    *acc_z += eval_fn(computation, &point, extra_data) * partial_eq;
+                    let high_at_z = eval_fn(computation, &point, extra_data, FolderMode::HighOnly);
+                    *acc_z += (high_at_z + linear_contrib) * partial_eq;
+                    if z_idx + 1 < degree {
+                        linear_contrib += linear_slope;
+                    }
                 }
                 (acc, point, diff)
             },

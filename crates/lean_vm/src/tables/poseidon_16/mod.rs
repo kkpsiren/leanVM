@@ -168,10 +168,6 @@ impl<const BUS: bool> TableT for Poseidon16Precompile<BUS> {
         num_cols_total_poseidon_16()
     }
 
-    fn logup_claim_columns(&self) -> Vec<ColIndex> {
-        POSEIDON_16_LOGUP_CLAIM_COLUMNS.to_vec()
-    }
-
     fn buses(&self) -> Vec<Bus> {
         let mut buses = vec![Bus {
             direction: BusDirection::Pull,
@@ -340,6 +336,9 @@ impl<const BUS: bool> Air for Poseidon16Precompile<BUS> {
     fn n_constraints(&self) -> usize {
         BUS as usize + 99
     }
+    fn logup_claim_columns(&self) -> &'static [usize] {
+        POSEIDON_16_LOGUP_CLAIM_COLUMNS
+    }
     fn eval<AB: AirBuilder>(&self, builder: &mut AB, extra_data: &Self::ExtraData) {
         let cols: Poseidon1Cols16<AB::IF> = {
             let flat = builder.flat();
@@ -379,7 +378,7 @@ impl<const BUS: bool> Air for Poseidon16Precompile<BUS> {
         // execution table for the rationale.
         for &col in POSEIDON_16_LOGUP_CLAIM_COLUMNS {
             let val = builder.flat()[col];
-            builder.assert_zero(val);
+            builder.assert_zero_linear(val);
         }
 
         builder.assert_bool(cols.multiplicity);

@@ -80,6 +80,10 @@ impl<const BUS: bool> Air for ExtensionOpPrecompile<BUS> {
         COL_COMP + 5
     }
 
+    fn logup_claim_columns(&self) -> &'static [usize] {
+        EXTENSION_OP_LOGUP_CLAIM_COLUMNS
+    }
+
     #[inline]
     fn eval<AB: AirBuilder>(&self, builder: &mut AB, extra_data: &Self::ExtraData) {
         let flat = builder.flat();
@@ -136,7 +140,7 @@ impl<const BUS: bool> Air for ExtensionOpPrecompile<BUS> {
         // execution table for the rationale.
         for &col in EXTENSION_OP_LOGUP_CLAIM_COLUMNS {
             let val = builder.flat()[col];
-            builder.assert_zero(val);
+            builder.assert_zero_linear(val);
         }
 
         let is_ee = -(is_be - AB::F::ONE);

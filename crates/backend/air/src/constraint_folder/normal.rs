@@ -9,6 +9,9 @@ pub struct ConstraintFolder<'a, IF, EF: ExtensionField<PF<EF>>, ExtraData: Alpha
     pub extra_data: &'a ExtraData,
     pub accumulator: EF,
     pub constraint_index: usize,
+    /// Controls whether `assert_zero[_ef]` / `assert_zero_linear` accumulate or just
+    /// bump `constraint_index`. See [`FolderMode`].
+    pub mode: FolderMode,
 }
 
 impl<'a, IF, EF, ExtraData> ConstraintFolder<'a, IF, EF, ExtraData>
@@ -23,6 +26,7 @@ where
             extra_data,
             accumulator: EF::ZERO,
             constraint_index: 0,
+            mode: FolderMode::All,
         }
     }
 }
@@ -49,15 +53,28 @@ where
 
     #[inline]
     fn assert_zero(&mut self, x: IF) {
-        let alpha_power = self.extra_data.alpha_powers()[self.constraint_index];
-        self.accumulator += alpha_power * x;
+        if matches!(self.mode, FolderMode::All | FolderMode::HighOnly) {
+            let alpha_power = self.extra_data.alpha_powers()[self.constraint_index];
+            self.accumulator += alpha_power * x;
+        }
         self.constraint_index += 1;
     }
 
     #[inline]
     fn assert_zero_ef(&mut self, x: EF) {
-        let alpha_power = self.extra_data.alpha_powers()[self.constraint_index];
-        self.accumulator += alpha_power * x;
+        if matches!(self.mode, FolderMode::All | FolderMode::HighOnly) {
+            let alpha_power = self.extra_data.alpha_powers()[self.constraint_index];
+            self.accumulator += alpha_power * x;
+        }
+        self.constraint_index += 1;
+    }
+
+    #[inline]
+    fn assert_zero_linear(&mut self, x: IF) {
+        if matches!(self.mode, FolderMode::All | FolderMode::LinearOnly) {
+            let alpha_power = self.extra_data.alpha_powers()[self.constraint_index];
+            self.accumulator += alpha_power * x;
+        }
         self.constraint_index += 1;
     }
 }
