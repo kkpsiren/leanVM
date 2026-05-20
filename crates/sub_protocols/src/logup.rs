@@ -159,9 +159,8 @@ pub fn prove_generic_logup(
             }
         };
 
+       
         for bus in &table.buses() {
-            let pull = matches!(bus.direction, BusDirection::Pull);
-
             // Numerator
             let slice = &mut numerators[offset..][..1 << log_n_rows];
             match bus.multiplicity {
@@ -170,22 +169,40 @@ pub fn prove_generic_logup(
                     slice.par_iter_mut().for_each(|n| *n = val);
                 }
                 Multiplicity::Column(col) => {
-                    fill_num_from(slice, &trace.columns[col], pull);
+                    fill_num_from(slice, &trace.columns[col], matches!(bus.direction, BusDirection::Pull));
                 }
             }
 
-            // Denominator
-            let bus_data: &[BusData] = &bus.data;
-            let bus_domainsep = bus.domainsep;
-            fill_denoms(&mut denominators[offset / width..][..(1 << log_n_rows) / width], |p| {
-                let mut data_buf = [PFPacking::<EF>::ZERO; MAX_PRECOMPILE_BUS_WIDTH];
-                for (j, entry) in bus_data.iter().enumerate() {
-                    data_buf[j] = resolve_packed(*entry, p);
-                }
-                let ds = resolve_packed(bus_domainsep, p);
-                let fp = finger_print_packed::<EF>(ds, &data_buf[..bus_data.len()], &alphas_packed);
-                c_packed - fp
-            });
+            let denom_slot = &mut denominators[offset / width..][..(1 << log_n_rows) / width];
+            if bus.is_memory_lookup() {
+                let (idx_col, ofs, val_col) = bus.as_memory_lookup();
+                let ofs_f = F::from_usize(ofs);
+                let idx_col_ref: &[F] = &trace.columns[idx_col];
+                let val_col_ref: &[F] = &trace.columns[val_col];
+                fill_denoms(denom_slot, |p| {
+                    c_packed
+                        - finger_print_packed::<EF>(
+                            memory_domainsep_packed,
+                            &[
+                                PFPacking::<EF>::from_fn(|w| idx_col_ref[src_idx(p, w)] + ofs_f),
+                                PFPacking::<EF>::from_fn(|w| val_col_ref[src_idx(p, w)]),
+                            ],
+                            &alphas_packed,
+                        )
+                });
+            } else {
+                let bus_data: &[BusData] = &bus.data;
+                let bus_domainsep = bus.domainsep;
+                fill_denoms(denom_slot, |p| {
+                    let mut data_buf = [PFPacking::<EF>::ZERO; MAX_PRECOMPILE_BUS_WIDTH];
+                    for (j, entry) in bus_data.iter().enumerate() {
+                        data_buf[j] = resolve_packed(*entry, p);
+                    }
+                    let ds = resolve_packed(bus_domainsep, p);
+                    let fp = finger_print_packed::<EF>(ds, &data_buf[..bus_data.len()], &alphas_packed);
+                    c_packed - fp
+                });
+            }
             offset += 1 << log_n_rows;
         }
     }

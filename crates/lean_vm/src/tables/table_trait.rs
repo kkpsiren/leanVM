@@ -56,6 +56,20 @@ pub struct Bus {
     pub data: Vec<BusData>,
 }
 
+impl Bus {
+    pub fn is_memory_lookup(&self) -> bool {
+        matches!(self.domainsep, BusData::Constant(LOGUP_MEMORY_DOMAINSEP))
+    }
+
+    /// For memory-lookup buses, returns `(idx_col, offset, val_col)`.
+    pub fn as_memory_lookup(&self) -> (ColIndex, usize, ColIndex) {
+        match self.data.as_slice() {
+            [BusData::ColumnPlusConstant(i, o), BusData::Column(v)] => (*i, *o, *v),
+            _ => panic!("memory-lookup bus must have data = [CPC(index, offset), Column(value)]"),
+        }
+    }
+}
+
 pub fn memory_lookups_consecutive(idx_col: ColIndex, values_start: ColIndex, n: usize) -> impl Iterator<Item = Bus> {
     (0..n).map(move |i| Bus {
         direction: BusDirection::Push,
@@ -68,13 +82,12 @@ pub fn memory_lookups_consecutive(idx_col: ColIndex, values_start: ColIndex, n: 
     })
 }
 
+/// Group consecutive memory-lookup buses into `(idx_col, [val_col_0, val_col_1, …])`,
+/// matching the original `LookupIntoMemory` layout.
 pub fn memory_lookup_groups<T: TableT + ?Sized>(table: &T) -> Vec<(ColIndex, Vec<ColIndex>)> {
     let mut groups: Vec<(ColIndex, Vec<ColIndex>)> = Vec::new();
-    for bus in table.buses().iter().skip(1) {
-        let (idx_col, offset, val_col) = match bus.data.as_slice() {
-            [BusData::ColumnPlusConstant(i, o), BusData::Column(v)] => (*i, *o, *v),
-            _ => panic!("memory-lookup bus must have data = [CPC(index, offset), Column(value)]"),
-        };
+    for bus in table.buses().iter().filter(|b| b.is_memory_lookup()) {
+        let (idx_col, offset, val_col) = bus.as_memory_lookup();
         if offset == 0 {
             groups.push((idx_col, vec![val_col]));
         } else {

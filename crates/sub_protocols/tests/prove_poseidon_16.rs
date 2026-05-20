@@ -3,7 +3,7 @@ use std::time::Instant;
 use backend::*;
 use lean_vm::{
     EF, ExtraDataForBuses, F, POSEIDON_16_COL_EFFECTIVE_INDEX_LEFT_FIRST, POSEIDON_16_COL_EFFECTIVE_INDEX_LEFT_SECOND,
-    POSEIDON_16_COL_INPUT_START, POSEIDON_16_COL_MULTIPLICITY, Poseidon16Precompile, TableT, fill_trace_poseidon_16,
+    POSEIDON_16_COL_INPUT_START, POSEIDON_16_COL_MULTIPLICITY, Poseidon16Precompile, fill_trace_poseidon_16,
     num_cols_poseidon_16,
 };
 use rand::{RngExt, SeedableRng, rngs::StdRng};
