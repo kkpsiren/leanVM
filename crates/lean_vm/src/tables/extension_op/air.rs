@@ -1,6 +1,6 @@
 use crate::{
     ColIndex, EF, EXT_OP_FLAG_ADD, EXT_OP_FLAG_IS_BE, EXT_OP_FLAG_MUL, EXT_OP_FLAG_POLY_EQ, ExtraDataForBuses,
-    eval_bus_virtual,
+    bus_fingerprint,
     tables::extension_op::{EXT_OP_LEN_MULTIPLIER, ExtensionOpPrecompile},
 };
 use backend::*;
@@ -130,12 +130,12 @@ impl<const BUS: bool> Air for ExtensionOpPrecompile<BUS> {
         let idx_r = flat[COL_IDX_RES];
 
         if BUS {
-            builder.assert_zero_ef(eval_bus_virtual::<AB, EF>(
-                extra_data,
-                multiplicity,
-                aux,
-                &[idx_a, idx_b, idx_r],
-            ));
+            // multiplicity (degree 2 = start * active, non-linear) and the bus
+            // fingerprint (degree 1 in cols but EF-typed, so still emitted via
+            // `assert_zero_ef` — adding a linear-EF builder method to optimize
+            // this is a follow-up).
+            builder.assert_zero(multiplicity);
+            builder.assert_zero_ef(bus_fingerprint::<AB, EF>(extra_data, aux, &[idx_a, idx_b, idx_r]));
         } else {
             builder.declare_values(&[multiplicity]);
             builder.declare_values(&[idx_a, idx_b, idx_r, aux]);

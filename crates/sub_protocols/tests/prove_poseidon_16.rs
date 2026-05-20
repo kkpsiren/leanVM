@@ -70,7 +70,7 @@ fn prove_air_poseidon_16(log_n_rows: usize) {
     let alpha = prover_state.sample();
     let air_alpha_powers: Vec<EF> = alpha.powers().collect_n(n_constraints + 1);
     // BUS=false => `logup_alphas_eq_poly` and `bus_beta` are unused; only `alpha_powers` matter.
-    let extra_data = ExtraDataForBuses::new(Vec::new(), EF::ZERO, air_alpha_powers.clone());
+    let extra_data = ExtraDataForBuses::new(Vec::new(), air_alpha_powers.clone());
     prover_state.duplex();
     let eq_factor: Vec<EF> = prover_state.sample_vec(log_n_rows);
     let column_refs: Vec<&[F]> = trace.iter().map(Vec::as_slice).collect();
@@ -123,7 +123,7 @@ fn prove_air_poseidon_16(log_n_rows: usize) {
 
     let alpha = verifier_state.sample();
     let air_alpha_powers: Vec<EF> = alpha.powers().collect_n(n_constraints + 1);
-    let extra_data = ExtraDataForBuses::new(Vec::new(), EF::ZERO, air_alpha_powers.clone());
+    let extra_data = ExtraDataForBuses::new(Vec::new(), air_alpha_powers.clone());
 
     verifier_state.duplex();
     let eq_factor_v: Vec<EF> = verifier_state.sample_vec(log_n_rows);

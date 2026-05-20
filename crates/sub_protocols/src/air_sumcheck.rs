@@ -449,7 +449,9 @@ where
     // logup-claim columns; precompute the broadcast alphas once per call.
     // `alpha_offset` is 1 when the AIR opens with a bus `assert_zero_ef`.
     let linear_cols = computation.logup_claim_columns();
-    let alpha_offset = usize::from(computation.has_bus());
+    // The bus consumes 2 alpha slots now (multiplicity at alpha^0, fingerprint at
+    // alpha^1), so column claims start at alpha^{2+j} when `has_bus()`.
+    let alpha_offset = if computation.has_bus() { 2 } else { 0 };
     let linear_alphas: Vec<EFPacking<EF>> = linear_cols
         .iter()
         .enumerate()
@@ -630,7 +632,9 @@ where
     // `alpha_offset` is 1 when the AIR opens with a bus `assert_zero_ef` (it consumes
     // `alpha^0`) and 0 otherwise — see `Air::has_bus`.
     let linear_cols = computation.logup_claim_columns();
-    let alpha_offset = usize::from(computation.has_bus());
+    // The bus consumes 2 alpha slots now (multiplicity at alpha^0, fingerprint at
+    // alpha^1), so column claims start at alpha^{2+j} when `has_bus()`.
+    let alpha_offset = if computation.has_bus() { 2 } else { 0 };
     let linear_alphas: Vec<EFT> = linear_cols
         .iter()
         .enumerate()

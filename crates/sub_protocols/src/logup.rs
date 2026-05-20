@@ -159,7 +159,6 @@ pub fn prove_generic_logup(
             }
         };
 
-       
         for bus in &table.buses() {
             // Numerator
             let slice = &mut numerators[offset..][..1 << log_n_rows];

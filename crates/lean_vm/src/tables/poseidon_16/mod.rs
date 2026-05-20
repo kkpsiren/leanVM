@@ -365,11 +365,14 @@ impl<const BUS: bool> Air for Poseidon16Precompile<BUS> {
         let index_a =
             cols.effective_index_left_second - one_minus_flag_hardcoded_left * AB::F::from_usize(HALF_DIGEST_LEN);
 
-        // Bus: data = [a, b, res], domainsep
+        // Bus split: multiplicity is just `cols.multiplicity` (linear, single column —
+        // a follow-up could route it through `assert_zero_linear` + LOGUP_CLAIM_COLUMNS
+        // to fold it into the linear dot product); fingerprint is degree 2 in cols
+        // (`domainsep_reconstructed` has `flag_hardcoded_left * offset_hardcoded_left`).
         if BUS {
-            builder.assert_zero_ef(eval_bus_virtual::<AB, EF>(
+            builder.assert_zero(cols.multiplicity);
+            builder.assert_zero_ef(bus_fingerprint::<AB, EF>(
                 extra_data,
-                cols.multiplicity,
                 domainsep_reconstructed,
                 &[index_a, cols.index_b, cols.index_res],
             ));

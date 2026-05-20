@@ -99,10 +99,9 @@ pub fn verify_execution(
         committed_statements.insert(table, Vec::new());
     }
 
-    let bus_beta = verifier_state.sample();
-    verifier_state.duplex();
+    // The bus's separate `bus_beta` is gone — `air_alpha_powers[1]` plays that role.
     let air_alpha = verifier_state.sample();
-    let air_alpha_powers: Vec<EF> = air_alpha.powers().collect_n(max_total_constraints() + 1);
+    let air_alpha_powers: Vec<EF> = air_alpha.powers().collect_n(max_total_constraints() + 2);
     verifier_state.duplex();
     let eta: EF = verifier_state.sample(); // batching the sumchecks proving validity of AIR tables
 
@@ -120,21 +119,24 @@ pub fn verify_execution(
     for (table, _) in &tables_sorted {
         let bus_numerator_value = logup_statements.bus_numerators_values[table];
         let bus_denominator_value = logup_statements.bus_denominators_values[table];
+        // Bus = alpha^0·multiplicity + alpha^1·fingerprint (replaces the old combined
+        // `bus_beta` formulation). Both contributions at GKR:
+        //   multiplicity_eval = bus_numerator_value * direction (direction²=1).
+        //   fingerprint_eval  = logup_c - bus_denominator_value.
         let bus_final_value = bus_numerator_value
             * match table.buses()[0].direction {
                 BusDirection::Pull => EF::NEG_ONE,
                 BusDirection::Push => EF::ONE,
             }
-            + bus_beta * (logup_c - bus_denominator_value);
+            + air_alpha_powers[1] * (logup_c - bus_denominator_value);
 
-        // Initial sum folds in each logup-column claim at the GKR point with the same
-        // alpha power the AIR constraint folder uses (alpha^{1+j}).
+        // Column claims now live at alpha^{2+j} (bus consumes alpha^0 and alpha^1).
         let logup_extra_sum = bus_final_value
             + table
                 .logup_claim_columns()
                 .iter()
                 .enumerate()
-                .map(|(j, col)| air_alpha_powers[1 + j] * logup_statements.columns_values[table][col])
+                .map(|(j, col)| air_alpha_powers[2 + j] * logup_statements.columns_values[table][col])
                 .sum::<EF>();
 
         initial_sum += eta_power * logup_extra_sum;
@@ -142,7 +144,7 @@ pub fn verify_execution(
         verify_data.push(TableVerifyData {
             table: *table,
             eta_power,
-            extra_data: ExtraDataForBuses::new(logup_alphas_eq_poly.clone(), bus_beta, air_alpha_powers.clone()),
+            extra_data: ExtraDataForBuses::new(logup_alphas_eq_poly.clone(), air_alpha_powers.clone()),
         });
 
         eta_power *= eta;

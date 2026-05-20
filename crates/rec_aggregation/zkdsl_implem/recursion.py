@@ -385,10 +385,8 @@ def continue_recursion_ordered(
 
     # VERIFY BUS AND AIR — back-loaded batched sumcheck (see https://hackmd.io/s/HyxaupAAA)
 
-    fs, bus_beta = fs_sample_ef(fs)
-    fs = fs_duplex(fs)
     fs, air_alpha = fs_sample_ef(fs)
-    air_alpha_powers = powers_const(air_alpha, MAX_NUM_AIR_CONSTRAINTS + 1)
+    air_alpha_powers = powers_const(air_alpha, MAX_NUM_AIR_CONSTRAINTS + 2)
     fs = fs_duplex(fs)
     fs, eta = fs_sample_ef(fs)
     eta_powers = powers_const(eta, N_TABLES)
@@ -408,19 +406,19 @@ def continue_recursion_ordered(
         bus_final_value: Mut = bus_numerator_value
         if table_index != EXECUTION_TABLE_INDEX:
             bus_final_value = opposite_extension_ret(bus_final_value)
+        # alpha^1 · (logup_c - bus_denominator) replaces `bus_beta · (logup_c - bus_denominator)`.
         bus_final_value = add_extension_ret(
             bus_final_value,
-            mul_extension_ret(bus_beta, sub_extension_ret(logup_c, bus_denominator_value)),
+            mul_extension_ret(air_alpha_powers + DIM, sub_extension_ret(logup_c, bus_denominator_value)),
         )
-        # Fold logup column claims (at the GKR point) into the per-table initial sum.
-        # Order matches `TableT::logup_claim_columns`: alpha^{1+j} for the j-th column.
+        # Column claims now start at alpha^{2+j} (bus consumes alpha^0 and alpha^1).
         logup_extra_sum: Mut = bus_final_value
         for j in unroll(0, len(LOGUP_CLAIM_COLUMNS[table_index])):
             col = LOGUP_CLAIM_COLUMNS[table_index][j]
             col_eval = gkr_col_evals[table_index][col][0]
             logup_extra_sum = add_extension_ret(
                 logup_extra_sum,
-                mul_extension_ret(air_alpha_powers + (1 + j) * DIM, col_eval),
+                mul_extension_ret(air_alpha_powers + (2 + j) * DIM, col_eval),
             )
         initial_sum = add_extension_ret(initial_sum, mul_extension_ret(eta_powers + sorted_pos * DIM, logup_extra_sum))
 
@@ -446,7 +444,7 @@ def continue_recursion_ordered(
 
         # `air_constraints_eval` now also includes the logup column claims (the AIR's
         # symbolic `assert_zero(flat[col])` calls), evaluated at the AIR sumcheck point.
-        air_constraints_eval = evaluate_air_constraints(table_index, inner_evals, air_alpha_powers, bus_beta, logup_alphas_eq_poly)
+        air_constraints_eval = evaluate_air_constraints(table_index, inner_evals, air_alpha_powers, logup_alphas_eq_poly)
 
         # The original GKR-derived point (`inner_point`) is no longer stored in
         # `pcs_points` since the GKR-point WHIR claim is gone. Recompute it inline.
@@ -820,16 +818,16 @@ def compute_total_gkr_n_vars(log_memory, log_bytecode_padded, tables_heights):
     return log2_ceil_runtime(total)
 
 
-def evaluate_air_constraints(table_index, inner_evals, air_alpha_powers, bus_beta, logup_alphas_eq_poly):
+def evaluate_air_constraints(table_index, inner_evals, air_alpha_powers, logup_alphas_eq_poly):
     res: Imu
     debug_assert(table_index < N_TABLES)
     match table_index:
         case 0:
-            res = evaluate_air_constraints_table_0(inner_evals, air_alpha_powers, bus_beta, logup_alphas_eq_poly)
+            res = evaluate_air_constraints_table_0(inner_evals, air_alpha_powers, logup_alphas_eq_poly)
         case 1:
-            res = evaluate_air_constraints_table_1(inner_evals, air_alpha_powers, bus_beta, logup_alphas_eq_poly)
+            res = evaluate_air_constraints_table_1(inner_evals, air_alpha_powers, logup_alphas_eq_poly)
         case 2:
-            res = evaluate_air_constraints_table_2(inner_evals, air_alpha_powers, bus_beta, logup_alphas_eq_poly)
+            res = evaluate_air_constraints_table_2(inner_evals, air_alpha_powers, logup_alphas_eq_poly)
     return res
 
 

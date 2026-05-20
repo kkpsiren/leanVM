@@ -147,10 +147,12 @@ pub fn prove_execution(
         committed_statements.insert(table, Vec::new());
     }
 
-    let bus_beta = prover_state.sample();
-    prover_state.duplex();
+    // The bus's separate `bus_beta` is gone — the AIR alpha at `alpha^1` plays its
+    // role as the random combiner between the multiplicity (alpha^0) and the
+    // fingerprint (alpha^1) constraints. Need `+2` slots in `air_alpha_powers`:
+    // one for the bus's extra constraint, one for the trailing buffer.
     let air_alpha = prover_state.sample();
-    let air_alpha_powers: Vec<EF> = air_alpha.powers().collect_n(max_total_constraints() + 1);
+    let air_alpha_powers: Vec<EF> = air_alpha.powers().collect_n(max_total_constraints() + 2);
     prover_state.duplex();
     let air_eta: EF = prover_state.sample();
 
@@ -178,26 +180,29 @@ pub fn prove_execution(
     for (idx, (table, log_n_rows)) in tables_sorted.iter().enumerate() {
         let bus_numerator_value = logup_statements.bus_numerators_values[table];
         let bus_denominator_value = logup_statements.bus_denominators_values[table];
+        // Bus contribution = alpha^0 * multiplicity_eval + alpha^1 * fingerprint_eval.
+        // multiplicity_eval at GKR = `bus_numerator_value * direction` (direction²=1).
+        // fingerprint_eval at GKR = `logup_c - bus_denominator_value`.
         let bus_final_value = bus_numerator_value
             * match table.buses()[0].direction {
                 BusDirection::Pull => EF::NEG_ONE,
                 BusDirection::Push => EF::ONE,
             }
-            + bus_beta * (logup_c - bus_denominator_value);
+            + air_alpha_powers[1] * (logup_c - bus_denominator_value);
 
-        // Initial sum folds in each logup-column claim at the GKR point with the same
-        // alpha power the AIR constraint folder will use during the sumcheck.
+        // Initial sum folds in each logup-column claim at the GKR point. Column claims
+        // now start at `alpha^{2+j}` (bus consumes alpha^0 and alpha^1).
         let logup_extra_sum = bus_final_value
             + table
                 .logup_claim_columns()
                 .iter()
                 .enumerate()
-                .map(|(j, col)| air_alpha_powers[1 + j] * logup_statements.columns_values[table][col])
+                .map(|(j, col)| air_alpha_powers[2 + j] * logup_statements.columns_values[table][col])
                 .sum::<EF>();
 
         let eq_suffix = from_end(gkr_point, *log_n_rows).to_vec();
 
-        let extra_data = ExtraDataForBuses::new(logup_alphas_eq_poly.clone(), bus_beta, air_alpha_powers.clone());
+        let extra_data = ExtraDataForBuses::new(logup_alphas_eq_poly.clone(), air_alpha_powers.clone());
 
         let mut flat_and_shift: Vec<&[PF<EF>]> = column_refs[idx].to_vec();
         flat_and_shift.extend(shifted_rows[idx].iter().map(Vec::as_slice));

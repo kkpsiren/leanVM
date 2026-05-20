@@ -1,4 +1,4 @@
-use crate::{ColIndex, EF, ExecutionTable, ExtraDataForBuses, eval_bus_virtual};
+use crate::{ColIndex, EF, ExecutionTable, ExtraDataForBuses, bus_fingerprint};
 use backend::*;
 
 pub const N_RUNTIME_COLUMNS: usize = 8;
@@ -130,12 +130,12 @@ impl<const BUS: bool> Air for ExecutionTable<BUS> {
         let multiplicity = -(add + mul + deref + jump - AB::F::ONE);
 
         if BUS {
-            builder.assert_zero_ef(eval_bus_virtual::<AB, EF>(
-                extra_data,
-                multiplicity,
-                domainsep,
-                &[nu_a, nu_b, nu_c],
-            ));
+            // Bus split into two constraints (alpha^0 + alpha^1):
+            // - multiplicity (degree 2 in cols here — not linear, so plain `assert_zero`)
+            // - fingerprint = `Σ alphas[i]·data[i] + alphas_last·domainsep` (degree 2 here)
+            //   The AIR alpha at `alpha^1` plays the role the separate `bus_beta` used to.
+            builder.assert_zero(multiplicity);
+            builder.assert_zero_ef(bus_fingerprint::<AB, EF>(extra_data, domainsep, &[nu_a, nu_b, nu_c]));
         } else {
             builder.declare_values(&[multiplicity]);
             builder.declare_values(&[nu_a, nu_b, nu_c, domainsep]);
