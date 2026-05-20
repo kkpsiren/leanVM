@@ -51,9 +51,19 @@ where
         self.shift
     }
 
+    #[inline(always)]
+    fn bus_only(&self) -> bool {
+        matches!(self.mode, FolderMode::BusOnly)
+    }
+
     #[inline]
     fn assert_zero(&mut self, x: IF) {
-        if matches!(self.mode, FolderMode::All | FolderMode::HighOnly) {
+        let acc = match self.mode {
+            FolderMode::All | FolderMode::HighOnly => true,
+            FolderMode::BusOnly => self.constraint_index < 2,
+            FolderMode::LinearOnly => false,
+        };
+        if acc {
             let alpha_power = self.extra_data.alpha_powers()[self.constraint_index];
             self.accumulator += alpha_power * x;
         }
@@ -62,7 +72,12 @@ where
 
     #[inline]
     fn assert_zero_ef(&mut self, x: EF) {
-        if matches!(self.mode, FolderMode::All | FolderMode::HighOnly) {
+        let acc = match self.mode {
+            FolderMode::All | FolderMode::HighOnly => true,
+            FolderMode::BusOnly => self.constraint_index < 2,
+            FolderMode::LinearOnly => false,
+        };
+        if acc {
             let alpha_power = self.extra_data.alpha_powers()[self.constraint_index];
             self.accumulator += alpha_power * x;
         }

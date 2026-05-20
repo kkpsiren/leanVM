@@ -140,6 +140,10 @@ impl<const BUS: bool> Air for ExtensionOpPrecompile<BUS> {
             builder.declare_values(&[multiplicity]);
             builder.declare_values(&[idx_a, idx_b, idx_r, aux]);
         }
+        // Round-0 z=0 path: AIR constraints below are zero by validity, skip them.
+        if builder.bus_only() {
+            return;
+        }
         // Reduce logup column claims at the GKR point into the AIR sumcheck. See the
         // execution table for the rationale.
         for &col in EXTENSION_OP_LOGUP_CLAIM_COLUMNS {

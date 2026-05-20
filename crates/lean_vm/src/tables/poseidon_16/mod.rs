@@ -463,6 +463,15 @@ fn eval_poseidon1_16<AB: AirBuilder>(builder: &mut AB, local: &Poseidon1Cols16<A
         }
     });
 
+    // Round-0 z=0: post-block state is captured (degree-split phase 2 needs it),
+    // but the final full rounds + last-2-full-rounds below would only emit assertions
+    // that are zero by AIR validity at actual row values. Skip their expression
+    // computation (16-wide MDS + 16 cubes per full-round call) — biggest single
+    // savings inside the poseidon AIR.
+    if builder.bus_only() {
+        return;
+    }
+
     let final_constants = poseidon1_final_constants();
     for round in 0..HALF_FINAL_FULL_ROUNDS - 1 {
         eval_2_full_rounds_16(

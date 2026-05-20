@@ -140,6 +140,13 @@ impl<const BUS: bool> Air for ExecutionTable<BUS> {
             builder.declare_values(&[multiplicity]);
             builder.declare_values(&[nu_a, nu_b, nu_c, domainsep]);
         }
+        // Round-0 z=0 path: every AIR constraint below evaluates to zero by AIR
+        // validity at the actual table row values, so we skip their expression
+        // computation entirely. (constraint_index stays inconsistent past this
+        // point but the caller only reads `folder.accumulator` afterwards.)
+        if builder.bus_only() {
+            return;
+        }
         // Reduce logup column claims at the GKR point into the AIR sumcheck: each
         // logup-claim column becomes an extra degree-1 "constraint" `col(x)` weighted
         // by the next alpha power. The session is started with an initial sum that

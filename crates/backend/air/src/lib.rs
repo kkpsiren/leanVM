@@ -111,4 +111,15 @@ pub trait AirBuilder: Sized {
     fn declare_values(&mut self, values: &[Self::IF]) {
         let _ = values;
     }
+
+    /// True when the constraint folder is in `BusOnly` mode (round-0 z=0 of the
+    /// AIR sumcheck). The AIR's `eval` uses this to early-return after emitting
+    /// the bus assertions — skipping the cost of computing every high-degree AIR
+    /// constraint's expression, which evaluates to zero by AIR validity at that
+    /// point. The default impl returns `false` (every other builder runs the
+    /// full AIR).
+    #[inline(always)]
+    fn bus_only(&self) -> bool {
+        false
+    }
 }

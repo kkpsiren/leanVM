@@ -246,6 +246,7 @@ where
             &split_eq,
             self.folding_bit_packed(),
             active_count_pairs,
+            self.rounds_done == 0,
         );
         let mut p_evals: Vec<EF> = p_evals_raw
             .into_iter()
@@ -315,6 +316,7 @@ fn compute_raw_poly<'a, EF, A>(
     split_eq: &SplitEq<EF>,
     fold_bit: usize, // in storage
     active_count_pairs: usize,
+    is_first_round: bool,
 ) -> Vec<EF>
 where
     EF: ExtensionField<PF<EF>>,
@@ -322,6 +324,15 @@ where
     A::ExtraData: AlphaPowers<EF>,
 {
     let unpack_sum_packed = |s: EFPacking<EF>| -> EF { EFPacking::<EF>::to_ext_iter([s]).sum::<EF>() };
+    // `BusOnly` at z=0 is sound only in round 0: column values are then actual
+    // table rows, so every AIR constraint evaluates to zero by AIR validity. The
+    // AIR's `eval` short-circuits after the bus via `builder.bus_only()`,
+    // skipping the cost of computing every high-degree constraint expression.
+    let mode_at_z0 = if is_first_round {
+        FolderMode::BusOnly
+    } else {
+        FolderMode::HighOnly
+    };
 
     if let Some((low_degree, low_n_constraints)) = computation.low_degree_air() {
         match multilinears {
@@ -336,6 +347,7 @@ where
                     low_degree,
                     low_n_constraints,
                     unpack_sum_packed,
+                    mode_at_z0,
                 );
             }
             MleGroupRef::ExtensionPacked(cols) => {
@@ -349,6 +361,7 @@ where
                     low_degree,
                     low_n_constraints,
                     unpack_sum_packed,
+                    mode_at_z0,
                 );
             }
             _ => {}
@@ -365,6 +378,7 @@ where
             active_count_pairs,
             A::eval_packed_base_with_mode,
             unpack_sum_packed,
+            mode_at_z0,
         ),
         MleGroupRef::ExtensionPacked(cols) => compute_raw_poly_impl::<EF, A, EFPacking<EF>, EFPacking<EF>, _, _>(
             cols,
@@ -375,6 +389,7 @@ where
             active_count_pairs,
             A::eval_packed_extension_with_mode,
             unpack_sum_packed,
+            mode_at_z0,
         ),
         MleGroupRef::Base(cols) => compute_raw_poly_impl::<EF, A, PF<EF>, EF, _, _>(
             cols,
@@ -385,6 +400,7 @@ where
             active_count_pairs,
             A::eval_base_with_mode,
             |s| s,
+            mode_at_z0,
         ),
         MleGroupRef::Extension(cols) => compute_raw_poly_impl::<EF, A, EF, EF, _, _>(
             cols,
@@ -395,6 +411,7 @@ where
             active_count_pairs,
             A::eval_extension_with_mode,
             |s| s,
+            mode_at_z0,
         ),
     }
 }
@@ -410,6 +427,7 @@ fn compute_raw_poly_degree_split<EF, A, IF, GetEq, UnpackSum>(
     low_degree: usize,
     low_n_constraints: usize,
     unpack_sum: UnpackSum,
+    mode_at_z0: FolderMode,
 ) -> Vec<EF>
 where
     EF: ExtensionField<PF<EF>>,
@@ -504,12 +522,16 @@ where
                 let linear_at =
                     |z_idx: usize| -> EFPacking<EF> { linear_at_0 + linear_slope * z_values_for_linear[z_idx] };
 
-                // Phase 1: full AIR constraints (sans column claims — HighOnly mode)
+                // Phase 1: full AIR constraints (sans column claims — HighOnly mode,
+                // except z=0 in round 0 which uses BusOnly: the low-degree block
+                // still runs to capture the post-partial-round state, but final
+                // full rounds + outside-block assertions are skipped because their
+                // expressions vanish by AIR validity at actual row values).
 
                 // z = 0: high eval, capture post-block state.
                 {
                     let mut folder = ConstraintFolderPacked::new(&point[..n_flat], &point[n_flat..], extra_data);
-                    folder.mode = FolderMode::HighOnly;
+                    folder.mode = mode_at_z0;
                     folder.cached_state = Some(state_0);
                     Air::eval(computation, &mut folder, extra_data);
                     acc[0] += (folder.accumulator + linear_at(0)) * partial_eq;
@@ -603,6 +625,7 @@ fn compute_raw_poly_impl<EF, A, IF, EFT, GetEq, UnpackSum>(
     active_count_pairs: usize,
     eval_fn: impl Fn(&A, &[IF], &A::ExtraData, FolderMode) -> EFT + Sync + Send,
     unpack_sum: UnpackSum,
+    mode_at_z0: FolderMode,
 ) -> Vec<EF>
 where
     EF: ExtensionField<PF<EF>>,
@@ -674,8 +697,11 @@ where
                     linear_slope += alpha_eft * diff[col];
                 }
 
-                // z = 0: linear contribution is `linear_at_0`.
-                let high_at_0 = eval_fn(computation, &point, extra_data, FolderMode::HighOnly);
+                // z = 0: linear contribution is `linear_at_0`. In round 0 `mode_at_z0`
+                // is `BusOnly`, which makes the AIR's `eval` early-return after the
+                // bus assertions — skipping the high-degree AIR constraints' expression
+                // computation entirely (they evaluate to zero by AIR validity here).
+                let high_at_0 = eval_fn(computation, &point, extra_data, mode_at_z0);
                 acc[0] += (high_at_0 + linear_at_0) * partial_eq;
                 // advance to z = 1 (no eval here — z = 1 is recovered from the sum).
                 for k in 0..n_cols {
