@@ -159,8 +159,65 @@ pub fn prove_generic_logup(
             }
         };
 
-        for bus in &table.buses() {
-            // Numerator
+        // Iterate buses, but coalesce consecutive memory-lookup buses sharing the
+        // same `idx_col` (offsets 0, 1, 2, …) into a single nested par_iter — same
+        // structure the pre-bus code used for `LookupIntoMemory`. Per-bus dispatch
+        // wastes a lot of time for poseidon (37 buses) because each `par_iter_mut`
+        // pays rayon's sync overhead.
+        let buses = table.buses();
+        let mut i = 0;
+        while i < buses.len() {
+            let bus = &buses[i];
+            if bus.is_memory_lookup() {
+                let (idx_col, ofs0, first_val_col) = bus.as_memory_lookup();
+                debug_assert_eq!(ofs0, 0);
+                let mut run_len = 1;
+                while i + run_len < buses.len() {
+                    let next = &buses[i + run_len];
+                    if !next.is_memory_lookup() {
+                        break;
+                    }
+                    let (n_idx, n_ofs, n_val) = next.as_memory_lookup();
+                    if n_idx != idx_col || n_ofs != run_len || n_val != first_val_col + run_len {
+                        break;
+                    }
+                    run_len += 1;
+                }
+
+                // Memory-lookup buses are Push + multiplicity One, so numerators are
+                // F::ONE across the whole run — a single par_iter_mut fills them all.
+                numerators[offset..][..run_len << log_n_rows]
+                    .par_iter_mut()
+                    .for_each(|n| *n = F::ONE);
+
+                // Denominators: nested par over (col-in-run, row). Matches the
+                // pre-bus `LookupIntoMemory` codepath.
+                let packed_chunk_size = (1 << log_n_rows) / width;
+                let idx_col_ref: &[F] = &trace.columns[idx_col];
+                denominators[offset / width..][..run_len * packed_chunk_size]
+                    .par_chunks_exact_mut(packed_chunk_size)
+                    .enumerate()
+                    .for_each(|(k, denom_chunk)| {
+                        let k_field = F::from_usize(k);
+                        let val_col_ref: &[F] = &trace.columns[first_val_col + k];
+                        denom_chunk.par_iter_mut().enumerate().for_each(|(p, slot)| {
+                            *slot = c_packed
+                                - finger_print_packed::<EF>(
+                                    memory_domainsep_packed,
+                                    &[
+                                        PFPacking::<EF>::from_fn(|w| idx_col_ref[src_idx(p, w)] + k_field),
+                                        PFPacking::<EF>::from_fn(|w| val_col_ref[src_idx(p, w)]),
+                                    ],
+                                    &alphas_packed,
+                                );
+                        });
+                    });
+                offset += run_len << log_n_rows;
+                i += run_len;
+                continue;
+            }
+
+            // Non-memory bus: process individually.
             let slice = &mut numerators[offset..][..1 << log_n_rows];
             match bus.multiplicity {
                 Multiplicity::One => {
@@ -171,38 +228,20 @@ pub fn prove_generic_logup(
                     fill_num_from(slice, &trace.columns[col], matches!(bus.direction, BusDirection::Pull));
                 }
             }
-
             let denom_slot = &mut denominators[offset / width..][..(1 << log_n_rows) / width];
-            if bus.is_memory_lookup() {
-                let (idx_col, ofs, val_col) = bus.as_memory_lookup();
-                let ofs_f = F::from_usize(ofs);
-                let idx_col_ref: &[F] = &trace.columns[idx_col];
-                let val_col_ref: &[F] = &trace.columns[val_col];
-                fill_denoms(denom_slot, |p| {
-                    c_packed
-                        - finger_print_packed::<EF>(
-                            memory_domainsep_packed,
-                            &[
-                                PFPacking::<EF>::from_fn(|w| idx_col_ref[src_idx(p, w)] + ofs_f),
-                                PFPacking::<EF>::from_fn(|w| val_col_ref[src_idx(p, w)]),
-                            ],
-                            &alphas_packed,
-                        )
-                });
-            } else {
-                let bus_data: &[BusData] = &bus.data;
-                let bus_domainsep = bus.domainsep;
-                fill_denoms(denom_slot, |p| {
-                    let mut data_buf = [PFPacking::<EF>::ZERO; MAX_PRECOMPILE_BUS_WIDTH];
-                    for (j, entry) in bus_data.iter().enumerate() {
-                        data_buf[j] = resolve_packed(*entry, p);
-                    }
-                    let ds = resolve_packed(bus_domainsep, p);
-                    let fp = finger_print_packed::<EF>(ds, &data_buf[..bus_data.len()], &alphas_packed);
-                    c_packed - fp
-                });
-            }
+            let bus_data: &[BusData] = &bus.data;
+            let bus_domainsep = bus.domainsep;
+            fill_denoms(denom_slot, |p| {
+                let mut data_buf = [PFPacking::<EF>::ZERO; MAX_PRECOMPILE_BUS_WIDTH];
+                for (j, entry) in bus_data.iter().enumerate() {
+                    data_buf[j] = resolve_packed(*entry, p);
+                }
+                let ds = resolve_packed(bus_domainsep, p);
+                let fp = finger_print_packed::<EF>(ds, &data_buf[..bus_data.len()], &alphas_packed);
+                c_packed - fp
+            });
             offset += 1 << log_n_rows;
+            i += 1;
         }
     }
 

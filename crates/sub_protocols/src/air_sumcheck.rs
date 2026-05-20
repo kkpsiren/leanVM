@@ -738,6 +738,44 @@ where
     acc.into_iter().map(unpack_sum).collect()
 }
 
+/// Adaptive parallel map over the active sessions of the current round.
+///
+/// `rayon::join` is documented as "potentially parallel": when the calling
+/// worker is the only idle one (because the inner `par_iter` of an
+/// already-running session is keeping every other worker busy), `join` runs the
+/// second closure inline on the current thread instead of spawning. This is
+/// exactly what we need:
+///   - early rounds: every session's inner `par_iter` saturates cores by itself,
+///     so `join` collapses to sequential — no nested-par_iter contention (~10%
+///     regression on a 16-thread x86 machine).
+///   - late rounds & high-bandwidth machines: inner `par_iter` underutilizes
+///     cores, so `join` spreads sessions across the idle workers.
+///
+/// `par_iter_mut` does not collapse the same way — it eagerly recursively
+/// splits the slice and queues every leaf, which keeps the contention even
+/// when no worker is free.
+fn join_map_sessions<'a, EF, F, R>(
+    sessions: &mut [Box<dyn OuterSumcheckSession<EF> + 'a>],
+    out: &mut [R],
+    f: &F,
+) where
+    EF: ExtensionField<PF<EF>>,
+    F: Fn(&mut Box<dyn OuterSumcheckSession<EF> + 'a>) -> R + Sync,
+    R: Send,
+{
+    debug_assert_eq!(sessions.len(), out.len());
+    match sessions.len() {
+        0 => {}
+        1 => out[0] = f(&mut sessions[0]),
+        _ => {
+            let mid = sessions.len() / 2;
+            let (sl, sr) = sessions.split_at_mut(mid);
+            let (ol, or) = out.split_at_mut(mid);
+            rayon::join(|| join_map_sessions(sl, ol, f), || join_map_sessions(sr, or, f));
+        }
+    }
+}
+
 pub fn prove_batched_air_sumcheck<'a, EF: ExtensionField<PF<EF>>>(
     prover_state: &mut impl FSProver<EF>,
     sessions: &mut [Box<dyn OuterSumcheckSession<EF> + 'a>],
@@ -751,25 +789,16 @@ pub fn prove_batched_air_sumcheck<'a, EF: ExtensionField<PF<EF>>>(
     let mut k: Vec<EF> = vec![EF::ONE; sessions.len()];
 
     for round in 0..n_rounds {
-        // Compute bare round polys per session in parallel. Each session's inner
-        // `compute_bare_round_poly` is already rayon-parallel, but as `active_count_pairs`
-        // shrinks across rounds the inner par_iter stops saturating cores; running
-        // sessions concurrently lets the work-stealing scheduler keep all threads busy.
-        let bare_polys: Vec<Option<DensePolynomial<EF>>> = sessions
-            .par_iter_mut()
-            .enumerate()
-            .map(|(_idx, session)| {
-                let join_round = n_rounds - session.initial_n_vars();
-                if round < join_round {
-                    None
-                } else {
-                    Some(session.compute_bare_round_poly())
-                }
-            })
-            .collect();
+        let mut bare_polys: Vec<Option<DensePolynomial<EF>>> = vec![None; sessions.len()];
+        join_map_sessions(sessions, &mut bare_polys, &|session| {
+            let join_round = n_rounds - session.initial_n_vars();
+            if round < join_round {
+                None
+            } else {
+                Some(session.compute_bare_round_poly())
+            }
+        });
 
-        // Combine the bare polys into the single batched round polynomial.
-        // Sequential and cheap (≪ d² ops total).
         let mut combined_coeffs = EF::zero_vec(max_full_degree + 1);
         for (idx, session) in sessions.iter().enumerate() {
             let join_round = n_rounds - session.initial_n_vars();
@@ -778,9 +807,8 @@ pub fn prove_batched_air_sumcheck<'a, EF: ExtensionField<PF<EF>>>(
             } else {
                 let bare_poly = bare_polys[idx].as_ref().unwrap();
                 let full_coeffs = expand_bare_to_full(&bare_poly.coeffs, session.eq_alpha());
-                let weight = eta_powers[idx] * k[idx];
                 for (i, &c) in full_coeffs.iter().enumerate() {
-                    combined_coeffs[i] += weight * c;
+                    combined_coeffs[i] += eta_powers[idx] * k[idx] * c;
                 }
             }
         }
@@ -789,26 +817,16 @@ pub fn prove_batched_air_sumcheck<'a, EF: ExtensionField<PF<EF>>>(
         let challenge = prover_state.sample();
         challenges.push(challenge);
 
-        // Process the challenge per session in parallel — each `process_challenge`
-        // does a fold over the session's own multilinears (independent work).
-        sessions
-            .par_iter_mut()
-            .zip(bare_polys.par_iter())
-            .enumerate()
-            .for_each(|(_idx, (session, bare_poly_opt))| {
-                let join_round = n_rounds - session.initial_n_vars();
-                if round >= join_round
-                    && let Some(bare_poly) = bare_poly_opt
-                {
-                    session.process_challenge(challenge, bare_poly);
-                }
-            });
-
-        // Update `k` for pre-join sessions sequentially (trivial work).
-        for (idx, session) in sessions.iter().enumerate() {
+        // `process_challenge` is also internally rayon-parallel, but routing it
+        // through `join_map_sessions` showed a measurable regression in the
+        // bench: folding multiple sessions concurrently competes for memory
+        // bandwidth on x86, and the inner par_iter already saturates cores.
+        for (idx, session) in sessions.iter_mut().enumerate() {
             let join_round = n_rounds - session.initial_n_vars();
             if round < join_round {
                 k[idx] *= challenge;
+            } else if let Some(bare_poly) = &bare_polys[idx] {
+                session.process_challenge(challenge, bare_poly);
             }
         }
     }
