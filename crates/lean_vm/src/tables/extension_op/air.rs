@@ -84,6 +84,10 @@ impl<const BUS: bool> Air for ExtensionOpPrecompile<BUS> {
         EXTENSION_OP_LOGUP_CLAIM_COLUMNS
     }
 
+    fn has_bus(&self) -> bool {
+        BUS
+    }
+
     #[inline]
     fn eval<AB: AirBuilder>(&self, builder: &mut AB, extra_data: &Self::ExtraData) {
         let flat = builder.flat();

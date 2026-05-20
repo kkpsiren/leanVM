@@ -102,6 +102,9 @@ impl Air for Table {
         // Use the BUS=true Air impl on each inner table.
         delegate_to_inner!(self, logup_claim_columns)
     }
+    fn has_bus(&self) -> bool {
+        delegate_to_inner!(self, has_bus)
+    }
     fn eval<AB: AirBuilder>(&self, _: &mut AB, _: &Self::ExtraData) {
         unreachable!()
     }

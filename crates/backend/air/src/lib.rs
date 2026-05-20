@@ -18,6 +18,14 @@ pub trait Air: Send + Sync + 'static {
 
     fn n_constraints(&self) -> usize;
 
+    /// Whether `eval` opens with an `assert_zero_ef(bus)` that consumes `alpha^0`.
+    /// When `true`, the AIR's `assert_zero_linear` calls start at `alpha^1`, so the
+    /// AIR sumcheck prover folds in column claims with `alpha^{1+j}`. When `false`
+    /// (e.g. standalone AIR tests with `BUS=false`), the prover uses `alpha^{j}`.
+    fn has_bus(&self) -> bool {
+        false
+    }
+
     /// Number of "shift" columns (the ones that are also queried at the next
     /// row). By convention they occupy columns `0..n_shift_columns()` of the
     /// table; the remaining columns are "flat" (queried at the current row only).

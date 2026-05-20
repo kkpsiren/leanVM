@@ -339,6 +339,9 @@ impl<const BUS: bool> Air for Poseidon16Precompile<BUS> {
     fn logup_claim_columns(&self) -> &'static [usize] {
         POSEIDON_16_LOGUP_CLAIM_COLUMNS
     }
+    fn has_bus(&self) -> bool {
+        BUS
+    }
     fn eval<AB: AirBuilder>(&self, builder: &mut AB, extra_data: &Self::ExtraData) {
         let cols: Poseidon1Cols16<AB::IF> = {
             let flat = builder.flat();

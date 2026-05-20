@@ -42,7 +42,6 @@ impl<const BUS: bool> TableT for ExecutionTable<BUS> {
         buses
     }
 
-
     fn padding_row(&self, zero_vec_ptr: usize, _null_hash_ptr: usize, ending_pc: usize) -> Vec<F> {
         let mut padding_row = vec![F::ZERO; N_TOTAL_EXECUTION_COLUMNS + N_TEMPORARY_EXEC_COLUMNS];
         padding_row[COL_PC] = F::from_usize(ending_pc);

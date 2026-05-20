@@ -31,7 +31,7 @@ use tracing::info_span;
 
 const ENDIANNESS_PIVOT_AIR: usize = 12;
 
-pub trait OuterSumcheckSession<EF: ExtensionField<PF<EF>>>: Debug {
+pub trait OuterSumcheckSession<EF: ExtensionField<PF<EF>>>: Debug + Send + Sync {
     fn initial_n_vars(&self) -> usize;
     fn sum(&self) -> EF;
     fn bare_degree(&self) -> usize;
@@ -447,11 +447,13 @@ where
         .collect();
     // Linear (degree-1) part is a bare dot product over the AIR's known
     // logup-claim columns; precompute the broadcast alphas once per call.
+    // `alpha_offset` is 1 when the AIR opens with a bus `assert_zero_ef`.
     let linear_cols = computation.logup_claim_columns();
+    let alpha_offset = usize::from(computation.has_bus());
     let linear_alphas: Vec<EFPacking<EF>> = linear_cols
         .iter()
         .enumerate()
-        .map(|(j, _)| EFPacking::<EF>::from(extra_data.alpha_powers()[1 + j]))
+        .map(|(j, _)| EFPacking::<EF>::from(extra_data.alpha_powers()[alpha_offset + j]))
         .collect();
 
     let acc = (0..active_count_pairs)
@@ -622,14 +624,17 @@ where
     let stride = 1usize << fold_bit;
     let lo_mask = stride - 1;
 
-    // Direct linear contribution: `lin(point) = Σ alpha^{1+j} · point[col_j]` is a
-    // bare dot product, so we don't need an `Air::eval` call to get it. (The
+    // Direct linear contribution: `lin(point) = Σ alpha^{alpha_offset+j} · point[col_j]`
+    // is a bare dot product, so we don't need an `Air::eval` call to get it. (The
     // `assert_zero_linear` calls inside `eval` are bypassed in `HighOnly` mode.)
+    // `alpha_offset` is 1 when the AIR opens with a bus `assert_zero_ef` (it consumes
+    // `alpha^0`) and 0 otherwise — see `Air::has_bus`.
     let linear_cols = computation.logup_claim_columns();
+    let alpha_offset = usize::from(computation.has_bus());
     let linear_alphas: Vec<EFT> = linear_cols
         .iter()
         .enumerate()
-        .map(|(j, _)| EFT::from(extra_data.alpha_powers()[1 + j]))
+        .map(|(j, _)| EFT::from(extra_data.alpha_powers()[alpha_offset + j]))
         .collect();
 
     let acc = (0..active_count_pairs)
@@ -716,20 +721,37 @@ pub fn prove_batched_air_sumcheck<'a, EF: ExtensionField<PF<EF>>>(
     let mut k: Vec<EF> = vec![EF::ONE; sessions.len()];
 
     for round in 0..n_rounds {
-        let mut combined_coeffs = EF::zero_vec(max_full_degree + 1);
-        let mut bare_polys: Vec<Option<DensePolynomial<EF>>> = vec![None; sessions.len()];
+        // Compute bare round polys per session in parallel. Each session's inner
+        // `compute_bare_round_poly` is already rayon-parallel, but as `active_count_pairs`
+        // shrinks across rounds the inner par_iter stops saturating cores; running
+        // sessions concurrently lets the work-stealing scheduler keep all threads busy.
+        let bare_polys: Vec<Option<DensePolynomial<EF>>> = sessions
+            .par_iter_mut()
+            .enumerate()
+            .map(|(_idx, session)| {
+                let join_round = n_rounds - session.initial_n_vars();
+                if round < join_round {
+                    None
+                } else {
+                    Some(session.compute_bare_round_poly())
+                }
+            })
+            .collect();
 
-        for (idx, session) in sessions.iter_mut().enumerate() {
+        // Combine the bare polys into the single batched round polynomial.
+        // Sequential and cheap (≪ d² ops total).
+        let mut combined_coeffs = EF::zero_vec(max_full_degree + 1);
+        for (idx, session) in sessions.iter().enumerate() {
             let join_round = n_rounds - session.initial_n_vars();
             if round < join_round {
                 combined_coeffs[1] += eta_powers[idx] * k[idx] * session.sum();
             } else {
-                let bare_poly = session.compute_bare_round_poly();
+                let bare_poly = bare_polys[idx].as_ref().unwrap();
                 let full_coeffs = expand_bare_to_full(&bare_poly.coeffs, session.eq_alpha());
+                let weight = eta_powers[idx] * k[idx];
                 for (i, &c) in full_coeffs.iter().enumerate() {
-                    combined_coeffs[i] += eta_powers[idx] * k[idx] * c;
+                    combined_coeffs[i] += weight * c;
                 }
-                bare_polys[idx] = Some(bare_poly);
             }
         }
 
@@ -737,12 +759,26 @@ pub fn prove_batched_air_sumcheck<'a, EF: ExtensionField<PF<EF>>>(
         let challenge = prover_state.sample();
         challenges.push(challenge);
 
-        for (idx, session) in sessions.iter_mut().enumerate() {
+        // Process the challenge per session in parallel — each `process_challenge`
+        // does a fold over the session's own multilinears (independent work).
+        sessions
+            .par_iter_mut()
+            .zip(bare_polys.par_iter())
+            .enumerate()
+            .for_each(|(_idx, (session, bare_poly_opt))| {
+                let join_round = n_rounds - session.initial_n_vars();
+                if round >= join_round
+                    && let Some(bare_poly) = bare_poly_opt
+                {
+                    session.process_challenge(challenge, bare_poly);
+                }
+            });
+
+        // Update `k` for pre-join sessions sequentially (trivial work).
+        for (idx, session) in sessions.iter().enumerate() {
             let join_round = n_rounds - session.initial_n_vars();
             if round < join_round {
                 k[idx] *= challenge;
-            } else if let Some(bare_poly) = &bare_polys[idx] {
-                session.process_challenge(challenge, bare_poly);
             }
         }
     }

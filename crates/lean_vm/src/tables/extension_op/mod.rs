@@ -108,7 +108,6 @@ impl<const BUS: bool> TableT for ExtensionOpPrecompile<BUS> {
         self.n_columns() + 2 // +2 for COL_MULTIPLICITY_EXTENSION_OP and COL_DOMAINSEP_EXTENSION_OP (non-AIR, used in bus logup)
     }
 
-
     fn padding_row(&self, zero_vec_ptr: usize, _null_hash_ptr: usize, _ending_pc: usize) -> Vec<F> {
         let mut row = vec![F::ZERO; self.n_columns_total()];
         row[COL_START] = F::ONE;
