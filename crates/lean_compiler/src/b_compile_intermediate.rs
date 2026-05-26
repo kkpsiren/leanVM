@@ -1,6 +1,6 @@
 use crate::{a_simplify_lang::*, ir::*, lang::*};
 use lean_vm::*;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use utils::ToUsize;
 
 #[derive(Default)]
@@ -140,10 +140,13 @@ fn compile_function(
     }
     stack_pos += function.arguments.len();
 
-    // Coalesce returned variables with their ret-slots: if every `return v_0, ..., v_n`
-    // in the body uses the same variable for slot i, register that variable directly at
-    // `fp + 2 + n_args + i`.
-    let coalesced = collect_return_coalescings(&function.instructions, function.n_returned_vars, &function.arguments);
+    // Two independent read-only analyses over the body: run them concurrently.
+    // For SPHINCS' main (~2M instructions) each is a sizable scan, so the
+    // join saves on the slowest one.
+    let (coalesced, (dead_fp_relative_vars, dead_store_vars)) = backend::rayon::join(
+        || collect_return_coalescings(&function.instructions, function.n_returned_vars, &function.arguments),
+        || compute_dead_vars(&function.instructions),
+    );
     let mut coalesced_ret_vars = BTreeSet::new();
     for (i, var) in coalesced.iter().enumerate() {
         if let Some(v) = var {
@@ -160,7 +163,8 @@ fn compile_function(
     compiler.const_mallocs.clear();
     compiler.const_malloc_vars.clear();
     compiler.coalesced_ret_vars = coalesced_ret_vars;
-    (compiler.dead_fp_relative_vars, compiler.dead_store_vars) = compute_dead_vars(&function.instructions);
+    compiler.dead_fp_relative_vars = dead_fp_relative_vars;
+    compiler.dead_store_vars = dead_store_vars;
 
     let mut instructions = Vec::new();
 
@@ -965,8 +969,8 @@ fn walk_returns(lines: &[SimpleLine], found: &mut [Option<Var>], conflict: &mut 
 /// `derived_base` maps each derived var to its immediate base var.
 fn collect_fp_rel_capable(
     lines: &[SimpleLine],
-    fp_rel_capable: &mut BTreeSet<Var>,
-    derived_base: &mut BTreeMap<Var, Var>,
+    fp_rel_capable: &mut HashSet<Var>,
+    derived_base: &mut HashMap<Var, Var>,
 ) {
     for line in lines {
         match line {
@@ -1012,10 +1016,10 @@ fn collect_fp_rel_capable(
 
 fn collect_use_info(
     lines: &[SimpleLine],
-    fp_rel_capable: &BTreeSet<Var>,
-    declared: &mut BTreeSet<Var>,
-    total_uses: &mut BTreeMap<Var, usize>,
-    fp_rel_uses: &mut BTreeMap<Var, usize>,
+    fp_rel_capable: &HashSet<Var>,
+    declared: &mut HashSet<Var>,
+    total_uses: &mut HashMap<Var, usize>,
+    fp_rel_uses: &mut HashMap<Var, usize>,
 ) {
     for line in lines {
         // Track declarations (for dead-store analysis)
@@ -1086,9 +1090,9 @@ fn collect_use_info(
 /// are fp-rel-eligible or in dead children. Returns whether `var` is dead.
 fn mark_dead_fp_rel(
     var: &Var,
-    children: &BTreeMap<&Var, Vec<&Var>>,
-    total_uses: &BTreeMap<Var, usize>,
-    fp_rel_uses: &BTreeMap<Var, usize>,
+    children: &HashMap<&Var, Vec<&Var>>,
+    total_uses: &HashMap<Var, usize>,
+    fp_rel_uses: &HashMap<Var, usize>,
     dead: &mut BTreeSet<Var>,
 ) -> bool {
     let mut dead_child_count = 0usize;
@@ -1112,25 +1116,25 @@ fn mark_dead_fp_rel(
 ///
 /// Returns `(dead_fp_relative_vars, dead_store_vars)`.
 fn compute_dead_vars(lines: &[SimpleLine]) -> (BTreeSet<Var>, BTreeSet<Var>) {
-    // Identify fp-rel-capable vars and derivation tree
-    let mut fp_rel_capable = BTreeSet::new();
-    let mut derived_base: BTreeMap<Var, Var> = BTreeMap::new();
+    // Internal lookup tables — keyed by var name, only ever .get()'d / inserted
+    // (no order-dependent iteration). HashMap gives O(1) average ops vs
+    // BTreeMap's O(log N) string-compare, which on SPHINCS' main (~2M
+    // instructions, many distinct vars) is a meaningful constant-factor cut.
+    let mut fp_rel_capable = HashSet::new();
+    let mut derived_base: HashMap<Var, Var> = HashMap::new();
     collect_fp_rel_capable(lines, &mut fp_rel_capable, &mut derived_base);
 
-    // Single walk: declarations + total uses + fp-rel uses
-    let mut declared = BTreeSet::new();
-    let mut total_uses: BTreeMap<Var, usize> = BTreeMap::new();
-    let mut fp_rel_uses: BTreeMap<Var, usize> = BTreeMap::new();
+    let mut declared = HashSet::new();
+    let mut total_uses: HashMap<Var, usize> = HashMap::new();
+    let mut fp_rel_uses: HashMap<Var, usize> = HashMap::new();
     collect_use_info(lines, &fp_rel_capable, &mut declared, &mut total_uses, &mut fp_rel_uses);
 
-    // Dead stores: declared but never referenced as operand
-    let dead_store_vars = declared
+    let dead_store_vars: BTreeSet<Var> = declared
         .into_iter()
         .filter(|v| total_uses.get(v).copied().unwrap_or(0) == 0)
         .collect();
 
-    // Dead fp-relative
-    let mut children: BTreeMap<&Var, Vec<&Var>> = BTreeMap::new();
+    let mut children: HashMap<&Var, Vec<&Var>> = HashMap::new();
     for (child, parent) in &derived_base {
         children.entry(parent).or_default().push(child);
     }

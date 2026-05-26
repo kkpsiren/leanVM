@@ -1,7 +1,7 @@
 use crate::{F, instruction_encoder::field_representation, ir::*, lang::*};
 use backend::*;
 use lean_vm::*;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use utils::ToUsize;
 #[cfg(not(feature = "debug-skip-bytecode-hashing"))]
 use utils::poseidon_compress_slice;
@@ -122,10 +122,27 @@ pub fn compile_to_low_level_bytecode(
         match_first_block_starts,
     };
 
-    let mut instructions = Vec::new();
+    // Precompute pc → Label for jump-destination resolution. compile_block only
+    // ever reads `hints` to find the Label at a jump destination — every other
+    // hint write is local to the block's pc range — so we can hand each block
+    // a read-only view and run them in parallel.
+    let pc_to_label: HashMap<usize, Label> = compiler
+        .label_to_pc
+        .iter()
+        .map(|(label, pc)| (*pc, label.clone()))
+        .collect();
 
-    for (pc_start, block) in code_blocks {
-        compile_block(&compiler, &block, pc_start, &mut instructions, &mut hints);
+    let block_results: Vec<(Vec<Instruction>, Vec<(usize, Hint)>)> = code_blocks
+        .par_iter()
+        .map(|(pc_start, block)| compile_block(&compiler, block, *pc_start, &pc_to_label))
+        .collect();
+
+    let mut instructions = Vec::with_capacity(bytecode_size);
+    for (block_instrs, block_hints) in block_results {
+        instructions.extend(block_instrs);
+        for (pc, hint) in block_hints {
+            hints.entry(pc).or_default().push(hint);
+        }
     }
 
     debug_assert_eq!(instructions.len(), bytecode_size);
@@ -193,9 +210,10 @@ fn compile_block(
     compiler: &Compiler,
     block: &[IntermediateInstruction],
     pc_start: CodeAddress,
-    low_level_bytecode: &mut Vec<Instruction>,
-    hints: &mut BTreeMap<CodeAddress, Vec<Hint>>,
-) {
+    pc_to_label: &HashMap<usize, Label>,
+) -> (Vec<Instruction>, Vec<(CodeAddress, Hint)>) {
+    let mut low_level_bytecode: Vec<Instruction> = Vec::with_capacity(block.len());
+    let mut block_hints: Vec<(CodeAddress, Hint)> = Vec::new();
     let try_as_mem_or_constant = |value: &IntermediateValue| {
         if let Some(cst) = try_as_constant(value, compiler) {
             return Some(MemOrConstant::Constant(cst));
@@ -208,21 +226,14 @@ fn compile_block(
         None
     };
 
-    let codegen_jump = |hints: &BTreeMap<CodeAddress, Vec<Hint>>,
-                        low_level_bytecode: &mut Vec<Instruction>,
+    let codegen_jump = |low_level_bytecode: &mut Vec<Instruction>,
                         condition: IntermediateValue,
                         dest: IntermediateValue,
                         updated_fp: Option<IntermediateValue>| {
         let dest = try_as_mem_or_constant(&dest).expect("Fatal: Could not materialize jump destination");
         let label = match dest {
-            MemOrConstant::Constant(dest) => hints
+            MemOrConstant::Constant(dest) => pc_to_label
                 .get(&usize::try_from(dest.as_canonical_u32()).unwrap())
-                .and_then(|hints: &Vec<Hint>| {
-                    hints.iter().find_map(|x| match x {
-                        Hint::Label { label } => Some(label),
-                        _ => None,
-                    })
-                })
                 .expect("Fatal: Unlabeled jump destination")
                 .clone(),
             MemOrConstant::MemoryAfterFp { offset } => Label::custom(format!("fp+{offset}")),
@@ -295,10 +306,10 @@ fn compile_block(
                 condition,
                 dest,
                 updated_fp,
-            } => codegen_jump(hints, low_level_bytecode, condition, dest, updated_fp),
+            } => codegen_jump(&mut low_level_bytecode, condition, dest, updated_fp),
             IntermediateInstruction::Jump { dest, updated_fp } => {
                 let one = ConstExpression::one().into();
-                codegen_jump(hints, low_level_bytecode, one, dest, updated_fp)
+                codegen_jump(&mut low_level_bytecode, one, dest, updated_fp)
             }
             IntermediateInstruction::Precompile(precompile) => {
                 let data = precompile
@@ -319,14 +330,14 @@ fn compile_block(
                         .map(|expr| expr.try_into_mem_or_fp_or_constant(compiler).unwrap())
                         .collect(),
                 );
-                hints.entry(pc).or_default().push(hint);
+                block_hints.push((pc, hint));
             }
             IntermediateInstruction::Inverse { arg, res_offset } => {
                 let hint = Hint::Inverse {
                     arg: try_as_mem_or_constant(&arg).unwrap(),
                     res_offset,
                 };
-                hints.entry(pc).or_default().push(hint);
+                block_hints.push((pc, hint));
             }
             IntermediateInstruction::RequestMemory { offset, size } => {
                 let size = try_as_mem_or_constant(&size).unwrap();
@@ -334,14 +345,11 @@ fn compile_block(
                     offset: eval_const_expression_usize(&offset, compiler),
                     size,
                 };
-                hints.entry(pc).or_default().push(hint);
+                block_hints.push((pc, hint));
             }
             IntermediateInstruction::HintWitness { name, destination } => {
                 let destination = destination.map(|offset| eval_const_expression_usize(&offset, compiler));
-                hints
-                    .entry(pc)
-                    .or_default()
-                    .push(Hint::HintWitness { name, destination });
+                block_hints.push((pc, Hint::HintWitness { name, destination }));
             }
             IntermediateInstruction::Print { line_info, content } => {
                 let hint = Hint::Print {
@@ -351,11 +359,11 @@ fn compile_block(
                         .map(|c| try_as_mem_or_constant(&c).unwrap())
                         .collect(),
                 };
-                hints.entry(pc).or_default().push(hint);
+                block_hints.push((pc, hint));
             }
             IntermediateInstruction::LocationReport { location } => {
                 let hint = Hint::LocationReport { location };
-                hints.entry(pc).or_default().push(hint);
+                block_hints.push((pc, hint));
             }
             IntermediateInstruction::DebugAssert {
                 expr,
@@ -371,7 +379,7 @@ fn compile_block(
                     location,
                     preceds_runtime_inequality,
                 };
-                hints.entry(pc).or_default().push(hint);
+                block_hints.push((pc, hint));
             }
             IntermediateInstruction::DerefHint {
                 offset_src,
@@ -381,18 +389,15 @@ fn compile_block(
                     offset_src: eval_const_expression_usize(&offset_src, compiler),
                     offset_target: eval_const_expression_usize(&offset_target, compiler),
                 };
-                hints.entry(pc).or_default().push(hint);
+                block_hints.push((pc, hint));
             }
             IntermediateInstruction::PanicHint { message } => {
                 let hint = Hint::Panic { message };
-                hints.entry(pc).or_default().push(hint);
+                block_hints.push((pc, hint));
             }
             IntermediateInstruction::ParallelBatchStart { n_args, end_value } => {
                 let end_value = try_as_mem_or_constant(&end_value).expect("parallel loop end value");
-                hints
-                    .entry(pc)
-                    .or_default()
-                    .push(Hint::ParallelBatchStart { n_args, end_value });
+                block_hints.push((pc, Hint::ParallelBatchStart { n_args, end_value }));
             }
         }
 
@@ -400,6 +405,7 @@ fn compile_block(
             pc += 1;
         }
     }
+    (low_level_bytecode, block_hints)
 }
 
 fn count_real_instructions(instrs: &[IntermediateInstruction]) -> usize {

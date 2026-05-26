@@ -22,17 +22,28 @@ pub fn collect_refs<T>(vecs: &[Vec<T>]) -> Vec<&[T]> {
     vecs.iter().map(Vec::as_slice).collect()
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct Counter(usize);
+/// Interior-mutability counter so the compiler can hand out `&Counter`s to
+/// parallel workers (e.g. parallel match-arm transforms in `a_simplify_lang`)
+/// without forcing them to serialize on a `&mut`. The IDs handed out are still
+/// unique across threads — relaxed atomic increment is enough since the only
+/// requirement is "no two get_next calls return the same value".
+#[derive(Debug, Default)]
+pub struct Counter(std::sync::atomic::AtomicUsize);
+
+impl Clone for Counter {
+    fn clone(&self) -> Self {
+        Self(std::sync::atomic::AtomicUsize::new(
+            self.0.load(std::sync::atomic::Ordering::Relaxed),
+        ))
+    }
+}
 
 impl Counter {
-    pub fn get_next(&mut self) -> usize {
-        let val = self.0;
-        self.0 += 1;
-        val
+    pub fn get_next(&self) -> usize {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     }
 
     pub fn new() -> Self {
-        Self(0)
+        Self(std::sync::atomic::AtomicUsize::new(0))
     }
 }

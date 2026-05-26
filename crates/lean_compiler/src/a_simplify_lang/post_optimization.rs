@@ -1,15 +1,21 @@
-use std::collections::{BTreeMap, BTreeSet, btree_map::Entry};
+use std::collections::{BTreeMap, BTreeSet, HashMap, btree_map::Entry};
 
-use backend::PrimeCharacteristicRing;
+use backend::*;
 
 use crate::{F, a_simplify_lang::*, lang::ConstExpression};
 
 pub fn propagate_copies(program: &mut SimpleProgram) {
-    for func in program.functions.values_mut() {
+    // Per-function passes are independent (every transform here reads only
+    // `func.instructions` and the local `refs` map). Parallelizing buys us
+    // multi-function programs, but the dominant win on SPHINCS is the
+    // `BTreeMap → HashMap` swap below: the maps are lookup-only with no
+    // iteration-order dependence, and for main's ~2M instructions the
+    // O(log N) string-compare per lookup is the per-pass hot spot.
+    program.functions.par_iter_mut().for_each(|(_, func)| {
         // Pass 1: copy propagation. `var = mem_expr + 0` with `var`
         // single-defined ⇒ rewrite uses with `mem_expr`, drop the assignment.
         let refs = get_var_refs(&func.instructions);
-        let mut subst = BTreeMap::<Var, SimpleExpr>::new();
+        let mut subst = HashMap::<Var, SimpleExpr>::new();
         build_substitutions(&func.instructions, &refs, &mut subst);
         if !subst.is_empty() {
             apply_substitutions(&mut func.instructions, &subst);
@@ -31,7 +37,7 @@ pub fn propagate_copies(program: &mut SimpleProgram) {
         // Pass 5: fuse `Assignment + AssertEq`('c = 0`and 'c = a * b` => `0 = a * b`).
         let refs = get_var_refs(&func.instructions);
         fuse_assign_asserts(&mut func.instructions, &refs);
-    }
+    });
 }
 
 #[derive(Default, Clone, Copy)]
@@ -40,8 +46,8 @@ struct VarRefs {
     uses: u32,
 }
 
-fn get_var_refs(lines: &[SimpleLine]) -> BTreeMap<Var, VarRefs> {
-    fn walk(lines: &[SimpleLine], counts: &mut BTreeMap<Var, VarRefs>) {
+fn get_var_refs(lines: &[SimpleLine]) -> HashMap<Var, VarRefs> {
+    fn walk(lines: &[SimpleLine], counts: &mut HashMap<Var, VarRefs>) {
         for line in lines {
             match line {
                 SimpleLine::Assignment {
@@ -76,12 +82,40 @@ fn get_var_refs(lines: &[SimpleLine]) -> BTreeMap<Var, VarRefs> {
             }
         }
     }
-    let mut counts = BTreeMap::new();
-    walk(lines, &mut counts);
-    counts
+    // For very large functions (SPHINCS' `main` is ~2M instructions), this
+    // analysis is called 5x per propagate_copies pass and dominates the
+    // sequential cost. Parallelize at the top-level Vec: split lines into
+    // chunks, build a per-chunk map, then merge by summing the VarRefs.
+    // Bytecode-output independent (refs is only ever .get()'d downstream).
+    const PAR_THRESHOLD: usize = 4096;
+    if lines.len() < PAR_THRESHOLD {
+        let mut counts = HashMap::new();
+        walk(lines, &mut counts);
+        return counts;
+    }
+    let n = rayon::current_num_threads().max(1);
+    let chunk = lines.len().div_ceil(n).max(1);
+    lines
+        .par_chunks(chunk)
+        .map(|chunk| {
+            let mut local = HashMap::new();
+            walk(chunk, &mut local);
+            local
+        })
+        .reduce(HashMap::new, |mut a, mut b| {
+            if a.len() < b.len() {
+                std::mem::swap(&mut a, &mut b);
+            }
+            for (k, v) in b {
+                let e = a.entry(k).or_default();
+                e.definitions += v.definitions;
+                e.uses += v.uses;
+            }
+            a
+        })
 }
 
-fn build_substitutions(lines: &[SimpleLine], refs: &BTreeMap<Var, VarRefs>, subst: &mut BTreeMap<Var, SimpleExpr>) {
+fn build_substitutions(lines: &[SimpleLine], refs: &HashMap<Var, VarRefs>, subst: &mut HashMap<Var, SimpleExpr>) {
     for line in lines {
         if let SimpleLine::Assignment {
             var: SimpleExpr::Memory(VarOrConstMallocAccess::Var(v)),
@@ -101,7 +135,7 @@ fn build_substitutions(lines: &[SimpleLine], refs: &BTreeMap<Var, VarRefs>, subs
     }
 }
 
-fn chase(mut expr: SimpleExpr, subst: &BTreeMap<Var, SimpleExpr>) -> SimpleExpr {
+fn chase(mut expr: SimpleExpr, subst: &HashMap<Var, SimpleExpr>) -> SimpleExpr {
     while let Some(v) = expr.as_var()
         && let Some(t) = subst.get(v)
     {
@@ -110,8 +144,9 @@ fn chase(mut expr: SimpleExpr, subst: &BTreeMap<Var, SimpleExpr>) -> SimpleExpr 
     expr
 }
 
-fn apply_substitutions(lines: &mut Vec<SimpleLine>, subst: &BTreeMap<Var, SimpleExpr>) {
-    for line in lines.iter_mut() {
+fn apply_substitutions(lines: &mut Vec<SimpleLine>, subst: &HashMap<Var, SimpleExpr>) {
+    const PAR_THRESHOLD: usize = 4096;
+    let rewrite_one = |line: &mut SimpleLine, subst: &HashMap<Var, SimpleExpr>| {
         for expr in line.operand_exprs_mut() {
             if let Some(v) = expr.as_var()
                 && let Some(replacement) = subst.get(v)
@@ -121,6 +156,15 @@ fn apply_substitutions(lines: &mut Vec<SimpleLine>, subst: &BTreeMap<Var, Simple
         }
         for block in line.nested_blocks_mut() {
             apply_substitutions(block, subst);
+        }
+    };
+    if lines.len() >= PAR_THRESHOLD {
+        // Per-line rewrites are independent (each only reads `subst`); only
+        // the final `retain` depends on the global subst keys.
+        lines.par_iter_mut().for_each(|line| rewrite_one(line, subst));
+    } else {
+        for line in lines.iter_mut() {
+            rewrite_one(line, subst);
         }
     }
     lines.retain(|line| match line {
@@ -165,12 +209,12 @@ fn find_fusable_assert<'a>(
     None
 }
 
-fn is_one_time_var(v: &Var, refs: &BTreeMap<Var, VarRefs>) -> bool {
+fn is_one_time_var(v: &Var, refs: &HashMap<Var, VarRefs>) -> bool {
     let r: VarRefs = refs.get(v).copied().unwrap_or_default();
     r.definitions == 1 && r.uses == 1
 }
 
-fn is_uniquely_defined(v: &Var, refs: &BTreeMap<Var, VarRefs>) -> bool {
+fn is_uniquely_defined(v: &Var, refs: &HashMap<Var, VarRefs>) -> bool {
     refs.get(v).map(|r| r.definitions) == Some(1)
 }
 
@@ -189,7 +233,7 @@ fn apply_fusions(lines: &mut Vec<SimpleLine>, fusions: Fusions) {
     );
 }
 
-fn fuse_raw_asserts(lines: &mut Vec<SimpleLine>, refs: &BTreeMap<Var, VarRefs>) {
+fn fuse_raw_asserts(lines: &mut Vec<SimpleLine>, refs: &HashMap<Var, VarRefs>) {
     for line in lines.iter_mut() {
         for block in line.nested_blocks_mut() {
             fuse_raw_asserts(block, refs);
@@ -221,7 +265,7 @@ fn fuse_raw_asserts(lines: &mut Vec<SimpleLine>, refs: &BTreeMap<Var, VarRefs>) 
     apply_fusions(lines, fusions);
 }
 
-fn fuse_assign_asserts(lines: &mut Vec<SimpleLine>, refs: &BTreeMap<Var, VarRefs>) {
+fn fuse_assign_asserts(lines: &mut Vec<SimpleLine>, refs: &HashMap<Var, VarRefs>) {
     for line in lines.iter_mut() {
         for block in line.nested_blocks_mut() {
             fuse_assign_asserts(block, refs);
@@ -263,7 +307,7 @@ fn fuse_assign_asserts(lines: &mut Vec<SimpleLine>, refs: &BTreeMap<Var, VarRefs
 ///   res     = memory[v_ptr + 0]
 ///
 /// Soundness: `v_inner` and `v_ptr` must each be uniquely defined and uniquely used
-fn fold_const_offset_into_deref(lines: &mut Vec<SimpleLine>, refs: &BTreeMap<Var, VarRefs>) {
+fn fold_const_offset_into_deref(lines: &mut Vec<SimpleLine>, refs: &HashMap<Var, VarRefs>) {
     for line in lines.iter_mut() {
         for block in line.nested_blocks_mut() {
             fold_const_offset_into_deref(block, refs);
@@ -374,7 +418,7 @@ fn fold_const_offset_into_deref(lines: &mut Vec<SimpleLine>, refs: &BTreeMap<Var
 }
 
 /// CSE (Common Subexpression Elimination)
-fn dedup_arithmetic_operations(lines: &mut Vec<SimpleLine>, refs: &BTreeMap<Var, VarRefs>) {
+fn dedup_arithmetic_operations(lines: &mut Vec<SimpleLine>, refs: &HashMap<Var, VarRefs>) {
     for line in lines.iter_mut() {
         for block in line.nested_blocks_mut() {
             dedup_arithmetic_operations(block, refs);
@@ -382,7 +426,7 @@ fn dedup_arithmetic_operations(lines: &mut Vec<SimpleLine>, refs: &BTreeMap<Var,
     }
 
     let mut first_def: BTreeMap<(MathOperation, SimpleExpr, SimpleExpr), Var> = BTreeMap::new();
-    let mut subst: BTreeMap<Var, SimpleExpr> = BTreeMap::new();
+    let mut subst: HashMap<Var, SimpleExpr> = HashMap::new();
 
     for line in lines.iter() {
         let SimpleLine::Assignment {
