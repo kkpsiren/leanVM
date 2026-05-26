@@ -2,7 +2,9 @@ use crate::{F, instruction_encoder::field_representation, ir::*, lang::*};
 use backend::*;
 use lean_vm::*;
 use std::collections::BTreeMap;
-use utils::{ToUsize, poseidon_compress_slice};
+use utils::ToUsize;
+#[cfg(not(feature = "debug-skip-bytecode-hashing"))]
+use utils::poseidon_compress_slice;
 
 impl IntermediateInstruction {
     const fn is_hint(&self) -> bool {
@@ -129,7 +131,6 @@ pub fn compile_to_low_level_bytecode(
     debug_assert_eq!(instructions.len(), bytecode_size);
 
     let instructions_encoded = instructions.par_iter().map(field_representation).collect::<Vec<_>>();
-
     let mut instructions_multilinear = vec![];
     for instr in &instructions_encoded {
         instructions_multilinear.extend_from_slice(instr);
@@ -137,6 +138,11 @@ pub fn compile_to_low_level_bytecode(
         instructions_multilinear.extend(vec![F::ZERO; padding]);
     }
     instructions_multilinear.resize(instructions_multilinear.len().next_power_of_two(), F::ZERO);
+
+    #[cfg(not(feature = "debug-skip-bytecode-hashing"))]
+    let hash = poseidon_compress_slice(&instructions_multilinear);
+    #[cfg(feature = "debug-skip-bytecode-hashing")]
+    let hash = [F::ZERO; 8];
 
     // Build pc_to_location mapping from LocationReport hints
     let mut pc_to_location = Vec::with_capacity(instructions.len());
@@ -154,8 +160,6 @@ pub fn compile_to_low_level_bytecode(
         }
         pc_to_location.push(current_location);
     }
-
-    let hash = poseidon_compress_slice(&instructions_multilinear);
 
     let code: Vec<_> = instructions
         .into_iter()

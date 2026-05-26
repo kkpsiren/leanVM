@@ -6,6 +6,10 @@ edition.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Warning: debug purpose only (makes compilation faster, but leads to bad domain separation in FIat-Shamir)
+debug-skip-bytecode-hashing = []
+
 [dependencies]
 pest.workspace = true
 pest_derive.workspace = true
