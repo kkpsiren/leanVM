@@ -932,8 +932,6 @@ def _eval_air_extension_op(folder: ConstraintFolder, extra_data: dict) -> None:
 
 def _build_p1c() -> dict:
     raw = POSEIDON1_AIR_CONSTANTS
-    fp_mat = lambda m: [[Fp(v) for v in row] for row in m]
-    fp_vec = lambda v: [Fp(x) for x in v]
     n = len(MDS_FIRST_ROW_16)
     mds_dense = [[Fp(MDS_FIRST_ROW_16[(j - i) % n]) for j in range(n)] for i in range(n)]
     # External full-round RCs: first and last `half_full_rounds * width` entries of the
@@ -943,16 +941,13 @@ def _build_p1c() -> dict:
     initial_constants = [[Fp(x) for x in rcs[i * t : (i + 1) * t]] for i in range(hf)]
     tail_start = (hf + raw["partial_rounds"]) * t
     final_constants = [[Fp(x) for x in rcs[tail_start + i * t : tail_start + (i + 1) * t]] for i in range(hf)]
+    partial_constants = [[Fp(x) for x in row] for row in raw["partial_round_constants"]]
     return {
         "half_full_rounds": raw["half_full_rounds"],
         "partial_rounds": raw["partial_rounds"],
         "initial_constants": initial_constants,
         "final_constants": final_constants,
-        "sparse_m_i": fp_mat(raw["sparse_m_i"]),
-        "sparse_first_row": fp_mat(raw["sparse_first_row"]),
-        "sparse_v": fp_mat(raw["sparse_v"]),
-        "sparse_first_rc": fp_vec(raw["sparse_first_round_constants"]),
-        "sparse_scalar_rc": fp_vec(raw["sparse_scalar_round_constants"]),
+        "partial_constants": partial_constants,
         "mds_dense": mds_dense,
     }
 
@@ -995,19 +990,12 @@ def _eval_poseidon1_16(folder: ConstraintFolder, cols: dict) -> None:
             folder.assert_eq(state[i], post)
             state[i] = post
 
-    state = [s + c for s, c in zip(state, const["sparse_first_rc"])]
-    state = _matvec_kb(const["sparse_m_i"], state)
-
-    n_partial = const["partial_rounds"]
-    for r in range(n_partial):
+    # Natural partial rounds: AddRC → cube state[0] → dense MDS.
+    for r in range(const["partial_rounds"]):
+        state = [s + c for s, c in zip(state, const["partial_constants"][r])]
         folder.assert_eq(state[0] * state[0] * state[0], cols["partial_rounds"][r])
         state[0] = cols["partial_rounds"][r]
-        if r < n_partial - 1:
-            state[0] = state[0] + const["sparse_scalar_rc"][r]
-        old_s0 = state[0]
-        state[0] = sum(state[j] * const["sparse_first_row"][r][j] for j in range(_POSEIDON_WIDTH))
-        for i in range(1, _POSEIDON_WIDTH):
-            state[i] = state[i] + old_s0 * const["sparse_v"][r][i - 1]
+        state = _matvec_kb(const["mds_dense"], state)
 
     for r in range(half_final - 1):
         state = _full_round(state, const["final_constants"][2 * r], const["final_constants"][2 * r + 1])

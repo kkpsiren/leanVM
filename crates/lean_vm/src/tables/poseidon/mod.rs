@@ -395,31 +395,17 @@ fn eval_poseidon1_16<AB: AirBuilder>(builder: &mut AB, local: &Poseidon1Cols16<A
         );
     }
 
-    // --- Sparse partial rounds ---
-    // Transition: add first-round constants, multiply by m_i
+    // --- Natural partial rounds: AddRC → cube state[0] → dense MDS ---
     builder.low_degree_block(&mut state, |b, state| {
         let state: &mut [AB::IF; WIDTH] = state.try_into().unwrap();
-
-        let frc = poseidon1_sparse_first_round_constants();
-        for (s, &c) in state.iter_mut().zip(frc.iter()) {
-            add_kb(s, c);
-        }
-        dense_mat_vec_air_16(poseidon1_sparse_m_i(), state);
-
-        let first_rows = poseidon1_sparse_first_row();
-        let v_vecs = poseidon1_sparse_v();
-        let scalar_rc = poseidon1_sparse_scalar_round_constants();
-        for round in 0..PARTIAL_ROUNDS {
-            // S-box on state[0]
+        for (round, rc) in poseidon1_partial_constants().iter().enumerate() {
+            for (s, &c) in state.iter_mut().zip(rc.iter()) {
+                add_kb(s, c);
+            }
             state[0] = state[0].cube();
             b.assert_eq_low(state[0], local.partial_rounds[round]);
             state[0] = local.partial_rounds[round];
-            // Scalar round constant (not on last round)
-            if round < PARTIAL_ROUNDS - 1 {
-                add_kb(&mut state[0], scalar_rc[round]);
-            }
-            // Sparse matrix: new_s0 = dot(first_row, state), state[i] += old_s0 * v[i-1]
-            sparse_mat_air_16(state, &first_rows[round], &v_vecs[round]);
+            mds_air_16(state);
         }
     });
 
@@ -526,22 +512,5 @@ fn dense_mat_vec_air_16<A: PrimeCharacteristicRing + 'static>(mat: &[[F; 16]; 16
             acc += mul_kb(input[j], mat[i][j]);
         }
         state[i] = acc;
-    }
-}
-
-#[inline]
-fn sparse_mat_air_16<A: PrimeCharacteristicRing + 'static>(
-    state: &mut [A; WIDTH],
-    first_row: &[F; WIDTH],
-    v: &[F; WIDTH],
-) {
-    let old_s0 = state[0];
-    let mut new_s0 = A::ZERO;
-    for j in 0..WIDTH {
-        new_s0 += mul_kb(state[j], first_row[j]);
-    }
-    state[0] = new_s0;
-    for i in 1..WIDTH {
-        state[i] += mul_kb(old_s0, v[i - 1]);
     }
 }

@@ -272,105 +272,15 @@ def next_multiple_of(n: int, k: int) -> int:
 
 
 # ---------------------------------------------------------------------------
-# sparse partial-round optimization for the AIR.
+# Poseidon1 AIR partial-round constants (natural formulation).
 # ---------------------------------------------------------------------------
 
-
-def _mat_mul(a: list[list[int]], b: list[list[int]], n: int) -> list[list[int]]:
-    return [[sum(a[i][k] * b[k][j] for k in range(n)) % P for j in range(n)] for i in range(n)]
-
-
-def _mat_vec(m: list[list[int]], v: Sequence[int], n: int) -> list[int]:
-    return [sum(m[i][j] * v[j] for j in range(n)) % P for i in range(n)]
-
-
-def _mat_transpose(m: list[list[int]], n: int) -> list[list[int]]:
-    return [[m[j][i] for j in range(n)] for i in range(n)]
-
-
-def _gauss_jordan_inv(m_in: list[list[int]], n: int) -> list[list[int]]:
-    aug = [row[:] for row in m_in]
-    inv = [[1 if i == j else 0 for j in range(n)] for i in range(n)]
-    for col in range(n):
-        pivot = next(r for r in range(col, n) if aug[r][col] != 0)
-        if pivot != col:
-            aug[col], aug[pivot] = aug[pivot], aug[col]
-            inv[col], inv[pivot] = inv[pivot], inv[col]
-        piv_inv = pow(aug[col][col], P - 2, P)
-        for j in range(n):
-            aug[col][j] = aug[col][j] * piv_inv % P
-            inv[col][j] = inv[col][j] * piv_inv % P
-        for i in range(n):
-            if i == col or aug[i][col] == 0:
-                continue
-            factor = aug[i][col]
-            for j in range(n):
-                aug[i][j] = (aug[i][j] - factor * aug[col][j]) % P
-                inv[i][j] = (inv[i][j] - factor * inv[col][j]) % P
-    return inv
-
-
-def _compute_air_sparse_constants() -> dict:
-    w = PARAMS_16.width
-    hf = PARAMS_16.rounds_f // 2
-    rp = PARAMS_16.rounds_p
-    rc = PARAMS_16.round_constants
-
-    # Dense circulant MDS: M[i][j] = MDS_FIRST_ROW_16[(j - i) mod w].
-    mds = [[MDS_FIRST_ROW_16[(j - i) % w] for j in range(w)] for i in range(w)]
-    mds_inv = _gauss_jordan_inv(mds, w)
-    partial_rc = [list(rc[(hf + i) * w : (hf + i + 1) * w]) for i in range(rp)]
-
-    # --- Compress round constants via backward substitution through MDS^{-1}. ---
-    scalar_rc: list[int] = [0] * rp
-    tmp = list(partial_rc[rp - 1])
-    for i in range(rp - 2, -1, -1):
-        inv_cip = _mat_vec(mds_inv, tmp, w)
-        scalar_rc[i + 1] = inv_cip[0]
-        tmp = list(partial_rc[i])
-        for j in range(1, w):
-            tmp[j] = (tmp[j] + inv_cip[j]) % P
-    sparse_first_round_constants = tmp
-    sparse_scalar_round_constants = scalar_rc[1:]  # length rp - 1
-
-    # --- Factor MDS into per-round sparse matrices. ---
-    mds_t = _mat_transpose(mds, w)
-    m_mul = [row[:] for row in mds_t]
-    v_collection: list[list[int]] = []
-    w_hat_collection: list[list[int]] = []
-    m_i = [[0] * w for _ in range(w)]
-    for _ in range(rp):
-        v_row = [m_mul[0][j + 1] if j < 15 else 0 for j in range(w)]
-        w_col = [m_mul[i + 1][0] for i in range(15)]
-        sub = [[m_mul[i + 1][j + 1] for j in range(15)] for i in range(15)]
-        m_hat_inv = _gauss_jordan_inv(sub, 15)
-        w_hat = [sum(m_hat_inv[i][k] * w_col[k] for k in range(15)) % P if i < 15 else 0 for i in range(w)]
-        v_collection.append(v_row)
-        w_hat_collection.append(w_hat)
-        m_i = [row[:] for row in m_mul]
-        m_i[0][0] = 1
-        for i in range(1, w):
-            m_i[i][0] = 0
-        for j in range(1, w):
-            m_i[0][j] = 0
-        m_mul = _mat_mul(mds_t, m_i, w)
-    sparse_m_i = _mat_transpose(m_i, w)
-    v_collection.reverse()
-    w_hat_collection.reverse()
-
-    # Pre-assemble full first rows: [mds[0][0], ŵ[0], ..., ŵ[14]].
-    mds_0_0 = mds[0][0]
-    sparse_first_row = [[mds_0_0] + w_hat_collection[r][:15] for r in range(rp)]
-
-    return {
-        "half_full_rounds": hf,
-        "partial_rounds": rp,
-        "sparse_m_i": sparse_m_i,
-        "sparse_first_row": sparse_first_row,
-        "sparse_v": v_collection,
-        "sparse_first_round_constants": sparse_first_round_constants,
-        "sparse_scalar_round_constants": sparse_scalar_round_constants,
-    }
-
-
-POSEIDON1_AIR_CONSTANTS = _compute_air_sparse_constants()
+POSEIDON1_AIR_CONSTANTS = {
+    "half_full_rounds": PARAMS_16.rounds_f // 2,
+    "partial_rounds": PARAMS_16.rounds_p,
+    "partial_round_constants": [
+        list(PARAMS_16.round_constants[(PARAMS_16.rounds_f // 2 + i) * PARAMS_16.width :
+                                       (PARAMS_16.rounds_f // 2 + i + 1) * PARAMS_16.width])
+        for i in range(PARAMS_16.rounds_p)
+    ],
+}

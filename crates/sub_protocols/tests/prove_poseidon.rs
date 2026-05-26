@@ -17,7 +17,7 @@ const HALF_DIGEST_LEN: usize = 4;
 
 #[test]
 fn test_prove_poseidon_16() {
-    // LOG_N_ROWS=20 cargo test --release --package sub_protocols --test prove_poseidon_16 -- test_prove_poseidon_16 --exact --nocapture
+    // LOG_N_ROWS=20 cargo test --release --package sub_protocols --test prove_poseidon -- test_prove_poseidon_16 --exact --nocapture
     let log_n_rows: usize = std::env::var("LOG_N_ROWS").unwrap_or("11".to_string()).parse().unwrap();
     prove_air_poseidon_16(log_n_rows);
 }

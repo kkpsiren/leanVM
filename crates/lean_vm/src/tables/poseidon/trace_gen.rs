@@ -55,39 +55,14 @@ pub(super) fn generate_trace_rows_for_perm<F: Algebra<KoalaBear> + Copy>(perm: &
         generate_2_full_round(&mut state, full_round, &constants[0], &constants[1]);
     }
 
-    // --- Sparse partial rounds ---
-    // Transition: add first-round constants, multiply by m_i
-    let frc = poseidon1_sparse_first_round_constants();
-    for (s, &c) in state.iter_mut().zip(frc.iter()) {
-        *s += c;
-    }
-    let m_i = poseidon1_sparse_m_i();
-    let input_for_mi = state;
-    for i in 0..WIDTH {
-        let row: [F; WIDTH] = m_i[i].map(F::from);
-        state[i] = F::dot_product(&input_for_mi, &row);
-    }
-
-    let first_rows = poseidon1_sparse_first_row();
-    let v_vecs = poseidon1_sparse_v();
-    let scalar_rc = poseidon1_sparse_scalar_round_constants();
-    let n_partial = perm.partial_rounds.len();
-    for round in 0..n_partial {
-        // S-box on state[0]
+    // --- Natural partial rounds: AddRC → cube state[0] → dense MDS ---
+    for (round, rc) in poseidon1_partial_constants().iter().enumerate() {
+        for (s, &c) in state.iter_mut().zip(rc.iter()) {
+            *s += c;
+        }
         state[0] = state[0].cube();
         *perm.partial_rounds[round] = state[0];
-        // Scalar round constant (not on last round)
-        if round < n_partial - 1 {
-            state[0] += scalar_rc[round];
-        }
-        // Sparse matrix
-        let old_s0 = state[0];
-        let row: [F; WIDTH] = first_rows[round].map(F::from);
-        let new_s0 = F::dot_product(&state, &row);
-        state[0] = new_s0;
-        for i in 1..WIDTH {
-            state[i] += old_s0 * v_vecs[round][i - 1];
-        }
+        mds_circ_16(&mut state);
     }
 
     let n_ending_full_rounds = perm.ending_full_rounds.len();
