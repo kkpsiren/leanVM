@@ -402,21 +402,21 @@ fn compile_time_transform_in_program(
             break;
         }
 
-        let existing_functions = program.functions.clone();
         for func_name in to_process {
             processed.insert(func_name.clone());
-            let func = program.functions.get_mut(&func_name).unwrap();
+            let mut current_func = program.functions.remove(&func_name).unwrap();
             let mut new_functions = BTreeMap::new();
             compile_time_transform_in_lines(
-                &mut func.body,
+                &mut current_func.body,
                 &const_arrays,
-                &existing_functions,
+                &program.functions,
                 &inlined_functions,
                 &mut new_functions,
                 unroll_counter,
                 inline_counter,
                 &BTreeMap::new(),
             )?;
+            program.functions.insert(func_name, current_func);
             for (name, new_func) in new_functions {
                 program.functions.entry(name).or_insert(new_func);
             }
