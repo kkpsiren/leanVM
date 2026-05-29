@@ -3,8 +3,8 @@ use crate::EF;
 use crate::F;
 use crate::MemoryAccess;
 use crate::RunnerError;
-use crate::TableTrace;
 use crate::tables::extension_op::{EXT_OP_FLAG_BE, EXT_OP_LEN_MULTIPLIER, ExtensionOp, air::*};
+use crate::{TableTrace, TableTraceBuilder};
 use backend::*;
 use utils::ToUsize;
 
@@ -99,7 +99,7 @@ pub(super) fn exec_multi_row(
     flag_be: bool,
     op: ExtensionOp,
     memory: &mut impl MemoryAccess,
-    trace: &mut TableTrace,
+    trace: &mut TableTraceBuilder,
 ) -> Result<(), RunnerError> {
     assert!(size >= 1);
 
@@ -190,14 +190,15 @@ pub(super) fn exec_multi_row(
     Ok(())
 }
 
-/// Fill the v_A columns (5 base field coordinates) after execution
-/// by looking up memory at idx_A addresses.
+/// Fill the v_A columns (5 base field coordinates) of the finalized (flat) trace by looking up
+/// memory at the idx_A addresses. Operates in place on the active region `[0, non_padded)`.
 pub fn fill_trace_extension_op(trace: &mut TableTrace, memory: &[F]) {
-    let n = trace.columns[COL_IDX_A].len();
-    for i in 0..n {
-        let addr = trace.columns[COL_IDX_A][i].to_usize();
-        for k in 0..DIMENSION {
-            trace.columns[COL_V_A + k][i] = memory[addr + k];
+    let n = trace.non_padded_n_rows;
+    let addrs: Vec<usize> = trace.col(COL_IDX_A)[..n].iter().map(|x| x.to_usize()).collect();
+    for k in 0..DIMENSION {
+        let col = trace.col_mut(COL_V_A + k);
+        for (i, &addr) in addrs.iter().enumerate() {
+            col[i] = memory[addr + k];
         }
     }
 }

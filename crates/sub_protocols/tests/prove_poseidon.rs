@@ -3,7 +3,7 @@ use std::time::Instant;
 use backend::*;
 use lean_vm::{
     EF, ExtraDataForBuses, F, POSEIDON_COL_ADDR_LEFT_HI, POSEIDON_COL_ADDR_LEFT_LO, POSEIDON_COL_INPUT_START,
-    POSEIDON_COL_MULTIPLICITY, Poseidon16Precompile, fill_trace_poseidon_16, num_cols_poseidon_16,
+    POSEIDON_COL_MULTIPLICITY, Poseidon16Precompile, TableTrace, fill_trace_poseidon_16, num_cols_poseidon_16,
 };
 use rand::{RngExt, SeedableRng, rngs::StdRng};
 use sub_protocols::{
@@ -26,14 +26,28 @@ fn prove_air_poseidon_16(log_n_rows: usize) {
     let n_rows = 1 << log_n_rows;
     let mut rng = StdRng::seed_from_u64(0);
     let n_cols = num_cols_poseidon_16();
-    let mut trace = vec![vec![F::ZERO; n_rows]; n_cols];
-    for t in trace.iter_mut().skip(POSEIDON_COL_INPUT_START).take(WIDTH) {
+    // Build the input/flag columns, then pack them into a flat column-major `TableTrace` and let
+    // `fill_trace_poseidon_16` compute the round/output columns in place.
+    let mut cols = vec![vec![F::ZERO; n_rows]; n_cols];
+    for t in cols.iter_mut().skip(POSEIDON_COL_INPUT_START).take(WIDTH) {
         *t = (0..n_rows).map(|_| rng.random()).collect();
     }
-    trace[POSEIDON_COL_MULTIPLICITY] = vec![F::ONE; n_rows];
-    trace[POSEIDON_COL_ADDR_LEFT_LO] = vec![F::ZERO; n_rows];
-    trace[POSEIDON_COL_ADDR_LEFT_HI] = vec![F::from_usize(HALF_DIGEST_LEN); n_rows];
-    fill_trace_poseidon_16(&mut trace);
+    cols[POSEIDON_COL_MULTIPLICITY] = vec![F::ONE; n_rows];
+    cols[POSEIDON_COL_ADDR_LEFT_LO] = vec![F::ZERO; n_rows];
+    cols[POSEIDON_COL_ADDR_LEFT_HI] = vec![F::from_usize(HALF_DIGEST_LEN); n_rows];
+
+    let mut data = F::zero_vec(n_cols * n_rows);
+    for (c, col) in cols.iter().enumerate() {
+        data[c * n_rows..(c + 1) * n_rows].copy_from_slice(col);
+    }
+    let mut trace = TableTrace {
+        data,
+        n_columns: n_cols,
+        n_rows,
+        non_padded_n_rows: n_rows,
+        log_n_rows,
+    };
+    fill_trace_poseidon_16(&mut trace, n_rows);
 
     let air = Poseidon16Precompile::<false>;
     let n_constraints = air.n_constraints();
@@ -57,9 +71,7 @@ fn prove_air_poseidon_16(log_n_rows: usize) {
     let time = Instant::now();
 
     let mut commitmed_pol = F::zero_vec((n_cols << log_n_rows).next_power_of_two());
-    for (i, col) in trace.iter().enumerate() {
-        commitmed_pol[i << log_n_rows..(i + 1) << log_n_rows].copy_from_slice(col);
-    }
+    commitmed_pol[..n_cols << log_n_rows].copy_from_slice(&trace.data);
     let committed_pol = MleOwned::Base(commitmed_pol);
     let witness = whir_config.commit(&mut prover_state, &committed_pol, n_cols << log_n_rows);
 
@@ -69,7 +81,7 @@ fn prove_air_poseidon_16(log_n_rows: usize) {
     let extra_data = ExtraDataForBuses::new(Vec::new(), air_alpha_powers);
     prover_state.duplex();
     let eq_factor: Vec<EF> = prover_state.sample_vec(log_n_rows);
-    let column_refs: Vec<&[F]> = trace.iter().map(Vec::as_slice).collect();
+    let column_refs: Vec<&[F]> = (0..n_cols).map(|i| trace.col(i)).collect();
     let packed = MleGroupRef::<EF>::Base(column_refs).pack();
 
     let mut sessions: Vec<Box<dyn OuterSumcheckSession<EF> + '_>> = vec![Box::new(AirSumcheckSession::new(

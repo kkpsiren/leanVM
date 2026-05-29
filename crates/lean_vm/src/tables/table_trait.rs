@@ -136,20 +136,71 @@ pub struct MemoryLookupGroup {
     pub value_cols: Vec<ColIndex>,
 }
 
+/// Incremental, column-major builder used *during* VM execution. Each precompile pushes its
+/// rows column-by-column, and parallel chunks are merged via per-column `extend`. A flat buffer
+/// cannot grow incrementally, so the builder keeps `Vec<Vec<F>>`; it is finalized into the flat
+/// [`TableTrace`] once the row count is known (see `get_execution_trace`).
+#[derive(Debug, Default)]
+pub struct TableTraceBuilder {
+    pub columns: Vec<Vec<F>>,
+}
+
+impl TableTraceBuilder {
+    pub fn new<A: TableT>(air: &A) -> Self {
+        Self {
+            columns: vec![Vec::new(); air.n_columns_total()],
+        }
+    }
+}
+
+/// Finalized table trace, consumed by the prover. Stored as a *single* flat buffer in
+/// **column-major** layout: column `c`, row `r` lives at `data[c * n_rows + r]`. This keeps every
+/// column a contiguous `&[F]` slice (so `stacked_pcs`, `MleGroupRef`, logup and the Poseidon SIMD
+/// fill all stay zero-copy) while replacing O(n_columns) heap allocations with one.
 #[derive(Debug, Default)]
 pub struct TableTrace {
-    pub columns: Vec<Vec<F>>,
+    pub data: Vec<F>,
+    pub n_columns: usize,
+    pub n_rows: usize, // padded, power of two
     pub non_padded_n_rows: usize,
     pub log_n_rows: VarCount,
 }
 
 impl TableTrace {
-    pub fn new<A: TableT>(air: &A) -> Self {
+    /// Allocate the flat buffer with every cell of column `c` pre-initialized to `padding_row[c]`.
+    /// The active region `[0, non_padded)` is then overwritten by the caller (scatter + fill); the
+    /// tail `[non_padded, n_rows)` is left as the padding value.
+    pub fn allocate_padded(non_padded_n_rows: usize, log_n_rows: VarCount, padding_row: &[F]) -> Self {
+        let n_columns = padding_row.len();
+        let n_rows = 1 << log_n_rows;
+        let mut data = F::zero_vec(n_columns * n_rows);
+        data.par_chunks_mut(n_rows)
+            .zip(padding_row.par_iter())
+            .for_each(|(col, &pad)| col.fill(pad));
         Self {
-            columns: vec![Vec::new(); air.n_columns_total()],
-            non_padded_n_rows: 0, // filled later
-            log_n_rows: 0,        // filled later
+            data,
+            n_columns,
+            n_rows,
+            non_padded_n_rows,
+            log_n_rows,
         }
+    }
+
+    #[inline]
+    pub fn col(&self, c: ColIndex) -> &[F] {
+        &self.data[c * self.n_rows..][..self.n_rows]
+    }
+
+    #[inline]
+    pub fn col_mut(&mut self, c: ColIndex) -> &mut [F] {
+        let n_rows = self.n_rows;
+        &mut self.data[c * n_rows..][..n_rows]
+    }
+
+    /// All columns as contiguous mutable slices (column-major chunks of `n_rows`).
+    #[inline]
+    pub fn cols_mut(&mut self) -> impl Iterator<Item = &mut [F]> {
+        self.data.chunks_mut(self.n_rows)
     }
 }
 

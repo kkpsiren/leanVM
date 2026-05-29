@@ -9,7 +9,7 @@ use crate::isa::hint::{DiagnosticState, Hint, HintState, NamedHintCursor};
 use crate::isa::instruction::{InstructionContext, InstructionCounts};
 use crate::{
     ALL_TABLES, CodeAddress, HintExecutionContext, MAX_LOG_MEMORY_SIZE, MemOrConstant, N_TABLES, STARTING_PC, Table,
-    TableTrace,
+    TableTraceBuilder,
 };
 use backend::*;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -72,7 +72,7 @@ pub fn execute_bytecode(
 struct Trace {
     pcs: Vec<usize>,
     fps: Vec<usize>,
-    tables: BTreeMap<Table, TableTrace>,
+    tables: BTreeMap<Table, TableTraceBuilder>,
     counts: InstructionCounts,
     pending_deref_hints: Vec<(usize, usize)>, // (target_addr, src_addr) constraints to resolve at end
 }
@@ -82,7 +82,7 @@ impl Trace {
         Self {
             pcs: Vec::new(),
             fps: Vec::new(),
-            tables: BTreeMap::from_iter((0..N_TABLES).map(|i| (ALL_TABLES[i], TableTrace::new(&ALL_TABLES[i])))),
+            tables: BTreeMap::from_iter((0..N_TABLES).map(|i| (ALL_TABLES[i], TableTraceBuilder::new(&ALL_TABLES[i])))),
             counts: InstructionCounts::default(),
             pending_deref_hints: Vec::new(),
         }

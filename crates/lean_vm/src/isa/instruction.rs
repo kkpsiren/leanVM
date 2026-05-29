@@ -6,7 +6,7 @@ use crate::core::{F, Label};
 use crate::diagnostics::RunnerError;
 use crate::execution::memory::MemoryAccess;
 use crate::tables::TableT;
-use crate::{ExtensionOpMode, Table, TableTrace};
+use crate::{ExtensionOpMode, Table, TableTraceBuilder};
 use crate::{POSEIDON16_NAME, POSEIDON16_PERMUTE_NAME};
 use backend::*;
 use std::collections::BTreeMap;
@@ -136,7 +136,7 @@ pub struct InstructionContext<'a, M: MemoryAccess> {
     pub fp: &'a mut usize,
     pub pc: &'a mut usize,
     pub pcs: &'a Vec<usize>,
-    pub traces: &'a mut BTreeMap<Table, TableTrace>,
+    pub traces: &'a mut BTreeMap<Table, TableTraceBuilder>,
     pub counts: &'a mut InstructionCounts,
 }
 

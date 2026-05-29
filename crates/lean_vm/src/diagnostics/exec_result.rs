@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use backend::pretty_integer;
 
 use crate::execution::Memory;
-use crate::{Table, TableTrace};
+use crate::{Table, TableTraceBuilder};
 
 #[derive(Debug, Default, Clone)]
 pub struct ExecutionMetadata {
@@ -75,7 +75,7 @@ pub struct ExecutionResult {
     pub memory: Memory,
     pub pcs: Vec<usize>,
     pub fps: Vec<usize>,
-    pub traces: BTreeMap<Table, TableTrace>,
+    pub traces: BTreeMap<Table, TableTraceBuilder>,
     pub metadata: ExecutionMetadata,
 }
 

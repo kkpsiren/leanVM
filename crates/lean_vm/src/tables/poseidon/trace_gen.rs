@@ -1,30 +1,35 @@
 use tracing::instrument;
 
 use crate::{
-    F,
+    F, TableTrace,
     tables::{Poseidon1Cols16, WIDTH},
 };
 use backend::*;
 
+/// Fill the Poseidon round/output columns of the finalized (flat) trace in place. The input and
+/// flag columns have already been scattered into `[0, n_active)`; the padding tail
+/// `[n_active, n_rows)` is left untouched (it already holds the padding-row value). The SIMD
+/// `pack_slice` + `Poseidon1Cols16` pointer-cast only require each column to be a contiguous
+/// slice, which the column-major layout guarantees.
 #[instrument(name = "generate Poseidon16 AIR trace", skip_all)]
-pub fn fill_trace_poseidon_16(trace: &mut [Vec<F>]) {
-    let n = trace.iter().map(|col| col.len()).max().unwrap();
-    for col in trace.iter_mut() {
-        if col.len() != n {
-            col.resize(n, F::ZERO);
-        }
-    }
-
-    let m = n - (n % packing_width::<F>());
-    let trace_packed: Vec<_> = trace.iter().map(|col| FPacking::<F>::pack_slice(&col[..m])).collect();
-
+pub fn fill_trace_poseidon_16(trace: &mut TableTrace, n_active: usize) {
     const N_COLS: usize = super::num_cols_poseidon_16();
 
+    let n_rows = trace.n_rows;
+    let data_ptr = trace.data.as_mut_ptr();
+    let width = packing_width::<F>();
+    let m = n_active - (n_active % width);
+
+    // Immutable views of the active region of the first `N_COLS` columns. Writes go through raw
+    // pointers derived from these (mirroring the pre-flat implementation's aliasing).
+    let cols: [&[F]; N_COLS] =
+        std::array::from_fn(|c| unsafe { std::slice::from_raw_parts(data_ptr.add(c * n_rows), n_active) });
+    let trace_packed: [&[FPacking<F>]; N_COLS] = std::array::from_fn(|c| FPacking::<F>::pack_slice(&cols[c][..m]));
+
     // fill the packed rows
-    let cols: &[&[FPacking<F>]; N_COLS] = (&trace_packed[..N_COLS]).try_into().unwrap();
-    (0..m / packing_width::<F>()).into_par_iter().for_each(|i| {
+    (0..m / width).into_par_iter().for_each(|i| {
         let ptrs: [*mut FPacking<F>; N_COLS] =
-            std::array::from_fn(|c| unsafe { (cols[c].as_ptr() as *mut FPacking<F>).add(i) });
+            std::array::from_fn(|c| unsafe { (trace_packed[c].as_ptr() as *mut FPacking<F>).add(i) });
         let perm: &mut Poseidon1Cols16<&mut FPacking<F>> =
             unsafe { &mut *(ptrs.as_ptr() as *mut Poseidon1Cols16<&mut FPacking<F>>) };
 
@@ -32,8 +37,7 @@ pub fn fill_trace_poseidon_16(trace: &mut [Vec<F>]) {
     });
 
     // fill the remaining rows (non packed)
-    let cols: &[Vec<F>; N_COLS] = (&trace[..N_COLS]).try_into().unwrap();
-    for i in m..n {
+    for i in m..n_active {
         let ptrs: [*mut F; N_COLS] = std::array::from_fn(|c| unsafe { (cols[c].as_ptr() as *mut F).add(i) });
         let perm: &mut Poseidon1Cols16<&mut F> = unsafe { &mut *(ptrs.as_ptr() as *mut Poseidon1Cols16<&mut F>) };
         generate_trace_rows_for_perm(perm);

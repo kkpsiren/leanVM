@@ -18,6 +18,25 @@ pub fn transposed_par_iter_mut<A: Send + Sync, const N: usize>(
         .map(move |i| unsafe { std::array::from_fn(|j| &mut *data_ptrs[j].load(Ordering::Relaxed).add(i)) })
 }
 
+/// Like [`transposed_par_iter_mut`], but over a single flat **column-major** buffer
+/// (`data[c * n_rows + r]`) rather than `[Vec<A>; N]`. Yields, for each of the first
+/// `n_active` rows, the array of `N` mutable references to that row's cells. Used to build a
+/// table trace row-by-row directly into its final flat storage.
+pub fn transposed_par_iter_mut_flat<A: Send + Sync, const N: usize>(
+    data: &mut [A],
+    n_rows: usize,
+    n_active: usize,
+) -> impl IndexedParallelIterator<Item = [&mut A; N]> + '_ {
+    assert!(data.len() >= N * n_rows);
+    assert!(n_active <= n_rows);
+    let base = data.as_mut_ptr();
+    let col_ptrs: [AtomicPtr<A>; N] = std::array::from_fn(|c| AtomicPtr::new(unsafe { base.add(c * n_rows) }));
+
+    (0..n_active)
+        .into_par_iter()
+        .map(move |i| unsafe { std::array::from_fn(|c| &mut *col_ptrs[c].load(Ordering::Relaxed).add(i)) })
+}
+
 pub fn collect_refs<T>(vecs: &[Vec<T>]) -> Vec<&[T]> {
     vecs.iter().map(Vec::as_slice).collect()
 }
