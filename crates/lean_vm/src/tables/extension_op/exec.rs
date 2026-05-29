@@ -8,6 +8,10 @@ use crate::{TableTrace, TableTraceBuilder};
 use backend::*;
 use utils::ToUsize;
 
+/// Row width of the extension-op builder: every column is written, so this is the full column count
+/// (`COL_DOMAINSEP_EXTENSION_OP` is the last column).
+const N_EXT_OP_BUILT_COLS: usize = COL_DOMAINSEP_EXTENSION_OP + 1;
+
 fn compute_elem(v_a: EF, v_b: EF, op: ExtensionOp) -> EF {
     match op {
         ExtensionOp::Add => v_a + v_b,
@@ -158,33 +162,33 @@ pub(super) fn exec_multi_row(
         let is_start = i == 0;
         let current_len = size - i;
 
-        trace.columns[COL_FLAG_BE].push(flag_be_f);
-        trace.columns[COL_FLAG_START].push(F::from_bool(is_start));
-        trace.columns[COL_FLAG_ADD].push(flag_add_f);
-        trace.columns[COL_FLAG_DOT_PRODUCT].push(flag_dot_product_f);
-        trace.columns[COL_FLAG_EQ].push(flag_eq_f);
-        trace.columns[COL_LEN].push(F::from_usize(current_len));
-        trace.columns[COL_IDX_A].push(idx_as[i]);
-        trace.columns[COL_IDX_B].push(idx_bs[i]);
-        trace.columns[COL_IDX_RES].push(ptr_res);
-
-        // COL_V_A+0..5: filled later by fill_trace_extension_op (push zeros as placeholders)
-        for k in 0..DIMENSION {
-            trace.columns[COL_V_A + k].push(F::ZERO);
-        }
+        // The extension-op table builds every column, so the builder row covers all columns
+        // (slot == final column index). COL_V_A+0..5 stay zero — filled later by
+        // `fill_trace_extension_op`.
+        let mut row = [F::ZERO; N_EXT_OP_BUILT_COLS];
+        row[COL_FLAG_BE] = flag_be_f;
+        row[COL_FLAG_START] = F::from_bool(is_start);
+        row[COL_FLAG_ADD] = flag_add_f;
+        row[COL_FLAG_DOT_PRODUCT] = flag_dot_product_f;
+        row[COL_FLAG_EQ] = flag_eq_f;
+        row[COL_LEN] = F::from_usize(current_len);
+        row[COL_IDX_A] = idx_as[i];
+        row[COL_IDX_B] = idx_bs[i];
+        row[COL_IDX_RES] = ptr_res;
         for (k, &val) in v_bs[i].as_basis_coefficients_slice().iter().enumerate() {
-            trace.columns[COL_V_B + k].push(val);
+            row[COL_V_B + k] = val;
         }
         for (k, &val) in result_coords.iter().enumerate() {
-            trace.columns[COL_RES + k].push(val);
+            row[COL_RES + k] = val;
         }
         for (k, &val) in accs[i].as_basis_coefficients_slice().iter().enumerate() {
-            trace.columns[COL_ACC + k].push(val);
+            row[COL_ACC + k] = val;
         }
 
         // Virtual columns
-        trace.columns[COL_MULTIPLICITY_EXTENSION_OP].push(F::from_bool(is_start));
-        trace.columns[COL_DOMAINSEP_EXTENSION_OP].push(F::from_usize(mode_bits + EXT_OP_LEN_MULTIPLIER * current_len));
+        row[COL_MULTIPLICITY_EXTENSION_OP] = F::from_bool(is_start);
+        row[COL_DOMAINSEP_EXTENSION_OP] = F::from_usize(mode_bits + EXT_OP_LEN_MULTIPLIER * current_len);
+        trace.push_row(&row);
     }
 
     Ok(())

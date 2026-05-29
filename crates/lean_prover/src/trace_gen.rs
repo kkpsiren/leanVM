@@ -139,11 +139,11 @@ pub fn get_execution_trace(
     {
         let table = Table::poseidon16();
         let builder = traces.remove(&table).unwrap();
-        let h = builder.columns[POSEIDON_COL_MULTIPLICITY].len();
+        let h = builder.n_rows;
         let log_n_rows = table_log_n_rows(h, &table, min_table_log_n_rows);
         let padding_row = table.padding_row(padding_zero_vec_ptr, null_poseidon_16_hash_ptr, ending_pc);
         let mut trace = TableTrace::allocate_padded(h, log_n_rows, &padding_row);
-        scatter_builder(&mut trace, &builder, h);
+        scatter_builder(&mut trace, &builder, &table.built_columns(), h);
 
         fill_trace_poseidon_16(&mut trace, h);
 
@@ -158,11 +158,11 @@ pub fn get_execution_trace(
     {
         let table = Table::extension_op();
         let builder = traces.remove(&table).unwrap();
-        let h = builder.columns[0].len();
+        let h = builder.n_rows;
         let log_n_rows = table_log_n_rows(h, &table, min_table_log_n_rows);
         let padding_row = table.padding_row(padding_zero_vec_ptr, null_poseidon_16_hash_ptr, ending_pc);
         let mut trace = TableTrace::allocate_padded(h, log_n_rows, &padding_row);
-        scatter_builder(&mut trace, &builder, h);
+        scatter_builder(&mut trace, &builder, &table.built_columns(), h);
 
         fill_trace_extension_op(&mut trace, &memory_padded);
 
@@ -176,14 +176,17 @@ pub fn get_execution_trace(
     }
 }
 
-/// Copy each non-empty builder column's `[0, h)` rows into the start of its flat column slice.
-/// Columns that are filled later (Poseidon round/output columns) are empty here and skipped; their
-/// active region is computed in place by the fill pass.
-fn scatter_builder(trace: &mut TableTrace, builder: &TableTraceBuilder, h: usize) {
-    for (c, col) in builder.columns.iter().enumerate() {
-        if !col.is_empty() {
-            debug_assert_eq!(col.len(), h, "builder column {c} has inconsistent height");
-            trace.col_mut(c)[..h].copy_from_slice(col);
+/// Transpose the row-major builder into the flat column-major trace: builder slot `s` (a column of
+/// the row-major buffer) is gathered into flat column `built_cols[s]`, rows `[0, h)`. Columns not
+/// listed in `built_cols` (e.g. Poseidon round/output columns) keep their padding value and are
+/// computed in place by the subsequent fill pass.
+fn scatter_builder(trace: &mut TableTrace, builder: &TableTraceBuilder, built_cols: &[ColIndex], h: usize) {
+    debug_assert_eq!(built_cols.len(), builder.n_built);
+    let n_built = builder.n_built;
+    for (s, &final_c) in built_cols.iter().enumerate() {
+        let col = trace.col_mut(final_c);
+        for (r, cell) in col[..h].iter_mut().enumerate() {
+            *cell = builder.data[r * n_built + s];
         }
     }
 }

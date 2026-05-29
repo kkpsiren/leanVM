@@ -94,10 +94,7 @@ impl Trace {
         self.counts += other.counts;
         self.pending_deref_hints.extend(other.pending_deref_hints);
         for (table, other_t) in other.tables {
-            let mine = self.tables.get_mut(&table).unwrap();
-            for (col, new_data) in mine.columns.iter_mut().zip(other_t.columns) {
-                col.extend(new_data);
-            }
+            self.tables.get_mut(&table).unwrap().merge(other_t);
         }
     }
 }
@@ -337,8 +334,8 @@ fn execute_bytecode_helper(
     let metadata = ExecutionMetadata {
         cycles: trace.pcs.len(),
         memory: memory.0.len(),
-        n_poseidons: trace.tables[&Table::poseidon16()].columns[0].len(),
-        n_extension_ops: trace.tables[&Table::extension_op()].columns[0].len(),
+        n_poseidons: trace.tables[&Table::poseidon16()].n_rows,
+        n_extension_ops: trace.tables[&Table::extension_op()].n_rows,
         bytecode_size: bytecode.code.len(),
         public_input_size: PUBLIC_INPUT_LEN,
         runtime_memory: runtime_memory_size,

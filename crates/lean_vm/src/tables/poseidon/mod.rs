@@ -112,6 +112,15 @@ pub const POSEIDON_COL_OUT_HI: ColIndex = num_cols_poseidon_16() - 8;
 pub const POSEIDON_COL_NU_A: ColIndex = num_cols_poseidon_16();
 pub const POSEIDON_COL_DOMAINSEP: ColIndex = num_cols_poseidon_16() + 1;
 
+/// Row-major builder layout. The incrementally-written columns are the AIR prefix
+/// `0..POSEIDON_COL_INPUT_START + WIDTH` (multiplicity, flags, addresses, inputs) plus the two
+/// trailing virtual columns. For the prefix, builder slot == final column index; the last two
+/// slots remap to `NU_A` / `DOMAINSEP`. The remaining AIR columns (round/output) are computed by
+/// `fill_trace_poseidon_16` at finalize.
+pub const POSEIDON_N_BUILT_COLS: usize = POSEIDON_COL_INPUT_START + WIDTH + 2;
+pub const POSEIDON_SLOT_NU_A: usize = POSEIDON_COL_INPUT_START + WIDTH;
+pub const POSEIDON_SLOT_DOMAINSEP: usize = POSEIDON_COL_INPUT_START + WIDTH + 1;
+
 pub const POSEIDON16_NAME: &str = "poseidon16_compress";
 pub const POSEIDON16_HALF_NAME: &str = "poseidon16_compress_half";
 pub const POSEIDON16_HARDCODED_LEFT_NAME: &str = "poseidon16_compress_hardcoded_left";
@@ -140,6 +149,12 @@ impl<const BUS: bool> TableT for Poseidon16Precompile<BUS> {
 
     fn n_columns_total(&self) -> usize {
         num_cols_total_poseidon_16()
+    }
+
+    fn built_columns(&self) -> Vec<ColIndex> {
+        (0..POSEIDON_COL_INPUT_START + WIDTH)
+            .chain([POSEIDON_COL_NU_A, POSEIDON_COL_DOMAINSEP])
+            .collect()
     }
 
     fn bus_interactions(&self) -> Vec<BusInteraction> {
@@ -261,26 +276,31 @@ impl<const BUS: bool> TableT for Poseidon16Precompile<BUS> {
 
         let hardcoded_offset_left_val = hardcoded_offset_left.unwrap_or(0);
 
-        trace.columns[POSEIDON_COL_MULTIPLICITY].push(F::ONE);
-        trace.columns[POSEIDON_COL_NU_B].push(arg_b);
-        trace.columns[POSEIDON_COL_NU_C].push(index_res_a);
-        trace.columns[POSEIDON_COL_FLAG_SHORT].push(F::from_bool(half_output));
-        trace.columns[POSEIDON_COL_FLAG_LEFT].push(F::from_bool(flag_hardcoded));
-        trace.columns[POSEIDON_COL_OFFSET_LEFT].push(F::from_usize(hardcoded_offset_left_val));
-        trace.columns[POSEIDON_COL_ADDR_LEFT_LO].push(F::from_usize(left_first_addr));
-        trace.columns[POSEIDON_COL_ADDR_LEFT_HI].push(F::from_usize(left_second_addr));
-        trace.columns[POSEIDON_COL_FLAG_PERMUTE].push(F::from_bool(permute));
-        for (i, value) in input.iter().enumerate() {
-            trace.columns[POSEIDON_COL_INPUT_START + i].push(*value);
-        }
-        // Non-committed columns
-        trace.columns[POSEIDON_COL_NU_A].push(arg_a);
         let domainsep = POSEIDON_DOMAINSEP_BASE
             + POSEIDON_FLAG_PERMUTE_SHIFT * (permute as usize)
             + POSEIDON_FLAG_SHORT_SHIFT * (half_output as usize)
             + POSEIDON_FLAG_LEFT_SHIFT * (flag_hardcoded as usize)
             + POSEIDON_OFFSET_LEFT_SHIFT * hardcoded_offset_left_val;
-        trace.columns[POSEIDON_COL_DOMAINSEP].push(F::from_usize(domainsep));
+
+        // Build one row in `built_columns()` slot order. For slots `0..INPUT_START + WIDTH` the slot
+        // index coincides with the final column index; the last two slots hold the virtual columns.
+        let mut row = [F::ZERO; POSEIDON_N_BUILT_COLS];
+        row[POSEIDON_COL_MULTIPLICITY] = F::ONE;
+        row[POSEIDON_COL_NU_B] = arg_b;
+        row[POSEIDON_COL_NU_C] = index_res_a;
+        row[POSEIDON_COL_FLAG_SHORT] = F::from_bool(half_output);
+        row[POSEIDON_COL_FLAG_LEFT] = F::from_bool(flag_hardcoded);
+        row[POSEIDON_COL_OFFSET_LEFT] = F::from_usize(hardcoded_offset_left_val);
+        row[POSEIDON_COL_ADDR_LEFT_LO] = F::from_usize(left_first_addr);
+        row[POSEIDON_COL_ADDR_LEFT_HI] = F::from_usize(left_second_addr);
+        row[POSEIDON_COL_FLAG_PERMUTE] = F::from_bool(permute);
+        for (i, value) in input.iter().enumerate() {
+            row[POSEIDON_COL_INPUT_START + i] = *value;
+        }
+        // Non-committed columns
+        row[POSEIDON_SLOT_NU_A] = arg_a;
+        row[POSEIDON_SLOT_DOMAINSEP] = F::from_usize(domainsep);
+        trace.push_row(&row);
 
         // the rest of the trace is filled at the end of the execution (to get parallelism + SIMD)
 

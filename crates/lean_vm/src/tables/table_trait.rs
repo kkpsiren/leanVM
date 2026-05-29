@@ -136,20 +136,44 @@ pub struct MemoryLookupGroup {
     pub value_cols: Vec<ColIndex>,
 }
 
-/// Incremental, column-major builder used *during* VM execution. Each precompile pushes its
-/// rows column-by-column, and parallel chunks are merged via per-column `extend`. A flat buffer
-/// cannot grow incrementally, so the builder keeps `Vec<Vec<F>>`; it is finalized into the flat
-/// [`TableTrace`] once the row count is known (see `get_execution_trace`).
+/// Incremental, **row-major** single-buffer builder used *during* VM execution. Each precompile
+/// appends a full row over its *built* columns (see [`TableT::built_columns`]); growth is just a
+/// contiguous `Vec` append, and parallel chunks merge with a single `extend`. It is transposed
+/// into the flat column-major [`TableTrace`] once the row count is known (see `get_execution_trace`).
 #[derive(Debug, Default)]
 pub struct TableTraceBuilder {
-    pub columns: Vec<Vec<F>>,
+    pub data: Vec<F>,   // row-major: row r, slot s at data[r * n_built + s]
+    pub n_built: usize, // row width = number of built columns
+    pub n_rows: usize,
 }
 
 impl TableTraceBuilder {
     pub fn new<A: TableT>(air: &A) -> Self {
         Self {
-            columns: vec![Vec::new(); air.n_columns_total()],
+            data: Vec::new(),
+            n_built: air.built_columns().len(),
+            n_rows: 0,
         }
+    }
+
+    /// Append one row, given in `built_columns()` slot order.
+    #[inline]
+    pub fn push_row(&mut self, row: &[F]) {
+        debug_assert_eq!(row.len(), self.n_built);
+        self.data.extend_from_slice(row);
+        self.n_rows += 1;
+    }
+
+    /// Append all rows of another (same-shape) builder — a single contiguous copy.
+    pub fn merge(&mut self, other: Self) {
+        debug_assert_eq!(self.n_built, other.n_built);
+        self.data.extend(other.data);
+        self.n_rows += other.n_rows;
+    }
+
+    #[inline]
+    pub fn row(&self, r: usize) -> &[F] {
+        &self.data[r * self.n_built..][..self.n_built]
     }
 }
 
@@ -270,6 +294,13 @@ pub trait TableT: Air {
     // number of columns committed + potentially some virtual columns (useful to keep in memory for logup)
     fn n_columns_total(&self) -> usize {
         self.n_columns()
+    }
+
+    /// Final column indices written incrementally during execution; the remaining columns are
+    /// computed at finalize (e.g. Poseidon round/output columns). Slot `s` of a builder row maps
+    /// to `built_columns()[s]`. Default: every column, in order.
+    fn built_columns(&self) -> Vec<ColIndex> {
+        (0..self.n_columns_total()).collect()
     }
 
     fn is_execution_table(&self) -> bool {

@@ -83,6 +83,9 @@ impl TableT for Table {
     fn n_columns_total(&self) -> usize {
         delegate_to_inner!(self, n_columns_total)
     }
+    fn built_columns(&self) -> Vec<ColIndex> {
+        delegate_to_inner!(self, built_columns)
+    }
 }
 
 impl Air for Table {
