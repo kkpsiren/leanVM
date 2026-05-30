@@ -86,7 +86,7 @@ pub fn prove_execution(
         for (table, trace) in &traces {
             let buses = table.bus_interactions();
             for group in memory_lookup_groups(&buses) {
-                let idx_col = &trace.columns[group.idx_col];
+                let idx_col = trace.column(group.idx_col);
                 let n = group.value_cols.len();
                 for idx in idx_col {
                     let base = idx.to_usize();
@@ -103,7 +103,7 @@ pub fn prove_execution(
     // // TODO parrallelize
     let mut bytecode_acc = F::zero_vec(bytecode.padded_size());
     info_span!("Building bytecode access count").in_scope(|| -> Result<(), ProverError> {
-        for pc in traces[&Table::execution()].columns[EXEC_COL_PC].iter() {
+        for pc in traces[&Table::execution()].column(EXEC_COL_PC).iter() {
             *bytecode_acc.get_mut(pc.to_usize()).ok_or(RunnerError::PCOutOfBounds)? += F::ONE;
         }
         Ok(())
@@ -157,12 +157,7 @@ pub fn prove_execution(
 
     let column_refs: Vec<Vec<&[F]>> = ALL_TABLES
         .iter()
-        .map(|table| {
-            traces[table].columns[..table.n_columns()]
-                .iter()
-                .map(Vec::as_slice)
-                .collect()
-        })
+        .map(|table| traces[table].column_slices(table.n_columns()))
         .collect();
     let _span = info_span!("Computing shifted columns for AIR sumcheck").entered();
     // Only a few tables; run them serially and let `compute_shifted_columns` use the full pool.

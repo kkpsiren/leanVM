@@ -1,15 +1,11 @@
 use clap::Parser;
 use rec_aggregation::benchmark::{AggregationTopology, biggest_leaf, run_aggregation_benchmark};
 
-// Allocator: mimalloc — a robust production allocator, tuned to retain freed memory (see
-// `lean_multisig::tune_allocator`). Replaces the former `zk-alloc` bump arena, which was
-// fast but fragile: any allocation outliving a phase, or a pointer retained across
-// `begin_phase`'s slab reset (e.g. from a background thread, tracing, or a stray clone),
-// silently corrupted memory. mimalloc-with-retention is both **faster** here and stable.
-// The `standard-alloc` feature selects the plain system allocator for comparison.
-#[cfg(not(feature = "standard-alloc"))]
-#[global_allocator]
-static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+// Allocator: the plain system allocator (glibc on Linux), tuned in `lean_multisig::tune_allocator`
+// to RETAIN freed memory rather than return it to the OS — so the prover's churn of huge per-proof
+// buffers reuses already-faulted pages instead of re-faulting them. Without that retention (plus the
+// explicit cross-proof buffer pool) the system allocator is ~27% slower on `fancy-aggregation`
+// (pure page-fault overhead); with it, performance is on par with the previous mimalloc build.
 
 #[derive(Parser)]
 enum Cli {

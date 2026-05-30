@@ -139,7 +139,7 @@ pub fn prove_generic_logup(
             if next_group < mem_groups.len() && mem_groups[next_group].start_bus == bus_idx {
                 let group = &mem_groups[next_group];
                 let group_len = group.value_cols.len();
-                let col_index = &trace.columns[group.idx_col];
+                let col_index = trace.column(group.idx_col);
                 let packed_chunk_size = (1 << log_n_rows) / width;
 
                 par_fill(&mut numerators[offset..][..group_len << log_n_rows], |_| F::ONE);
@@ -149,7 +149,7 @@ pub fn prove_generic_logup(
                     packed_chunk_size,
                     |i, denom_chunk| {
                         let i_field = F::from_usize(i);
-                        let col_value = &trace.columns[group.value_cols[i]];
+                        let col_value = trace.column(group.value_cols[i]);
                         for (p, slot) in denom_chunk.iter_mut().enumerate() {
                             *slot = c_packed
                                 - finger_print_packed::<EF>(
@@ -177,7 +177,7 @@ pub fn prove_generic_logup(
                     par_fill(slice, |_| val);
                 }
                 BusMultiplicity::Column(col) => {
-                    fill_num_from(slice, &trace.columns[col], matches!(bus.direction, BusDirection::Pull));
+                    fill_num_from(slice, trace.column(col), matches!(bus.direction, BusDirection::Pull));
                 }
             }
             let denom_slot = &mut denominators[offset / width..][..(1 << log_n_rows) / width];
@@ -187,7 +187,7 @@ pub fn prove_generic_logup(
             for (k, entry) in bus.data.iter().enumerate() {
                 match *entry {
                     BusData::Column(c) => {
-                        data_cols[k] = &trace.columns[c];
+                        data_cols[k] = trace.column(c);
                     }
                     _ => {
                         panic!("Non-Column BusData::data entries are not supported on the fast path");
@@ -195,7 +195,7 @@ pub fn prove_generic_logup(
                 }
             }
             let ds_col: Option<&[F]> = match bus.domainsep {
-                BusData::Column(c) => Some(&trace.columns[c]),
+                BusData::Column(c) => Some(trace.column(c)),
                 _ => None,
             };
             let ds_constant_packed: PFPacking<EF> = match bus.domainsep {
@@ -268,8 +268,8 @@ pub fn prove_generic_logup(
 
         let resolve_ef = |entry: BusData| -> EF {
             match entry {
-                BusData::Column(col) => trace.columns[col].evaluate(&inner_point),
-                BusData::ColumnPlusConstant(col, ofs) => trace.columns[col].evaluate(&inner_point) + F::from_usize(ofs),
+                BusData::Column(col) => trace.column(col).evaluate(&inner_point),
+                BusData::ColumnPlusConstant(col, ofs) => trace.column(col).evaluate(&inner_point) + F::from_usize(ofs),
                 BusData::Constant(val) => EF::from_usize(val),
             }
         };
@@ -278,7 +278,7 @@ pub fn prove_generic_logup(
             match bus.multiplicity {
                 BusMultiplicity::Column(mult_col) => {
                     let eval_on_multiplicity =
-                        trace.columns[mult_col].evaluate(&inner_point) * bus.direction.to_field_flag();
+                        trace.column(mult_col).evaluate(&inner_point) * bus.direction.to_field_flag();
                     prover_state.add_extension_scalar(eval_on_multiplicity);
                     let data_evals: Vec<EF> = bus.data.iter().map(|e| resolve_ef(*e)).collect();
                     let eval_on_data = c - finger_print(resolve_ef(bus.domainsep), &data_evals, alphas_eq_poly);
@@ -297,7 +297,7 @@ pub fn prove_generic_logup(
                         .filter_map(|entry| {
                             entry.column().and_then(|col| {
                                 if let std::collections::btree_map::Entry::Vacant(e) = table_values.entry(col) {
-                                    let v = trace.columns[col].evaluate(&inner_point);
+                                    let v = trace.column(col).evaluate(&inner_point);
                                     e.insert(v);
                                     Some(v)
                                 } else {

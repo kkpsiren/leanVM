@@ -1,5 +1,6 @@
 //! Lean VM - A minimal virtual machine implementation
 
+pub mod buffer_pool;
 mod core;
 mod diagnostics;
 mod execution;

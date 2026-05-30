@@ -131,11 +131,12 @@ pub fn stack_polynomials_and_commit(
 
     for (table, log_n_rows) in &tables_heights_sorted {
         let n_rows = 1 << *log_n_rows;
-        for col_index in 0..table.n_columns() {
-            let col = &traces[table].columns[col_index];
-            global_polynomial[offset..][..n_rows].copy_from_slice(&col[..n_rows]);
-            offset += n_rows;
-        }
+        let n_cols = table.n_columns();
+        // The committed columns are stored first and contiguously in the column-major matrix, in
+        // the same order the stacking layout expects, so the whole table copies in one shot.
+        let committed = traces[table].flat_committed(n_cols);
+        global_polynomial[offset..][..n_cols * n_rows].copy_from_slice(committed);
+        offset += n_cols * n_rows;
     }
     assert_eq!(log2_ceil_usize(offset), stacked_n_vars);
     tracing::info!(

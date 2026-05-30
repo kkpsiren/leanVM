@@ -15,9 +15,12 @@ pub type F = KoalaBear;
 ///
 /// Two things, both before any heavy proving allocation (idempotent):
 ///
-/// 1. **Disable mimalloc purging** so freed large blocks are *retained* rather than returned
-///    to the OS and re-faulted on the next allocation — what made the old bump arena fast
-///    (page reuse); mimalloc-with-retention matches and beats it.
+/// 1. **Make the allocator RETAIN freed memory** rather than return it to the OS and re-fault it
+///    on the next allocation — what made the old bump arena fast (page reuse). For glibc this means
+///    `M_TRIM_THRESHOLD = -1` (never trim the main arena to the OS) and `M_MMAP_MAX = 0` (route large
+///    allocations through the retained arena instead of mmap/munmap, which would re-fault). Without
+///    it the prover is ~27% slower on `fancy-aggregation`; with it (plus the cross-proof buffer
+///    pool in `lean_vm::buffer_pool`) performance is on par with the previous mimalloc build.
 ///
 /// 2. **Disable Transparent Huge Pages for this process.** On Zen4 (and likely other x86 with
 ///    physically-indexed L2/L3), when the kernel promotes the allocator's large arenas to
@@ -28,12 +31,12 @@ pub type F = KoalaBear;
 ///    is process-local and overrides even a system-wide `THP=always`. No-op off Linux (macOS
 ///    has no THP — Apple silicon was never affected). Applies under any allocator.
 pub fn tune_allocator() {
-    // mimalloc v3 option index `mi_option_purge_delay` = 15; value -1 = never purge
-    // (equivalent to `MIMALLOC_PURGE_DELAY=-1`). No-op under the `standard-alloc` (plain
-    // system allocator) build.
-    #[cfg(not(feature = "standard-alloc"))]
+    // Retention (point 1 above): never trim the main arena back to the OS, and never satisfy large
+    // allocations with mmap (whose munmap-on-free would re-fault the pages next proof).
+    #[cfg(target_os = "linux")]
     unsafe {
-        libmimalloc_sys::mi_option_set(15, -1);
+        libc::mallopt(libc::M_TRIM_THRESHOLD, -1);
+        libc::mallopt(libc::M_MMAP_MAX, 0);
     }
     // Keep allocator arenas on 4 KB pages (see point 2 above).
     #[cfg(target_os = "linux")]
