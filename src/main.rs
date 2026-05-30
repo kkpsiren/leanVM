@@ -1,6 +1,12 @@
 use clap::Parser;
 use rec_aggregation::benchmark::{AggregationTopology, biggest_leaf, run_aggregation_benchmark};
 
+// Diagnostics build: count process-wide allocations >= 1 MiB to verify the buffer pool eliminates
+// fresh big allocations after warmup. No effect on the default build.
+#[cfg(feature = "count-allocs")]
+#[global_allocator]
+static COUNTING_ALLOC: backend::buffer_pool::CountingSystemAlloc = backend::buffer_pool::CountingSystemAlloc;
+
 // Allocator: the plain system allocator (glibc on Linux), tuned in `lean_multisig::tune_allocator`
 // to RETAIN freed memory rather than return it to the OS — so the prover's churn of huge per-proof
 // buffers reuses already-faulted pages instead of re-faulting them. Without that retention (plus the
@@ -64,6 +70,14 @@ fn run_with_warmup(topology: &AggregationTopology, tracing: bool, json: bool, re
     let report = run_aggregation_benchmark(topology, tracing && !json, json, repeat);
     if json {
         println!("{}", serde_json::to_string(&report).unwrap());
+    }
+    #[cfg(feature = "count-allocs")]
+    {
+        eprintln!(
+            "[count-allocs] total allocations >= 1 MiB (warmup + {repeat} measured): {}",
+            backend::buffer_pool::global_big_alloc_count()
+        );
+        backend::buffer_pool::print_alloc_histogram();
     }
 }
 

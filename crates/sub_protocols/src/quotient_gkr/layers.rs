@@ -84,6 +84,37 @@ impl<'a, EF: ExtensionField<PF<EF>>> LayerStorage<'a, EF> {
         }
     }
 
+    /// Return this layer's owned num/den buffers to the cross-proof pool (borrowed inputs are
+    /// left alone). Call when draining the layer stack at the end of the GKR proof.
+    pub(super) fn into_pooled_owned(self) {
+        match self {
+            Self::Initial { nums, dens, .. } => {
+                if let Cow::Owned(v) = nums {
+                    buffer_pool::checkin_t(v);
+                }
+                if let Cow::Owned(v) = dens {
+                    buffer_pool::checkin_t(v);
+                }
+            }
+            Self::PackedBr { nums, dens, .. } => {
+                if let Cow::Owned(v) = nums {
+                    buffer_pool::checkin_t(v);
+                }
+                if let Cow::Owned(v) = dens {
+                    buffer_pool::checkin_t(v);
+                }
+            }
+            Self::Natural { nums, dens } => {
+                if let Cow::Owned(v) = nums {
+                    buffer_pool::checkin_t(v);
+                }
+                if let Cow::Owned(v) = dens {
+                    buffer_pool::checkin_t(v);
+                }
+            }
+        }
+    }
+
     pub fn materialise_in_full(self) -> (Vec<EF>, Vec<EF>) {
         let natural = match self {
             Self::Natural { .. } => self,
@@ -126,8 +157,14 @@ fn sum_quotients_2_by_2<EF: ExtensionField<PF<EF>>>(nums: &[EF], dens: &[EF]) ->
     let new_active = active_len.div_ceil(2);
     let full_pairs = active_len / 2;
 
-    let mut new_nums: Vec<EF> = unsafe { uninitialized_vec(new_active) };
-    let mut new_dens: Vec<EF> = unsafe { uninitialized_vec(new_active) };
+    // Pooled across proofs (returned when the layer stack is drained); fully written below
+    // (the `full_pairs` loop + the boundary element cover all of `[0, new_active)`).
+    let mut new_nums: Vec<EF> = buffer_pool::checkout_t::<EF>(new_active);
+    let mut new_dens: Vec<EF> = buffer_pool::checkout_t::<EF>(new_active);
+    unsafe {
+        new_nums.set_len(new_active);
+        new_dens.set_len(new_active);
+    }
 
     {
         let dp = parallel::SendPtr(new_dens.as_mut_ptr());
@@ -168,8 +205,14 @@ where
     let stride = 1usize << bit;
     let lo_mask = stride - 1;
 
-    let mut new_nums: Vec<EFPacking<EF>> = unsafe { uninitialized_vec(nums.len() >> 1) };
-    let mut new_dens: Vec<EFPacking<EF>> = unsafe { uninitialized_vec(nums.len() >> 1) };
+    // Pooled across proofs (returned when the layer stack is drained in `prove_gkr_quotient`).
+    // SAFETY: every slot is written by the parallel loop below before any read.
+    let mut new_nums: Vec<EFPacking<EF>> = buffer_pool::checkout_t::<EFPacking<EF>>(nums.len() >> 1);
+    let mut new_dens: Vec<EFPacking<EF>> = buffer_pool::checkout_t::<EFPacking<EF>>(nums.len() >> 1);
+    unsafe {
+        new_nums.set_len(nums.len() >> 1);
+        new_dens.set_len(nums.len() >> 1);
+    }
 
     {
         let dp = parallel::SendPtr(new_dens.as_mut_ptr());

@@ -185,8 +185,13 @@ pub fn fold_and_compute_product_sumcheck_polynomial<
     assert!(n.is_power_of_two());
     let prev_folding_factor_packed = EFPacking::from(prev_folding_factor);
 
-    let mut pol_0_folded = unsafe { uninitialized_vec::<EFPacking>(n / 2) };
-    let mut pol_1_folded = unsafe { uninitialized_vec::<EFPacking>(n / 2) };
+    // Pooled across proofs (returned at the fold-in-place handoff in prove.rs); fully overwritten.
+    let mut pol_0_folded = ::utils::buffer_pool::checkout_t::<EFPacking>(n / 2);
+    let mut pol_1_folded = ::utils::buffer_pool::checkout_t::<EFPacking>(n / 2);
+    unsafe {
+        pol_0_folded.set_len(n / 2);
+        pol_1_folded.set_len(n / 2);
+    }
 
     #[allow(clippy::type_complexity)]
     let process_element = |(p0_prev, p0_f): (((&F, &F), (&F, &F)), (&mut EFPacking, &mut EFPacking)),

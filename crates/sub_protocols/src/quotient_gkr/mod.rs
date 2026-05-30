@@ -74,6 +74,13 @@ pub fn prove_gkr_quotient<'a, EF: ExtensionField<PF<EF>>>(
         (point, claim_num, claim_den) = prove_gkr_layer(prover_state, layer, &point, claim_num, claim_den);
     }
 
+    // Return the layer stack's buffers and the materialised top layer to the cross-proof pool.
+    for layer in layers {
+        layer.into_pooled_owned();
+    }
+    buffer_pool::checkin_t(top_nums);
+    buffer_pool::checkin_t(top_dens);
+
     (quotient, point)
 }
 

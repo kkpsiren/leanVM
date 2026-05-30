@@ -465,13 +465,19 @@ fn sumcheck_fold_and_compute_core<EF, IF, FT, SC>(
 where
     EF: ExtensionField<PF<EF>>,
     IF: Copy + Send + Sync,
-    FT: PrimeCharacteristicRing + Copy + Sub<Output = FT> + Add<Output = FT> + Send + Sync,
+    FT: PrimeCharacteristicRing + Copy + Sub<Output = FT> + Add<Output = FT> + Send + Sync + 'static,
     SC: SumcheckComputation<EF>,
 {
     let prev_folded_size = 2 * compute_fold_size;
 
+    // Pooled across proofs; the OLD group is returned to the pool at the fold-in-place handoff in
+    // prove.rs. SAFETY: every slot is fully overwritten below before any read.
     let folded_f: Vec<Vec<FT>> = (0..multilinears.len())
-        .map(|_| FT::zero_vec(prev_folded_size))
+        .map(|_| {
+            let mut v = ::utils::buffer_pool::checkout_t::<FT>(prev_folded_size);
+            unsafe { v.set_len(prev_folded_size) };
+            v
+        })
         .collect();
 
     // Per-worker scratch: `rows_f` (the [lo, diff, hi] triples) and `point` (the
@@ -629,8 +635,13 @@ where
     SC: SumcheckComputation<EF>,
 {
     let prev_folded_size = 2 * compute_fold_size;
+    // Pooled (returned at the fold-in-place handoff in prove.rs); fully overwritten below.
     let folded_f: Vec<Vec<EFPacking<EF>>> = (0..multilinears.len())
-        .map(|_| EFPacking::<EF>::zero_vec(prev_folded_size))
+        .map(|_| {
+            let mut v = ::utils::buffer_pool::checkout_t::<EFPacking<EF>>(prev_folded_size);
+            unsafe { v.set_len(prev_folded_size) };
+            v
+        })
         .collect();
 
     let n_lo = split_eq.n_lo();

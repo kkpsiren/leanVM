@@ -82,6 +82,9 @@ include_dir = "0.7"
 
 [features]
 prox-gaps-conjecture = ["rec_aggregation/prox-gaps-conjecture"]
+# Diagnostics: install a counting global allocator that tallies allocations >= 1 MiB, to verify the
+# buffer pool eliminates fresh big allocations after warmup (see `lean_vm`/`mt-utils` buffer_pool).
+count-allocs = []
 
 [dependencies]
 clap.workspace = true

@@ -203,6 +203,13 @@ pub(super) fn run_phase1_sumcheck<'a, EF: ExtensionField<PF<EF>>>(
         assert!(initial_pending_r.is_none());
         let (num_l, num_r) = even_odd_split(&unpack_and_unreverse_active::<EF>(nums.as_ref(), layer_chunk_log));
         let (den_l, den_r) = even_odd_split(&unpack_and_unreverse_active::<EF>(dens.as_ref(), layer_chunk_log));
+        // If `nums`/`dens` were pooled fold outputs (from the base), return them now.
+        if let Cow::Owned(v) = nums {
+            buffer_pool::checkin_t(v);
+        }
+        if let Cow::Owned(v) = dens {
+            buffer_pool::checkin_t(v);
+        }
         return run_phase2_sumcheck(
             prover_state,
             num_l,
@@ -239,8 +246,12 @@ pub(super) fn run_phase1_sumcheck<'a, EF: ExtensionField<PF<EF>>>(
                 &eq_outer,
                 &eq_within,
             );
-            nums = Cow::Owned(new_nums);
-            dens = Cow::Owned(new_dens);
+            if let Cow::Owned(v) = std::mem::replace(&mut nums, Cow::Owned(new_nums)) {
+                buffer_pool::checkin_t(v);
+            }
+            if let Cow::Owned(v) = std::mem::replace(&mut dens, Cow::Owned(new_dens)) {
+                buffer_pool::checkin_t(v);
+            }
             c
         } else {
             compute_round_packed::<EF, _>(nums.as_ref(), dens.as_ref(), layer_chunk_log, &eq_outer, &eq_within)
@@ -256,12 +267,25 @@ pub(super) fn run_phase1_sumcheck<'a, EF: ExtensionField<PF<EF>>>(
     if let Some(prev_r) = pending_r {
         let prev_bit = layer_chunk_log - 1 - w;
         let mul = |x: EFPacking<EF>, a: EF| x * a;
-        nums = Cow::Owned(fold_multilinear_at_bit(nums.as_ref(), prev_r, prev_bit, &mul, false));
-        dens = Cow::Owned(fold_multilinear_at_bit(dens.as_ref(), prev_r, prev_bit, &mul, false));
+        let new_nums = fold_multilinear_at_bit(nums.as_ref(), prev_r, prev_bit, &mul, false);
+        if let Cow::Owned(v) = std::mem::replace(&mut nums, Cow::Owned(new_nums)) {
+            buffer_pool::checkin_t(v);
+        }
+        let new_dens = fold_multilinear_at_bit(dens.as_ref(), prev_r, prev_bit, &mul, false);
+        if let Cow::Owned(v) = std::mem::replace(&mut dens, Cow::Owned(new_dens)) {
+            buffer_pool::checkin_t(v);
+        }
     }
 
     let nums_nat = unpack_and_unreverse_active::<EF>(nums.as_ref(), layer_chunk_log);
     let dens_nat = unpack_and_unreverse_active::<EF>(dens.as_ref(), layer_chunk_log);
+    // The folded packed buffers are done (unpacked above); return them to the pool.
+    if let Cow::Owned(v) = nums {
+        buffer_pool::checkin_t(v);
+    }
+    if let Cow::Owned(v) = dens {
+        buffer_pool::checkin_t(v);
+    }
     let (num_l, num_r) = even_odd_split(&nums_nat);
     let (den_l, den_r) = even_odd_split(&dens_nat);
     run_phase2_sumcheck(
@@ -468,8 +492,13 @@ where
     debug_assert_eq!(eq_within.len(), in_eighth);
 
     let active_out_packed = nums.len() / 2;
-    let mut new_nums: Vec<EFPacking<EF>> = unsafe { uninitialized_vec(active_out_packed) };
-    let mut new_dens: Vec<EFPacking<EF>> = unsafe { uninitialized_vec(active_out_packed) };
+    // Pooled across proofs (returned at the GKR sumcheck fold ping-pong); fully overwritten below.
+    let mut new_nums: Vec<EFPacking<EF>> = buffer_pool::checkout_t::<EFPacking<EF>>(active_out_packed);
+    let mut new_dens: Vec<EFPacking<EF>> = buffer_pool::checkout_t::<EFPacking<EF>>(active_out_packed);
+    unsafe {
+        new_nums.set_len(active_out_packed);
+        new_dens.set_len(active_out_packed);
+    }
     let prev_r_packed: EFPacking<EF> = <EFPacking<EF> as From<EF>>::from(prev_r);
 
     let n_chunks = nums.len() / in_packed;

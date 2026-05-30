@@ -6,6 +6,20 @@ use poly::*;
 
 use crate::*;
 
+/// Return a fold-in-place group's column buffers to the cross-proof pool. Only the
+/// extension(-packed) fold OUTPUTS are pooled (base/ref inputs are skipped). Call this on the OLD
+/// group at each fold reassignment below — never on the terminal group, which is returned to the
+/// caller. The borrow checker guarantees the old group is no longer borrowed at the reassignment.
+fn checkin_folded_group<EF: ExtensionField<PF<EF>>>(old: MleGroup<'_, EF>) {
+    match old {
+        MleGroup::Owned(MleGroupOwned::Extension(cols)) => cols.into_iter().for_each(::utils::buffer_pool::checkin_t),
+        MleGroup::Owned(MleGroupOwned::ExtensionPacked(cols)) => {
+            cols.into_iter().for_each(::utils::buffer_pool::checkin_t);
+        }
+        _ => {}
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn sumcheck_prove<'a, EF, SC, M: Into<MleGroup<'a, EF>>>(
     multilinears_f: M,
@@ -144,7 +158,8 @@ where
     }
 
     if let Some(pf) = prev_folding_factor {
-        multilinears = multilinears.by_ref().fold(pf).into();
+        let folded = multilinears.by_ref().fold(pf).into();
+        checkin_folded_group(std::mem::replace(&mut multilinears, folded));
     }
 
     (MultilinearPoint(challenges), multilinears.as_owned().unwrap(), sum)
@@ -189,7 +204,7 @@ where
                 sc_params,
                 computation_degree,
             );
-            *multilinears = folded_multilinears.into();
+            checkin_folded_group(std::mem::replace(multilinears, folded_multilinears.into()));
             computed_p_evals
         }
         None => sumcheck_compute(&multilinears.by_ref(), sc_params, computation_degree),
@@ -271,7 +286,8 @@ pub fn on_challenge_received<'a, EF: ExtensionField<PF<EF>>>(
     }
 
     if store_intermediate_foldings {
-        *multilinears = multilinears.by_ref().fold(challenge).into();
+        let folded = multilinears.by_ref().fold(challenge).into();
+        checkin_folded_group(std::mem::replace(multilinears, folded));
         None
     } else {
         Some(challenge)
