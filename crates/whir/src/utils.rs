@@ -122,7 +122,7 @@ fn prepare_evals_for_fft<EF: ExtensionField<PF<EF>>>(
 }
 
 #[instrument(skip_all)]
-fn prepare_evals_for_fft_unpacked<A: Copy + Send + Sync>(
+fn prepare_evals_for_fft_unpacked<A: Copy + Send + Sync + 'static>(
     evals: &[A],
     folding_factor: usize,
     log_inv_rate: usize,
@@ -135,10 +135,14 @@ fn prepare_evals_for_fft_unpacked<A: Copy + Send + Sync>(
     let log_block_size = log2_strict_usize(block_size);
     let out_len = block_size * dft_n_cols;
 
-    let mut out: Vec<A> = unsafe { uninitialized_vec(out_len) };
+    // Pooled across proofs: this buffer becomes the Merkle leaf codeword (the biggest base-field
+    // buffer for the initial commitment) and is returned to the pool via `MerkleData::checkin`.
+    let mut out: Vec<A> = utils::buffer_pool::checkout_t::<A>(out_len);
     if block_size == 0 || dft_n_cols == 0 {
-        return out;
+        return out; // `out_len == 0` here; an empty buffer is correct
     }
+    // SAFETY: the band loop below writes every element of `[0, out_len)` before any read.
+    unsafe { out.set_len(out_len) };
 
     let rows_per_band = ((system_info::L1_CACHE_SIZE / 2) / (dft_n_cols * size_of::<A>())).clamp(1, block_size);
     let band_len = rows_per_band * dft_n_cols;

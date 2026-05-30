@@ -19,8 +19,14 @@ pub fn get_execution_trace(
 
     let n_cycles = execution_result.pcs.len();
     let memory = &execution_result.memory;
-    let mut main_trace: [Vec<F>; N_TOTAL_EXECUTION_COLUMNS + N_TEMPORARY_EXEC_COLUMNS] =
-        array::from_fn(|_| F::zero_vec(n_cycles.next_power_of_two()));
+    // Build columns drawn from the cross-proof pool (returned in `pad_table`). Zero-fill (not
+    // bare `set_len`): EXEC_COL_FLAG_PRECOMPILE is only written on precompile rows and relies on
+    // the rest being zero — exactly the old `F::zero_vec` semantics.
+    let mut main_trace: [Vec<F>; N_TOTAL_EXECUTION_COLUMNS + N_TEMPORARY_EXEC_COLUMNS] = array::from_fn(|_| {
+        let mut c = buffer_pool::checkout_t::<F>(n_cycles.next_power_of_two());
+        c.resize(n_cycles.next_power_of_two(), F::ZERO);
+        c
+    });
     for col in &mut main_trace {
         unsafe {
             col.set_len(n_cycles);
@@ -93,7 +99,11 @@ pub fn get_execution_trace(
         *trace_row[EXEC_COL_ADDR_C] = addr_c;
     });
 
-    let mut memory_padded: Vec<F> = unsafe { uninitialized_vec(memory.0.len()) };
+    // Reuse a pooled buffer across proofs (returned to the pool at the end of `prove_execution`).
+    // SAFETY: `set_len` then write every element in `[0, memory.0.len())` in the loop below; the
+    // tail appended afterwards by `extend`/`resize` is written with `F::ZERO` explicitly.
+    let mut memory_padded: Vec<F> = buffer_pool::checkout_t::<F>(memory.0.len());
+    unsafe { memory_padded.set_len(memory.0.len()) };
     parallel::par_for_each_mut(&mut memory_padded, |i, slot| {
         *slot = memory.0[i].unwrap_or(F::ZERO);
     });
@@ -204,4 +214,10 @@ fn pad_table(
     // consumed (left empty); the prover reads the trace through the matrix from here on.
     let columns = std::mem::take(&mut trace.columns);
     trace.matrix = ColMatrix::from_padded_columns(&columns, n_rows, &padding_row);
+    // Return every table's build columns to the pool (this runs for all tables): the execution
+    // columns were checked out above; the push-grown poseidon/extension_op columns are recycled
+    // too. `from_padded_columns` only borrowed them, and unused (cap-0) columns no-op on checkin.
+    for col in columns {
+        buffer_pool::checkin_t(col);
+    }
 }

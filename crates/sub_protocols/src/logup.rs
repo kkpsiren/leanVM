@@ -48,9 +48,14 @@ pub fn prove_generic_logup(
         &tables_log_heights_sorted,
     );
     let total_gkr_n_vars = log2_ceil_usize(total_active_len);
-    let mut numerators: Vec<F> = unsafe { uninitialized_vec(total_active_len) };
+    // Pooled across proofs (checked in after the GKR call below). Both are fully overwritten by the
+    // section fills that follow (`offset` reaches `total_active_len`, asserted below), so `set_len`
+    // is sound — no zero-init reliance.
+    let mut numerators: Vec<F> = buffer_pool::checkout_t::<F>(total_active_len);
+    unsafe { numerators.set_len(total_active_len) };
     let width = packing_width::<EF>();
-    let mut denominators: Vec<EFPacking<EF>> = unsafe { uninitialized_vec(total_active_len / width) };
+    let mut denominators: Vec<EFPacking<EF>> = buffer_pool::checkout_t(total_active_len / width);
+    unsafe { denominators.set_len(total_active_len / width) };
     let c_packed = EFPacking::<EF>::from(c);
     let alphas_packed: Vec<EFPacking<EF>> = alphas_eq_poly.iter().map(|a| EFPacking::<EF>::from(*a)).collect();
     let memory_domainsep_packed = PFPacking::<EF>::from(F::from_usize(LOGUP_MEMORY_DOMAINSEP));
@@ -238,6 +243,9 @@ pub fn prove_generic_logup(
         &denominators,
         pivot,
     );
+    // Past their last use; return to the cross-proof pool.
+    buffer_pool::checkin_t(numerators);
+    buffer_pool::checkin_t(denominators);
 
     // sanity check
     assert_eq!(sum, EF::ZERO);

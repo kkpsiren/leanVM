@@ -162,7 +162,7 @@ impl ColMatrix {
         let n_cols = cols.len();
         let needed = n_cols * n_rows;
         // Reuse a buffer from the cross-proof pool (already-faulted pages) instead of allocating.
-        let mut data = crate::buffer_pool::checkout(needed);
+        let mut data = buffer_pool::checkout_t::<F>(needed);
         // SAFETY: every element in `[0, needed)` is written exactly once below (head copy + tail
         // fill), so the uninitialized (or stale-from-a-prior-proof) contents are never read.
         unsafe { data.set_len(needed) };
@@ -209,7 +209,7 @@ impl Drop for ColMatrix {
         // Return the backing buffer to the cross-proof pool for the next proof to reuse. All
         // `&[F]` views into the matrix are confined to the proving call frame that owns it, so
         // none outlive this drop. A default/unbuilt matrix has an empty buffer (checkin no-ops).
-        crate::buffer_pool::checkin(std::mem::take(&mut self.data));
+        buffer_pool::checkin_t(std::mem::take(&mut self.data));
     }
 }
 

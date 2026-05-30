@@ -183,7 +183,7 @@ fn first_digest_layer_with_initial_state<P, Perm, const DIGEST_ELEMS: usize, con
 ) -> Vec<[P::Value; DIGEST_ELEMS]>
 where
     P: PackedValue + Default,
-    P::Value: Default + Copy + Send + Sync,
+    P::Value: Default + Copy + Send + Sync + 'static,
     Perm: koala_bear::symmetric::Permutation<[P::Value; WIDTH]> + koala_bear::symmetric::Permutation<[P; WIDTH]>,
 {
     let width = P::WIDTH;
@@ -191,7 +191,10 @@ where
     assert!(height.is_multiple_of(width));
     let n_pad = (RATE - effective_base_width % RATE) % RATE;
 
-    let mut digests = unsafe { uninitialized_vec(height) };
+    // Pooled across proofs (the first/largest digest layer); returned via `MerkleData::checkin`.
+    // SAFETY: the par loop below writes every element before any read.
+    let mut digests = utils::buffer_pool::checkout_t::<[P::Value; DIGEST_ELEMS]>(height);
+    unsafe { digests.set_len(height) };
 
     // `height` is a multiple of `width`, so every chunk is exactly `width` long.
     parallel::par_chunks_mut(&mut digests, width, |i, digests_chunk| {

@@ -119,7 +119,12 @@ pub fn stack_polynomials_and_commit(
         log2_strict_usize(bytecode_acc.len()),
         &tables_heights_sorted.iter().cloned().collect(),
     );
-    let mut global_polynomial = F::zero_vec(1 << stacked_n_vars); // TODO avoid cloning all witness data
+    // Reuse a pooled buffer across proofs (returned to the pool at the end of `prove_execution`).
+    // Must be fully zero-filled, not `set_len`: only `[0, offset)` is overwritten by the copies
+    // below; the power-of-two padding tail `[offset, 1<<stacked_n_vars)` is never written here and
+    // is read by WHIR, so it must be zero — exactly the old `F::zero_vec` semantics.
+    let mut global_polynomial = buffer_pool::checkout_t::<F>(1 << stacked_n_vars);
+    global_polynomial.resize(1 << stacked_n_vars, F::ZERO);
     global_polynomial[..memory.len()].copy_from_slice(memory);
     let mut offset = memory.len();
     global_polynomial[offset..][..memory_acc.len()].copy_from_slice(memory_acc);

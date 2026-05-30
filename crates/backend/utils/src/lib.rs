@@ -5,6 +5,7 @@ use std::{
 };
 
 pub mod array_serialization;
+pub mod buffer_pool;
 
 /// Computes `log_2(n)`
 ///

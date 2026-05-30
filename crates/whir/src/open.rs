@@ -51,6 +51,9 @@ where
             self.round(round, prover_state, &mut round_state).unwrap();
         }
 
+        // Return the final round's Merkle tree to the cross-proof pool (partial move; the point is
+        // built from a different field below).
+        round_state.merkle_prover_data.checkin();
         MultilinearPoint(round_state.randomness_vec)
     }
 
@@ -172,7 +175,10 @@ where
         round_state.domain_size = new_domain_size;
         round_state.next_domain_gen =
             PF::<EF>::two_adic_generator(log2_strict_usize(new_domain_size) - folding_factor_next);
-        round_state.merkle_prover_data = prover_data;
+        // The previous round's tree is now past its last use (this round already opened it above);
+        // return its codeword + first digest layer to the cross-proof pool before replacing it.
+        let old_tree = std::mem::replace(&mut round_state.merkle_prover_data, prover_data);
+        old_tree.checkin();
         round_state.commitment_merkle_prover_data_b = None;
 
         Ok(())
@@ -432,7 +438,11 @@ where
         );
 
         evals = new_evals.into();
-        weights = new_weights.into();
+        // The original (pre-fold) combined_weights buffer is past its last use; return it to the pool.
+        let old_weights = std::mem::replace(&mut weights, new_weights.into());
+        if let Mle::Owned(MleOwned::ExtensionPacked(buf)) = old_weights {
+            ::utils::buffer_pool::checkin_t(buf);
+        }
 
         let sumcheck = Self {
             evals: evals.as_owned().unwrap(),
@@ -533,7 +543,8 @@ where
 
     let start_idx = match statements {
         [a, b, ..] if is_full(a) && is_full(b) => {
-            combined_weights = unsafe { uninitialized_vec(out_len) };
+            combined_weights = ::utils::buffer_pool::checkout_t::<EFPacking<EF>>(out_len);
+            unsafe { combined_weights.set_len(out_len) }; // fully overwritten by compute_eval_eq_packed* below
             let sa = gamma_pow;
             let sb = gamma_pow * gamma;
             combined_sum = a.values[0].value * sa + b.values[0].value * sb;
@@ -542,7 +553,8 @@ where
             2
         }
         [a, ..] if is_full(a) => {
-            combined_weights = unsafe { uninitialized_vec(out_len) };
+            combined_weights = ::utils::buffer_pool::checkout_t::<EFPacking<EF>>(out_len);
+            unsafe { combined_weights.set_len(out_len) }; // fully overwritten by compute_eval_eq_packed* below
             let sa = gamma_pow;
             combined_sum = a.values[0].value * sa;
             gamma_pow *= gamma;
@@ -550,7 +562,9 @@ where
             1
         }
         _ => {
-            combined_weights = EFPacking::<EF>::zero_vec(out_len);
+            // Zero-init required: the sparse path only `+=` into subranges below.
+            combined_weights = ::utils::buffer_pool::checkout_t::<EFPacking<EF>>(out_len);
+            combined_weights.resize(out_len, EFPacking::<EF>::ZERO);
             0
         }
     };

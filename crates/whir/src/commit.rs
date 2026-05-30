@@ -31,6 +31,19 @@ impl<EF: ExtensionField<PF<EF>>> MerkleData<EF> {
         }
     }
 
+    /// Return the Merkle leaf codeword and the first (largest) digest layer to the cross-proof
+    /// pool. Call once the tree is past its last use (it is consumed). The smaller compressed
+    /// digest layers are left to drop normally.
+    pub(crate) fn checkin(self) {
+        let mut tree = match self {
+            MerkleData::Base(t) | MerkleData::Extension(t) => t,
+        };
+        if !tree.tree.digest_layers.is_empty() {
+            ::utils::buffer_pool::checkin_t(tree.tree.digest_layers.swap_remove(0));
+        }
+        ::utils::buffer_pool::checkin_t(std::mem::take(&mut tree.leaf.values));
+    }
+
     pub(crate) fn open(&self, index: usize) -> (MleOwned<EF>, Vec<[PF<EF>; DIGEST_ELEMS]>) {
         match self {
             MerkleData::Base(prover_data) => {

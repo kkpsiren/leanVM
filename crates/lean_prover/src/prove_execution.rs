@@ -81,7 +81,10 @@ pub fn prove_execution(
     tracing::info!("Trace tables sizes: {}", table_log.magenta());
 
     // TODO parrallelize
-    let mut memory_acc = F::zero_vec(memory.len());
+    // Pooled across proofs (checked in at the end). Zero-fill required: the loop only `+= ONE` on
+    // a subset of indices; every other cell must stay 0 (the lookup multiplicities).
+    let mut memory_acc = backend::buffer_pool::checkout_t::<F>(memory.len());
+    memory_acc.resize(memory.len(), F::ZERO);
     info_span!("Building memory access count").in_scope(|| -> Result<(), ProverError> {
         for (table, trace) in &traces {
             let buses = table.bus_interactions();
@@ -101,7 +104,9 @@ pub fn prove_execution(
     })?;
 
     // // TODO parrallelize
-    let mut bytecode_acc = F::zero_vec(bytecode.padded_size());
+    // Pooled across proofs (checked in at the end). Zero-fill required (accumulator, as above).
+    let mut bytecode_acc = backend::buffer_pool::checkout_t::<F>(bytecode.padded_size());
+    bytecode_acc.resize(bytecode.padded_size(), F::ZERO);
     info_span!("Building bytecode access count").in_scope(|| -> Result<(), ProverError> {
         for pc in traces[&Table::execution()].column(EXEC_COL_PC).iter() {
             *bytecode_acc.get_mut(pc.to_usize()).ok_or(RunnerError::PCOutOfBounds)? += F::ONE;
@@ -222,6 +227,14 @@ pub fn prove_execution(
         committed_statements.get_mut(table).unwrap().push(claim);
     }
 
+    // The AIR sessions borrow the shifted columns; once dropped, return those buffers to the pool.
+    drop(sessions);
+    for table_shifts in shifted_rows {
+        for col in table_shifts {
+            backend::buffer_pool::checkin_t(col);
+        }
+    }
+
     let public_memory_random_point = MultilinearPoint(prover_state.sample_vec(log2_strict_usize(PUBLIC_INPUT_LEN)));
     let public_memory_eval = (&memory[..PUBLIC_INPUT_LEN]).evaluate(&public_memory_random_point);
 
@@ -265,6 +278,14 @@ pub fn prove_execution(
         stacked_pcs_witness.inner_witness,
         &stacked_pcs_witness.global_polynomial.by_ref(),
     );
+
+    // Return the large per-proof buffers to the cross-proof pool, now past their last use above.
+    if let Some(global_polynomial) = stacked_pcs_witness.global_polynomial.into_base() {
+        backend::buffer_pool::checkin_t(global_polynomial);
+    }
+    backend::buffer_pool::checkin_t(memory);
+    backend::buffer_pool::checkin_t(memory_acc);
+    backend::buffer_pool::checkin_t(bytecode_acc);
 
     tracing::info!("total pow_grinding time: {} ms", pow_grinding_time().as_millis());
     reset_pow_grinding_time();

@@ -92,7 +92,10 @@ where
                 let mut bit_reversed: Vec<Vec<PFPacking<EF>>> = (0..cols.len()).map(|_| Vec::new()).collect();
                 parallel::par_chunks_mut(&mut bit_reversed, 1, |i, out_slot| {
                     let src = cols[i];
-                    let mut dst: Vec<PFPacking<EF>> = unsafe { uninitialized_vec(src.len()) };
+                    // Pooled across proofs; returned at the first `process_challenge`.
+                    // SAFETY: the chunked loop below writes every element of `dst`.
+                    let mut dst: Vec<PFPacking<EF>> = buffer_pool::checkout_t::<PFPacking<EF>>(src.len());
+                    unsafe { dst.set_len(src.len()) };
                     let src_u = PFPacking::<EF>::unpack_slice(src);
                     let dst_u = PFPacking::<EF>::unpack_slice_mut(&mut dst);
                     for (src_chunk, dst_chunk) in src_u.chunks_exact(chunk_size).zip(dst_u.chunks_exact_mut(chunk_size))
@@ -272,7 +275,15 @@ where
         let was_in_phase_1 = self.in_phase_1();
         let fold_bit = self.folding_bit_packed();
 
-        self.multilinears = self.multilinears.by_ref().fold_at_bit(challenge, fold_bit).into();
+        let folded = self.multilinears.by_ref().fold_at_bit(challenge, fold_bit).into();
+        let old = std::mem::replace(&mut self.multilinears, folded);
+        // Round 0's group is the pooled `bit_reversed` (BasePacked); the first fold makes it
+        // ExtensionPacked, so this gate fires only for round 0. Return those columns to the pool.
+        if let MleGroup::Owned(MleGroupOwned::BasePacked(old_cols)) = old {
+            for col in old_cols {
+                buffer_pool::checkin_t(col);
+            }
+        }
 
         self.current_unpadded_len = self.current_unpadded_len.div_ceil(2);
         self.rounds_done += 1;
@@ -657,12 +668,15 @@ pub fn prove_batched_air_sumcheck<'a, EF: ExtensionField<PF<EF>>>(
     MultilinearPoint(challenges)
 }
 
-pub fn compute_shifted_columns<F: Field>(n_shift_columns: usize, columns: &[&[F]]) -> Vec<Vec<F>> {
+pub fn compute_shifted_columns<F: Field + Send + 'static>(n_shift_columns: usize, columns: &[&[F]]) -> Vec<Vec<F>> {
     // Convention: the first `n_shift_columns` columns are the ones that get shifted.
     let mut out: Vec<Vec<F>> = (0..n_shift_columns).map(|_| Vec::new()).collect();
     parallel::par_chunks_mut(&mut out, 1, |i, slot| {
         let column = columns[i];
-        let mut shifted = unsafe { uninitialized_vec(column.len()) };
+        // Pooled across proofs (returned in prove_execution after the AIR sessions are done).
+        // SAFETY: every element is written below (the copy + the last-element set).
+        let mut shifted = buffer_pool::checkout_t::<F>(column.len());
+        unsafe { shifted.set_len(column.len()) };
         shifted[..column.len() - 1].copy_from_slice(&column[1..]);
         shifted[column.len() - 1] = column[column.len() - 1];
         slot[0] = shifted;
