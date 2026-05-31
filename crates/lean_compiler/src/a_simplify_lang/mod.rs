@@ -449,151 +449,81 @@ fn compile_time_transform_in_lines(
     inline_counter: &mut Counter,
     parent_const_var_exprs: &BTreeMap<Var, F>,
 ) -> Result<(), String> {
-    let mut const_var_exprs: BTreeMap<Var, F> = parent_const_var_exprs.clone(); // used to simplify expressions containing variables with known constant values
+    // Maps each immutable variable to its known compile-time scalar value, so
+    // later lines can substitute it. Seeded with the constants visible from the
+    // enclosing (inline) block.
+    let mut const_var_exprs: BTreeMap<Var, F> = parent_const_var_exprs.clone();
 
     let mut i = 0;
     while i < lines.len() {
-        let line = &mut lines[i];
+        // Each step below either rewrites `lines[i]` in place — splicing in new
+        // lines and restarting at `i` (via `continue`) so they too get
+        // transformed — or leaves the line for the next step. The ORDER is
+        // load-bearing; each step's comment states the precondition it relies on.
 
-        // Handle match_range expansion FIRST, before any expression transformations
-        // This is necessary because lambda bodies contain bound variables that don't exist in scope
+        // 1. Expand `match_range(...)` into a `match`. Must precede every
+        //    expression transform: lambda bodies mention an unbound parameter.
         if let Line::Statement {
             targets,
             value,
             location,
-        } = line
+        } = &lines[i]
             && let Some(expanded) = try_expand_match_range(value, targets, *location, const_arrays)?
         {
             lines.splice(i..=i, expanded);
             continue;
         }
 
-        for expr in line.expressions_mut() {
-            substitute_const_vars_in_expr(expr, &const_var_exprs);
-            compile_time_transform_in_expr(expr, const_arrays)?;
-        }
+        // 2. Substitute known constants, then fold constant subexpressions. This
+        //    is what lets later steps recognize const-arg calls / unroll bounds /
+        //    constant `if` conditions via `as_scalar()`.
+        fold_expressions_in_line(&mut lines[i], &const_var_exprs, const_arrays)?;
 
-        // Extract nested calls to functions requiring preprocessing (inlined or const-arg)
-        // e.g., `x = a + inlined_func(b)` -> `tmp = inlined_func(b); x = a + tmp`
+        // 3. Hoist nested inlined / const-arg calls (e.g. `a + f(b)`) into temps,
+        //    so steps 4a/4b only ever see *direct* calls with simple arguments.
         if let Some(new_lines) =
-            extract_preprocessed_calls(line, inlined_functions, existing_functions, inline_counter)?
+            extract_preprocessed_calls(&mut lines[i], inlined_functions, existing_functions, inline_counter)?
         {
             lines.splice(i..=i, new_lines);
             continue;
         }
 
-        match line {
-            Line::Statement { targets, value, .. } => {
-                if let Some(inlined) = try_inline_call(value, targets, inlined_functions, const_arrays, inline_counter)
-                {
-                    lines.splice(i..=i, inlined);
-                    continue;
-                }
-                // Handle direct const-arg function calls: specialize them (e.g., double(1) -> double_a=1())
-                if let Expression::FunctionCall {
-                    function_name, args, ..
-                } = value
-                    && let Some(func) = existing_functions.get(function_name.as_str())
-                    && func.has_const_arguments()
-                {
-                    let mut const_evals = Vec::new();
-                    for (arg_expr, arg) in args.iter().zip(&func.arguments) {
-                        if arg.is_const {
-                            if let Some(const_eval) = arg_expr.as_scalar() {
-                                const_evals.push((arg.name.clone(), const_eval));
-                            } else {
-                                return Err(format!(
-                                    "Cannot evaluate const argument '{}' for function '{}'",
-                                    arg.name, function_name
-                                ));
-                            }
-                        }
-                    }
-                    let const_funct_name = format!(
-                        "{function_name}_{}",
-                        const_evals
-                            .iter()
-                            .map(|(v, c)| format!("{v}={c}"))
-                            .collect::<Vec<_>>()
-                            .join("_")
-                    );
-                    *function_name = const_funct_name.clone();
-                    *args = args
-                        .iter()
-                        .zip(&func.arguments)
-                        .filter(|(_, arg)| !arg.is_const)
-                        .map(|(e, _)| e.clone())
-                        .collect();
-                    if !new_functions.contains_key(&const_funct_name)
-                        && !existing_functions.contains_key(&const_funct_name)
-                    {
-                        let mut new_body = func.body.clone();
-                        replace_vars_by_const_in_lines(&mut new_body, &const_evals.iter().cloned().collect())?;
-                        new_functions.insert(
-                            const_funct_name.clone(),
-                            Function {
-                                name: const_funct_name,
-                                arguments: func.arguments.iter().filter(|a| !a.is_const).cloned().collect(),
-                                inlined: false,
-                                body: new_body,
-                                n_returned_vars: func.n_returned_vars,
-                            },
-                        );
-                    }
-                }
-                if targets.len() == 1
-                    && let AssignmentTarget::Var { var, is_mutable: false } = &targets[0]
-                    && let Some(value_const) = value.as_scalar()
-                {
-                    const_var_exprs.insert(var.clone(), value_const);
-                }
-            }
-
-            Line::IfCondition {
-                condition,
-                then_branch,
-                else_branch,
-                ..
-            } => {
-                if let Some(constant_condition) = condition.try_eval(|expr| expr.as_scalar()) {
-                    let chosen_branch = if constant_condition { then_branch } else { else_branch }.clone();
-                    lines.splice(i..=i, chosen_branch);
-                    continue;
-                }
-            }
-
-            Line::ForLoop {
-                iterator,
-                start,
-                end,
-                body,
-                loop_kind: LoopKind::Unroll,
-                location,
-            } => {
-                let (Some(start), Some(end)) = (start.as_scalar(), end.as_scalar()) else {
-                    return Err(format!(
-                        "line {}: Cannot unroll loop with non-constant bounds",
-                        location
-                    ));
-                };
-                let unroll_index = unroll_counter.get_next();
-                let (internal_vars, _) = find_variable_usage(body, const_arrays);
-                let iterator = iterator.clone();
-                let body = body.clone();
-                let mut unrolled = Vec::new();
-                for j in start.to_usize()..end.to_usize() {
-                    let mut body_copy = body.clone();
-                    replace_vars_for_unroll(&mut body_copy, &iterator, unroll_index, j, &internal_vars);
-                    unrolled.extend(body_copy);
-                }
-                lines.splice(i..=i, unrolled);
-                continue;
-            }
-            _ => {}
+        // 4a. Inline a direct call to an `@inline` function.
+        if let Line::Statement { targets, value, .. } = &lines[i]
+            && let Some(inlined) = try_inline_call(value, targets, inlined_functions, const_arrays, inline_counter)
+        {
+            lines.splice(i..=i, inlined);
+            continue;
         }
 
-        // Propagate const vars into blocks which stay inline
-        let parent = if matches!(
+        // 4b. Monomorphize a direct call to a function with `Const` parameters
+        //     (generating the specialized function on demand). No-op otherwise.
+        specialize_const_arg_call(&mut lines[i], existing_functions, new_functions)?;
+
+        // 4c. Remember `x = <scalar>` bindings for immutable `x` (feeds step 2).
+        record_const_binding(&lines[i], &mut const_var_exprs);
+
+        // 4d. Replace an `if` with a constant condition by its taken branch.
+        if try_fold_constant_if(lines, i) {
+            continue;
+        }
+
+        // 4e. Expand an `unroll(a, b)` loop with constant bounds.
+        if matches!(
+            lines[i],
+            Line::ForLoop {
+                loop_kind: LoopKind::Unroll,
+                ..
+            }
+        ) {
+            unroll_loop(lines, i, const_arrays, unroll_counter)?;
+            continue;
+        }
+
+        // 5. Recurse into nested blocks. Constants propagate into blocks that stay
+        //    inline (if / match arms), but not into `range` loop bodies.
+        let no_consts = BTreeMap::new();
+        let inner_consts = if matches!(
             lines[i],
             Line::IfCondition { .. }
                 | Line::Match { .. }
@@ -604,7 +534,7 @@ fn compile_time_transform_in_lines(
         ) {
             &const_var_exprs
         } else {
-            &BTreeMap::new()
+            &no_consts
         };
         for block in lines[i].nested_blocks_mut() {
             compile_time_transform_in_lines(
@@ -615,12 +545,169 @@ fn compile_time_transform_in_lines(
                 new_functions,
                 unroll_counter,
                 inline_counter,
-                parent,
+                inner_consts,
             )?;
         }
 
         i += 1;
     }
+    Ok(())
+}
+
+/// Step 2 of `compile_time_transform_in_lines`: substitute known-constant
+/// immutable variables into every expression of `line`, then fold any subexpression
+/// that thereby became fully constant.
+fn fold_expressions_in_line(
+    line: &mut Line,
+    const_var_exprs: &BTreeMap<Var, F>,
+    const_arrays: &BTreeMap<String, ConstArrayValue>,
+) -> Result<(), String> {
+    for expr in line.expressions_mut() {
+        substitute_const_vars_in_expr(expr, const_var_exprs);
+        compile_time_transform_in_expr(expr, const_arrays)?;
+    }
+    Ok(())
+}
+
+/// Step 4b: if `line` is a direct call to a function with `Const` parameters,
+/// monomorphize it. With `def double(const a)`, the call `double(1)` is rewritten
+/// to `double_a=1()`, its const argument dropped, and the specialized function
+/// `double_a=1` generated once (with the constant substituted into its body).
+/// Requires the const arguments to already be folded to scalars (step 2). No-op
+/// unless `line` is exactly such a call.
+fn specialize_const_arg_call(
+    line: &mut Line,
+    existing_functions: &BTreeMap<String, Function>,
+    new_functions: &mut BTreeMap<String, Function>,
+) -> Result<(), String> {
+    let Line::Statement {
+        value: Expression::FunctionCall {
+            function_name, args, ..
+        },
+        ..
+    } = line
+    else {
+        return Ok(());
+    };
+    let Some(func) = existing_functions.get(function_name.as_str()) else {
+        return Ok(());
+    };
+    if !func.has_const_arguments() {
+        return Ok(());
+    }
+
+    let mut const_evals = Vec::new();
+    for (arg_expr, arg) in args.iter().zip(&func.arguments) {
+        if arg.is_const {
+            if let Some(const_eval) = arg_expr.as_scalar() {
+                const_evals.push((arg.name.clone(), const_eval));
+            } else {
+                return Err(format!(
+                    "Cannot evaluate const argument '{}' for function '{}'",
+                    arg.name, function_name
+                ));
+            }
+        }
+    }
+    let const_funct_name = format!(
+        "{function_name}_{}",
+        const_evals
+            .iter()
+            .map(|(v, c)| format!("{v}={c}"))
+            .collect::<Vec<_>>()
+            .join("_")
+    );
+    *function_name = const_funct_name.clone();
+    *args = args
+        .iter()
+        .zip(&func.arguments)
+        .filter(|(_, arg)| !arg.is_const)
+        .map(|(e, _)| e.clone())
+        .collect();
+    if !new_functions.contains_key(&const_funct_name) && !existing_functions.contains_key(&const_funct_name) {
+        let mut new_body = func.body.clone();
+        replace_vars_by_const_in_lines(&mut new_body, &const_evals.iter().cloned().collect())?;
+        new_functions.insert(
+            const_funct_name.clone(),
+            Function {
+                name: const_funct_name,
+                arguments: func.arguments.iter().filter(|a| !a.is_const).cloned().collect(),
+                inlined: false,
+                body: new_body,
+                n_returned_vars: func.n_returned_vars,
+            },
+        );
+    }
+    Ok(())
+}
+
+/// Step 4c: record `x = <scalar>` bindings for immutable `x`, so subsequent lines
+/// can substitute the constant (step 2). No-op for anything else.
+fn record_const_binding(line: &Line, const_var_exprs: &mut BTreeMap<Var, F>) {
+    if let Line::Statement { targets, value, .. } = line
+        && targets.len() == 1
+        && let AssignmentTarget::Var { var, is_mutable: false } = &targets[0]
+        && let Some(value_const) = value.as_scalar()
+    {
+        const_var_exprs.insert(var.clone(), value_const);
+    }
+}
+
+/// Step 4d: if `lines[i]` is an `if` whose condition folds to a compile-time
+/// constant, replace it in place with the taken branch. Returns whether it did
+/// (so the caller restarts at `i`). No-op for non-`if` lines.
+fn try_fold_constant_if(lines: &mut Vec<Line>, i: usize) -> bool {
+    let Line::IfCondition {
+        condition,
+        then_branch,
+        else_branch,
+        ..
+    } = &lines[i]
+    else {
+        return false;
+    };
+    let Some(constant_condition) = condition.try_eval(|expr| expr.as_scalar()) else {
+        return false;
+    };
+    let chosen_branch = if constant_condition { then_branch } else { else_branch }.clone();
+    lines.splice(i..=i, chosen_branch);
+    true
+}
+
+/// Step 4e: expand `unroll(start, end)` (constant bounds) by cloning the body
+/// once per iteration, substituting the iterator constant and uniquely renaming
+/// the body's internal variables. `lines[i]` must be an unroll loop.
+fn unroll_loop(
+    lines: &mut Vec<Line>,
+    i: usize,
+    const_arrays: &BTreeMap<String, ConstArrayValue>,
+    unroll_counter: &mut Counter,
+) -> Result<(), String> {
+    let Line::ForLoop {
+        iterator,
+        start,
+        end,
+        body,
+        loop_kind: LoopKind::Unroll,
+        location,
+    } = &lines[i]
+    else {
+        unreachable!("unroll_loop called on a non-unroll line");
+    };
+    let (Some(start), Some(end)) = (start.as_scalar(), end.as_scalar()) else {
+        return Err(format!("line {location}: Cannot unroll loop with non-constant bounds"));
+    };
+    let unroll_index = unroll_counter.get_next();
+    let (internal_vars, _) = find_variable_usage(body, const_arrays);
+    let iterator = iterator.clone();
+    let body = body.clone();
+    let mut unrolled = Vec::new();
+    for j in start.to_usize()..end.to_usize() {
+        let mut body_copy = body.clone();
+        replace_vars_for_unroll(&mut body_copy, &iterator, unroll_index, j, &internal_vars);
+        unrolled.extend(body_copy);
+    }
+    lines.splice(i..=i, unrolled);
     Ok(())
 }
 
