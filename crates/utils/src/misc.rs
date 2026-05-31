@@ -18,6 +18,19 @@ pub fn transposed_par_iter_mut<A: Send + Sync, const N: usize>(
         .map(move |i| unsafe { std::array::from_fn(|j| &mut *data_ptrs[j].load(Ordering::Relaxed).add(i)) })
 }
 
+/// Like [`transposed_par_iter_mut`], but over mutable slices instead of `Vec`s.
+/// Used to write a column-major matrix (each column a `chunks_mut` slice) row-by-row in parallel.
+pub fn transposed_par_iter_mut_slices<'a, A: Send + Sync, const N: usize>(
+    array: &'a mut [&mut [A]; N], // all slices must have the same length
+) -> impl IndexedParallelIterator<Item = [&'a mut A; N]> + 'a {
+    let len = array[0].len();
+    let data_ptrs: [AtomicPtr<A>; N] = array.each_mut().map(|v| AtomicPtr::new(v.as_mut_ptr()));
+
+    (0..len)
+        .into_par_iter()
+        .map(move |i| unsafe { std::array::from_fn(|j| &mut *data_ptrs[j].load(Ordering::Relaxed).add(i)) })
+}
+
 pub fn collect_refs<T>(vecs: &[Vec<T>]) -> Vec<&[T]> {
     vecs.iter().map(Vec::as_slice).collect()
 }

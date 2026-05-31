@@ -153,6 +153,49 @@ impl TableTrace {
     }
 }
 
+/// Committed representation of a table: a single column-major matrix.
+/// `data[c * n_rows + r]` is row `r` of column `c`. The committed columns
+/// `0..n_columns()` are stored first, so they form a contiguous prefix
+/// (`committed_segment`) — exactly one block of the stacked polynomial.
+/// Virtual (non-committed) columns are the suffix, kept for logup.
+#[derive(Debug, Default)]
+pub struct TableMatrix {
+    pub data: Vec<F>,
+    pub n_rows: usize,
+    pub non_padded_n_rows: usize,
+    pub log_n_rows: VarCount,
+}
+
+impl TableMatrix {
+    #[inline]
+    pub fn column(&self, c: ColIndex) -> &[F] {
+        &self.data[c * self.n_rows..][..self.n_rows]
+    }
+
+    /// The committed columns `0..n_committed`, as one contiguous slice.
+    #[inline]
+    pub fn committed_segment(&self, n_committed: usize) -> &[F] {
+        &self.data[..n_committed * self.n_rows]
+    }
+
+    /// Transpose a (padded) column builder into a column-major matrix.
+    pub fn from_columns(columns: &[Vec<F>], non_padded_n_rows: usize, log_n_rows: VarCount) -> Self {
+        let n_rows = columns[0].len();
+        debug_assert_eq!(n_rows, 1 << log_n_rows);
+        let mut data = unsafe { uninitialized_vec(columns.len() * n_rows) };
+        data.par_chunks_mut(n_rows).zip(columns).for_each(|(dst, col)| {
+            debug_assert_eq!(col.len(), n_rows);
+            dst.copy_from_slice(col);
+        });
+        Self {
+            data,
+            n_rows,
+            non_padded_n_rows,
+            log_n_rows,
+        }
+    }
+}
+
 pub fn sort_tables_by_height(tables_log_heights: &BTreeMap<Table, usize>) -> Vec<(Table, usize)> {
     let mut tables_heights_sorted = tables_log_heights.clone().into_iter().collect::<Vec<_>>();
     tables_heights_sorted.sort_by_key(|&(_, h)| Reverse(h));

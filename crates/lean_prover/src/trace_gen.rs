@@ -1,14 +1,16 @@
 use backend::*;
 use lean_vm::*;
-use std::{array, collections::BTreeMap};
-use utils::{ToUsize, get_poseidon_16_of_zero, transposed_par_iter_mut};
+use std::collections::BTreeMap;
+use utils::{ToUsize, get_poseidon_16_of_zero, transposed_par_iter_mut, transposed_par_iter_mut_slices};
 
 #[derive(Debug)]
 pub struct ExecutionTrace {
-    pub traces: BTreeMap<Table, TableTrace>,
+    pub traces: BTreeMap<Table, TableMatrix>,
     pub memory: Vec<F>, // of length a multiple of public_memory_size
     pub metadata: ExecutionMetadata,
 }
+
+const N_EXEC_COLUMNS: usize = N_TOTAL_EXECUTION_COLUMNS + N_TEMPORARY_EXEC_COLUMNS;
 
 pub fn get_execution_trace(
     bytecode: &Bytecode,
@@ -19,81 +21,8 @@ pub fn get_execution_trace(
 
     let n_cycles = execution_result.pcs.len();
     let memory = &execution_result.memory;
-    let mut main_trace: [Vec<F>; N_TOTAL_EXECUTION_COLUMNS + N_TEMPORARY_EXEC_COLUMNS] =
-        array::from_fn(|_| F::zero_vec(n_cycles.next_power_of_two()));
-    for col in &mut main_trace {
-        unsafe {
-            col.set_len(n_cycles);
-        }
-    }
 
-    transposed_par_iter_mut(&mut main_trace)
-        .zip(execution_result.pcs.par_iter())
-        .zip(execution_result.fps.par_iter())
-        .for_each(|((trace_row, &pc), &fp)| {
-            let instruction = &bytecode.code[pc].instruction;
-            let field_repr = &bytecode.instructions_multilinear[pc * N_INSTRUCTION_COLUMNS.next_power_of_two()..]
-                [..N_INSTRUCTION_COLUMNS];
-
-            let flag_a = field_repr[instr_idx(EXEC_COL_FLAG_A)];
-            let flag_b = field_repr[instr_idx(EXEC_COL_FLAG_B)];
-            let flag_c = field_repr[instr_idx(EXEC_COL_FLAG_C)];
-            let flag_c_fp = field_repr[instr_idx(EXEC_COL_FLAG_C_FP)];
-            let flag_ab_fp = field_repr[instr_idx(EXEC_COL_FLAG_AB_FP)];
-            let aux_1 = field_repr[instr_idx(EXEC_COL_AUX_1)];
-            let is_deref = aux_1 == F::TWO;
-
-            let mut addr_a = F::ZERO;
-            if flag_a.is_zero() && flag_ab_fp.is_zero() {
-                addr_a = F::from_usize(fp) + field_repr[instr_idx(EXEC_COL_OPERAND_A)];
-            }
-            let value_a = memory.0.get(addr_a.to_usize()).copied().flatten().unwrap_or_default();
-
-            let mut addr_b = F::ZERO;
-            if flag_b.is_zero() && flag_ab_fp.is_zero() {
-                addr_b = F::from_usize(fp) + field_repr[instr_idx(EXEC_COL_OPERAND_B)];
-            } else if is_deref {
-                // DEREF: addr_B = value_A + operand_B
-                addr_b = value_a + field_repr[instr_idx(EXEC_COL_OPERAND_B)];
-            }
-            let value_b = memory.0.get(addr_b.to_usize()).copied().flatten().unwrap_or_default();
-
-            let mut addr_c = F::ZERO;
-            if flag_c.is_zero() && flag_c_fp.is_zero() {
-                addr_c = F::from_usize(fp) + field_repr[instr_idx(EXEC_COL_OPERAND_C)];
-            }
-            let value_c = memory.0.get(addr_c.to_usize()).copied().flatten().unwrap_or_default();
-
-            for (j, field) in field_repr.iter().enumerate() {
-                *trace_row[j + N_RUNTIME_COLUMNS] = *field;
-            }
-
-            let nu_a = flag_a * field_repr[instr_idx(EXEC_COL_OPERAND_A)]
-                + (F::ONE - flag_a - flag_ab_fp) * value_a
-                + flag_ab_fp * (F::from_usize(fp) + field_repr[instr_idx(EXEC_COL_OPERAND_A)]);
-            let nu_b = flag_b * field_repr[instr_idx(EXEC_COL_OPERAND_B)]
-                + (F::ONE - flag_b - flag_ab_fp) * value_b
-                + flag_ab_fp * (F::from_usize(fp) + field_repr[instr_idx(EXEC_COL_OPERAND_B)]);
-            let nu_c = flag_c * field_repr[instr_idx(EXEC_COL_OPERAND_C)]
-                + (F::ONE - flag_c - flag_c_fp) * value_c
-                + flag_c_fp * (F::from_usize(fp) + field_repr[instr_idx(EXEC_COL_OPERAND_C)]);
-            if let Instruction::Precompile(..) = instruction {
-                *trace_row[EXEC_COL_FLAG_PRECOMPILE] = F::ONE;
-            }
-            *trace_row[EXEC_COL_NU_A] = nu_a;
-            *trace_row[EXEC_COL_NU_B] = nu_b;
-            *trace_row[EXEC_COL_NU_C] = nu_c;
-
-            *trace_row[EXEC_COL_VALUE_A] = value_a;
-            *trace_row[EXEC_COL_VALUE_B] = value_b;
-            *trace_row[EXEC_COL_VALUE_C] = value_c;
-            *trace_row[EXEC_COL_PC] = F::from_usize(pc);
-            *trace_row[EXEC_COL_FP] = F::from_usize(fp);
-            *trace_row[EXEC_COL_ADDR_A] = addr_a;
-            *trace_row[EXEC_COL_ADDR_B] = addr_b;
-            *trace_row[EXEC_COL_ADDR_C] = addr_c;
-        });
-
+    // Memory: replace `None` with zeros, then append the padding-row helpers.
     let mut memory_padded = memory.0.par_iter().map(|&v| v.unwrap_or(F::ZERO)).collect::<Vec<F>>();
 
     // Write [0000000000000000 | poseidon_compress(0000000000000000)] (to make lookups work on padding-rows).
@@ -106,7 +35,104 @@ pub fn get_execution_trace(
     let padded_memory_len = (memory_padded.len().max(n_cycles).max(1 << MIN_LOG_N_ROWS_PER_TABLE)).next_power_of_two();
     memory_padded.resize(padded_memory_len, F::ZERO);
 
-    let ExecutionResult { mut traces, .. } = execution_result;
+    // --- Execution table: build directly into a column-major matrix (no per-column Vecs). ---
+    let exec_floor = min_table_log_n_rows
+        .get(&Table::execution())
+        .copied()
+        .unwrap_or_default()
+        .max(MIN_LOG_N_ROWS_PER_TABLE);
+    let exec_log_n_rows = log2_ceil_usize(n_cycles + 1).max(exec_floor);
+    let exec_n_rows = 1 << exec_log_n_rows;
+    let mut exec_data = F::zero_vec(N_EXEC_COLUMNS * exec_n_rows);
+    {
+        // Active rows [0, n_cycles): write each column's prefix in parallel, row-by-row.
+        let mut active: [&mut [F]; N_EXEC_COLUMNS] = exec_data
+            .chunks_mut(exec_n_rows)
+            .map(|col| col.split_at_mut(n_cycles).0)
+            .collect::<Vec<_>>()
+            .try_into()
+            .unwrap();
+
+        transposed_par_iter_mut_slices(&mut active)
+            .zip(execution_result.pcs.par_iter())
+            .zip(execution_result.fps.par_iter())
+            .for_each(|((trace_row, &pc), &fp)| {
+                let instruction = &bytecode.code[pc].instruction;
+                let field_repr = &bytecode.instructions_multilinear[pc * N_INSTRUCTION_COLUMNS.next_power_of_two()..]
+                    [..N_INSTRUCTION_COLUMNS];
+
+                let flag_a = field_repr[instr_idx(EXEC_COL_FLAG_A)];
+                let flag_b = field_repr[instr_idx(EXEC_COL_FLAG_B)];
+                let flag_c = field_repr[instr_idx(EXEC_COL_FLAG_C)];
+                let flag_c_fp = field_repr[instr_idx(EXEC_COL_FLAG_C_FP)];
+                let flag_ab_fp = field_repr[instr_idx(EXEC_COL_FLAG_AB_FP)];
+                let aux_1 = field_repr[instr_idx(EXEC_COL_AUX_1)];
+                let is_deref = aux_1 == F::TWO;
+
+                let mut addr_a = F::ZERO;
+                if flag_a.is_zero() && flag_ab_fp.is_zero() {
+                    addr_a = F::from_usize(fp) + field_repr[instr_idx(EXEC_COL_OPERAND_A)];
+                }
+                let value_a = memory.0.get(addr_a.to_usize()).copied().flatten().unwrap_or_default();
+
+                let mut addr_b = F::ZERO;
+                if flag_b.is_zero() && flag_ab_fp.is_zero() {
+                    addr_b = F::from_usize(fp) + field_repr[instr_idx(EXEC_COL_OPERAND_B)];
+                } else if is_deref {
+                    // DEREF: addr_B = value_A + operand_B
+                    addr_b = value_a + field_repr[instr_idx(EXEC_COL_OPERAND_B)];
+                }
+                let value_b = memory.0.get(addr_b.to_usize()).copied().flatten().unwrap_or_default();
+
+                let mut addr_c = F::ZERO;
+                if flag_c.is_zero() && flag_c_fp.is_zero() {
+                    addr_c = F::from_usize(fp) + field_repr[instr_idx(EXEC_COL_OPERAND_C)];
+                }
+                let value_c = memory.0.get(addr_c.to_usize()).copied().flatten().unwrap_or_default();
+
+                for (j, field) in field_repr.iter().enumerate() {
+                    *trace_row[j + N_RUNTIME_COLUMNS] = *field;
+                }
+
+                let nu_a = flag_a * field_repr[instr_idx(EXEC_COL_OPERAND_A)]
+                    + (F::ONE - flag_a - flag_ab_fp) * value_a
+                    + flag_ab_fp * (F::from_usize(fp) + field_repr[instr_idx(EXEC_COL_OPERAND_A)]);
+                let nu_b = flag_b * field_repr[instr_idx(EXEC_COL_OPERAND_B)]
+                    + (F::ONE - flag_b - flag_ab_fp) * value_b
+                    + flag_ab_fp * (F::from_usize(fp) + field_repr[instr_idx(EXEC_COL_OPERAND_B)]);
+                let nu_c = flag_c * field_repr[instr_idx(EXEC_COL_OPERAND_C)]
+                    + (F::ONE - flag_c - flag_c_fp) * value_c
+                    + flag_c_fp * (F::from_usize(fp) + field_repr[instr_idx(EXEC_COL_OPERAND_C)]);
+                if let Instruction::Precompile(..) = instruction {
+                    *trace_row[EXEC_COL_FLAG_PRECOMPILE] = F::ONE;
+                }
+                *trace_row[EXEC_COL_NU_A] = nu_a;
+                *trace_row[EXEC_COL_NU_B] = nu_b;
+                *trace_row[EXEC_COL_NU_C] = nu_c;
+
+                *trace_row[EXEC_COL_VALUE_A] = value_a;
+                *trace_row[EXEC_COL_VALUE_B] = value_b;
+                *trace_row[EXEC_COL_VALUE_C] = value_c;
+                *trace_row[EXEC_COL_PC] = F::from_usize(pc);
+                *trace_row[EXEC_COL_FP] = F::from_usize(fp);
+                *trace_row[EXEC_COL_ADDR_A] = addr_a;
+                *trace_row[EXEC_COL_ADDR_B] = addr_b;
+                *trace_row[EXEC_COL_ADDR_C] = addr_c;
+            });
+    }
+    // Padding rows [n_cycles, exec_n_rows): the execution padding row (self-loop at ending_pc).
+    let exec_padding_row =
+        Table::execution().padding_row(padding_zero_vec_ptr, null_poseidon_16_hash_ptr, bytecode.ending_pc);
+    exec_data
+        .par_chunks_mut(exec_n_rows)
+        .zip(&exec_padding_row)
+        .for_each(|(col, &pad)| col[n_cycles..].fill(pad));
+
+    let ExecutionResult {
+        mut traces, metadata, ..
+    } = execution_result;
+    // The execution table is built above; its builder entry (unused) is dropped here.
+    traces.remove(&Table::execution());
 
     let poseidon_trace = traces.get_mut(&Table::poseidon16()).unwrap();
     fill_trace_poseidon_16(&mut poseidon_trace.columns);
@@ -146,14 +172,8 @@ pub fn get_execution_trace(
     let extension_op_trace = traces.get_mut(&Table::extension_op()).unwrap();
     fill_trace_extension_op(extension_op_trace, &memory_padded);
 
-    traces.insert(
-        Table::execution(),
-        TableTrace {
-            columns: Vec::from(main_trace),
-            non_padded_n_rows: n_cycles,
-            log_n_rows: log2_ceil_usize(n_cycles),
-        },
-    );
+    // Pad the precompile builders to a power of two, then transpose into column-major matrices.
+    let mut matrices: BTreeMap<Table, TableMatrix> = BTreeMap::new();
     for table in traces.keys().copied().collect::<Vec<_>>() {
         let floor = min_table_log_n_rows
             .get(&table)
@@ -168,12 +188,27 @@ pub fn get_execution_trace(
             bytecode.ending_pc,
             floor,
         );
+        let tt = &traces[&table];
+        matrices.insert(
+            table,
+            TableMatrix::from_columns(&tt.columns, tt.non_padded_n_rows, tt.log_n_rows),
+        );
     }
 
+    matrices.insert(
+        Table::execution(),
+        TableMatrix {
+            data: exec_data,
+            n_rows: exec_n_rows,
+            non_padded_n_rows: n_cycles,
+            log_n_rows: exec_log_n_rows,
+        },
+    );
+
     ExecutionTrace {
-        traces,
+        traces: matrices,
         memory: memory_padded,
-        metadata: execution_result.metadata,
+        metadata,
     }
 }
 

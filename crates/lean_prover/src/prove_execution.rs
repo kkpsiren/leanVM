@@ -86,7 +86,7 @@ pub fn prove_execution(
         for (table, trace) in &traces {
             let buses = table.bus_interactions();
             for group in memory_lookup_groups(&buses) {
-                let idx_col = &trace.columns[group.idx_col];
+                let idx_col = trace.column(group.idx_col);
                 let n = group.value_cols.len();
                 for idx in idx_col {
                     let base = idx.to_usize();
@@ -103,21 +103,19 @@ pub fn prove_execution(
     // // TODO parrallelize
     let mut bytecode_acc = F::zero_vec(bytecode.padded_size());
     info_span!("Building bytecode access count").in_scope(|| -> Result<(), ProverError> {
-        for pc in traces[&Table::execution()].columns[EXEC_COL_PC].iter() {
+        for pc in traces[&Table::execution()].column(EXEC_COL_PC).iter() {
             *bytecode_acc.get_mut(pc.to_usize()).ok_or(RunnerError::PCOutOfBounds)? += F::ONE;
         }
         Ok(())
     })?;
 
-    // 1st Commitment
-    let stacked_pcs_witness = stack_polynomials_and_commit(
-        &mut prover_state,
-        whir_config,
-        &memory,
-        &memory_acc,
-        &bytecode_acc,
-        &traces,
-    );
+    // 1st Commitment.
+    // The stacked polynomial is never materialized: WHIR reads its segments (memory, the two
+    // accumulators, and each table's committed column-major matrix) directly through this view.
+    let stacked = build_stacked_poly(&memory, &memory_acc, &bytecode_acc, &traces);
+    let stacked_n_vars = stacked.n_vars;
+    let whir = WhirConfig::new(whir_config, stacked_n_vars);
+    let inner_witness = whir.commit_stacked(&mut prover_state, &stacked);
 
     // logup (GKR)
     let logup_c = prover_state.sample();
@@ -157,12 +155,7 @@ pub fn prove_execution(
 
     let column_refs: Vec<Vec<&[F]>> = ALL_TABLES
         .iter()
-        .map(|table| {
-            traces[table].columns[..table.n_columns()]
-                .iter()
-                .map(Vec::as_slice)
-                .collect()
-        })
+        .map(|table| (0..table.n_columns()).map(|c| traces[table].column(c)).collect())
         .collect();
     let _span = info_span!("Computing shifted columns for AIR sumcheck").entered();
     let shifted_rows: Vec<Vec<Vec<F>>> = ALL_TABLES
@@ -231,7 +224,7 @@ pub fn prove_execution(
 
     let previous_statements = vec![
         SparseStatement::new(
-            stacked_pcs_witness.stacked_n_vars,
+            stacked_n_vars,
             logup_statements.memory_and_acc_point,
             vec![
                 SparseValue::new(0, logup_statements.value_memory),
@@ -239,12 +232,12 @@ pub fn prove_execution(
             ],
         ),
         SparseStatement::new(
-            stacked_pcs_witness.stacked_n_vars,
+            stacked_n_vars,
             public_memory_random_point,
             vec![SparseValue::new(0, public_memory_eval)],
         ),
         SparseStatement::new(
-            stacked_pcs_witness.stacked_n_vars,
+            stacked_n_vars,
             logup_statements.bytecode_and_acc_point,
             vec![SparseValue::new(
                 (2 * memory.len()) >> bytecode.log_size(),
@@ -254,7 +247,7 @@ pub fn prove_execution(
     ];
 
     let global_statements_base = stacked_pcs_global_statements(
-        stacked_pcs_witness.stacked_n_vars,
+        stacked_n_vars,
         log2_strict_usize(memory.len()),
         bytecode.log_size(),
         bytecode.ending_pc,
@@ -263,12 +256,7 @@ pub fn prove_execution(
         &committed_statements,
     );
 
-    WhirConfig::new(whir_config, stacked_pcs_witness.global_polynomial.by_ref().n_vars()).prove(
-        &mut prover_state,
-        global_statements_base,
-        stacked_pcs_witness.inner_witness,
-        &stacked_pcs_witness.global_polynomial.by_ref(),
-    );
+    whir.prove_stacked(&mut prover_state, global_statements_base, inner_witness, &stacked);
 
     tracing::info!("total pow_grinding time: {} ms", pow_grinding_time().as_millis());
     reset_pow_grinding_time();

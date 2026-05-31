@@ -89,6 +89,52 @@ where
     }
 }
 
+/// Stacked analogue of [`reorder_and_dft`]: reads evaluations from a [`StackedPoly`] (a logical
+/// concatenation of base-field segments) instead of one contiguous slice, so the full stacked
+/// polynomial is never materialized. Always base-valued.
+pub(crate) fn reorder_and_dft_stacked<EF: ExtensionField<PF<EF>>>(
+    stacked: &StackedPoly<'_, EF>,
+    folding_factor: usize,
+    log_inv_rate: usize,
+    dft_n_cols: usize,
+) -> DftOutput<EF>
+where
+    PF<EF>: TwoAdicField,
+{
+    let prepared_evals = prepare_evals_for_fft_stacked(stacked, folding_factor, log_inv_rate, dft_n_cols);
+    let dft = global_dft::<PF<EF>>();
+    let dft_size = (1 << (stacked.n_vars + log_inv_rate)) >> folding_factor;
+    if dft.max_n_twiddles() < dft_size {
+        tracing::warn!("Twiddles have not been precomputed, for size = {}", dft_size);
+    }
+    DftOutput::Base(dft.dft_algebra_batch_by_evals(Matrix::new(prepared_evals, dft_n_cols)))
+}
+
+fn prepare_evals_for_fft_stacked<EF: ExtensionField<PF<EF>>>(
+    stacked: &StackedPoly<'_, EF>,
+    folding_factor: usize,
+    log_inv_rate: usize,
+    dft_n_cols: usize,
+) -> Vec<PF<EF>> {
+    let n = 1usize << stacked.n_vars;
+    assert!(n.is_multiple_of(1 << folding_factor));
+    let n_blocks = 1 << folding_factor;
+    let full_len = n << log_inv_rate;
+    let block_size = full_len / n_blocks;
+    let log_block_size = log2_strict_usize(block_size);
+    let out_len = block_size * dft_n_cols;
+
+    (0..out_len)
+        .into_par_iter()
+        .map(|i| {
+            let block_index = i % dft_n_cols;
+            let offset_in_block = i / dft_n_cols;
+            let src_index = ((block_index << log_block_size) + offset_in_block) >> log_inv_rate;
+            stacked.value_at(src_index)
+        })
+        .collect()
+}
+
 fn prepare_evals_for_fft<EF: ExtensionField<PF<EF>>>(
     evals: &MleRef<'_, EF>,
     folding_factor: usize,

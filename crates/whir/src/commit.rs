@@ -97,4 +97,43 @@ where
             ood_answers,
         }
     }
+
+    /// Commit to a stacked polynomial given as a logical concatenation of base-field segments
+    /// (see [`StackedPoly`]), without ever materializing the full `1 << num_variables` vector.
+    #[instrument(skip_all)]
+    pub fn commit_stacked(
+        &self,
+        prover_state: &mut impl FSProver<EF>,
+        polynomial: &StackedPoly<'_, EF>,
+    ) -> Witness<EF> {
+        debug_assert_eq!(polynomial.n_vars, self.num_variables);
+        let n_blocks = 1usize << self.folding_factor.at_round(0);
+        let evals_len = 1usize << self.num_variables;
+        let effective_n_cols = polynomial.active_len.div_ceil(evals_len / n_blocks);
+        let dft_n_cols = effective_n_cols.next_multiple_of(packing_width::<EF>()).min(n_blocks);
+
+        let folded_matrix = info_span!("FFT").in_scope(|| {
+            reorder_and_dft_stacked(
+                polynomial,
+                self.folding_factor.at_round(0),
+                self.starting_log_inv_rate,
+                dft_n_cols,
+            )
+        });
+
+        let (prover_data, root) = MerkleData::build(folded_matrix, n_blocks, effective_n_cols);
+
+        prover_state.add_base_scalars(&root);
+
+        let (ood_points, ood_answers) =
+            sample_ood_points::<EF, _>(prover_state, self.commitment_ood_samples, self.num_variables, |point| {
+                polynomial.evaluate(point)
+            });
+
+        Witness {
+            prover_data,
+            ood_points,
+            ood_answers,
+        }
+    }
 }

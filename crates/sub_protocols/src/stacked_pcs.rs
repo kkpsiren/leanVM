@@ -3,9 +3,8 @@ use lean_vm::{
     ALL_TABLES, ColIndex, CommittedStatements, EXEC_COL_PC, MIN_LOG_MEMORY_SIZE, MIN_LOG_N_ROWS_PER_TABLE,
     N_INSTRUCTION_COLUMNS, STARTING_PC, sort_tables_by_height,
 };
-use lean_vm::{EF, F, Table, TableT, TableTrace};
+use lean_vm::{EF, F, Table, TableMatrix, TableT};
 use std::collections::BTreeMap;
-use tracing::instrument;
 use utils::VarCount;
 use utils::ansi::Colorize;
 
@@ -30,11 +29,93 @@ Stacking of various (multilinear) polynomials into a single -big- (multilinear) 
 (The order between Dot-Product and Poseidon-16 varies based on which table has more rows, but they are always after the execution table)
 */
 
+/// Offsets and size of the stacked polynomial layout. Single source of truth, shared by the
+/// committed-statement construction, the segmented-view builder, and `compute_stacked_n_vars`.
 #[derive(Debug)]
-pub struct StackedPcsWitness {
+pub struct StackedLayout {
     pub stacked_n_vars: VarCount,
-    pub inner_witness: Witness<EF>,
-    pub global_polynomial: MleOwned<EF>,
+    /// End of the last segment (the rest, up to `1 << stacked_n_vars`, is zero padding).
+    pub active_len: usize,
+    /// Element offset of each table's first committed column.
+    pub table_offsets: BTreeMap<Table, usize>,
+}
+
+pub fn stacked_layout(
+    log_memory: usize,
+    log_bytecode: usize,
+    tables_log_heights: &BTreeMap<Table, VarCount>,
+) -> StackedLayout {
+    let tables_heights_sorted = sort_tables_by_height(tables_log_heights);
+    let max_table_n_vars = tables_heights_sorted[0].1;
+    let mut offset = (2 << log_memory) + (1 << log_bytecode.max(max_table_n_vars));
+    let mut table_offsets = BTreeMap::new();
+    for (table, n_vars) in &tables_heights_sorted {
+        table_offsets.insert(*table, offset);
+        offset += table.n_columns() << n_vars;
+    }
+    StackedLayout {
+        stacked_n_vars: log2_ceil_usize(offset),
+        active_len: offset,
+        table_offsets,
+    }
+}
+
+/// Build the segmented view of the stacked polynomial over the prover's witness pieces,
+/// without materializing it. The segment order/offsets match the committed layout exactly.
+pub fn build_stacked_poly<'a>(
+    memory: &'a [F],
+    memory_acc: &'a [F],
+    bytecode_acc: &'a [F],
+    traces: &'a BTreeMap<Table, TableMatrix>,
+) -> StackedPoly<'a, EF> {
+    assert_eq!(memory.len(), memory_acc.len());
+    let log_memory = log2_strict_usize(memory.len());
+    let log_bytecode = log2_strict_usize(bytecode_acc.len());
+    let tables_log_heights: BTreeMap<Table, VarCount> =
+        traces.iter().map(|(table, m)| (*table, m.log_n_rows)).collect();
+    // Memory must be at least as large as the largest table.
+    assert!(log_memory >= *tables_log_heights.values().max().unwrap());
+
+    let layout = stacked_layout(log_memory, log_bytecode, &tables_log_heights);
+
+    let mut segments = vec![
+        StackedSegment {
+            offset: 0,
+            data: memory,
+            log_block: log_memory,
+        },
+        StackedSegment {
+            offset: 1 << log_memory,
+            data: memory_acc,
+            log_block: log_memory,
+        },
+        StackedSegment {
+            offset: 2 << log_memory,
+            data: bytecode_acc,
+            log_block: log_bytecode,
+        },
+    ];
+    for (table, &offset) in &layout.table_offsets {
+        let m = &traces[table];
+        segments.push(StackedSegment {
+            offset,
+            data: m.committed_segment(table.n_columns()),
+            log_block: m.log_n_rows,
+        });
+    }
+
+    tracing::info!(
+        "{}",
+        format!(
+            "stacked PCS data: {} = 2^{} * (1 + {:.2})",
+            layout.active_len,
+            layout.stacked_n_vars - 1,
+            (layout.active_len as f64) / (1 << (layout.stacked_n_vars - 1)) as f64 - 1.0
+        )
+        .green()
+    );
+
+    StackedPoly::new(layout.stacked_n_vars, segments)
 }
 
 pub fn stacked_pcs_global_statements(
@@ -48,15 +129,7 @@ pub fn stacked_pcs_global_statements(
 ) -> Vec<SparseStatement<EF>> {
     assert_eq!(tables_heights.len(), committed_statements.len());
 
-    let tables_heights_sorted = sort_tables_by_height(tables_heights);
-    let max_table_n_vars = tables_heights_sorted[0].1;
-
-    let mut table_offsets: BTreeMap<Table, usize> = BTreeMap::new();
-    let mut layout_offset = (2 << memory_n_vars) + (1 << bytecode_n_vars.max(max_table_n_vars));
-    for (table, n_vars) in &tables_heights_sorted {
-        table_offsets.insert(*table, layout_offset);
-        layout_offset += table.n_columns() << n_vars;
-    }
+    let table_offsets = stacked_layout(memory_n_vars, bytecode_n_vars, tables_heights).table_offsets;
 
     let mut global_statements = previous_statements;
     for table in ALL_TABLES {
@@ -99,67 +172,6 @@ pub fn stacked_pcs_global_statements(
     global_statements
 }
 
-#[instrument(skip_all)]
-pub fn stack_polynomials_and_commit(
-    prover_state: &mut impl FSProver<EF>,
-    whir_config_builder: &WhirConfigBuilder,
-    memory: &[F],
-    memory_acc: &[F],
-    bytecode_acc: &[F],
-    traces: &BTreeMap<Table, TableTrace>,
-) -> StackedPcsWitness {
-    assert_eq!(memory.len(), memory_acc.len());
-    let tables_heights = traces.iter().map(|(table, trace)| (*table, trace.log_n_rows)).collect();
-    let tables_heights_sorted = sort_tables_by_height(&tables_heights);
-    // Memory must be at least as large as the largest table.
-    assert!(log2_strict_usize(memory.len()) >= tables_heights_sorted[0].1);
-
-    let stacked_n_vars = compute_stacked_n_vars(
-        log2_strict_usize(memory.len()),
-        log2_strict_usize(bytecode_acc.len()),
-        &tables_heights_sorted.iter().cloned().collect(),
-    );
-    let mut global_polynomial = F::zero_vec(1 << stacked_n_vars); // TODO avoid cloning all witness data
-    global_polynomial[..memory.len()].copy_from_slice(memory);
-    let mut offset = memory.len();
-    global_polynomial[offset..][..memory_acc.len()].copy_from_slice(memory_acc);
-    offset += memory_acc.len();
-
-    global_polynomial[offset..][..bytecode_acc.len()].copy_from_slice(bytecode_acc);
-    let largest_table_height = 1 << tables_heights_sorted[0].1;
-    offset += largest_table_height.max(bytecode_acc.len()); // we may pad bytecode_acc to match largest table height
-
-    for (table, log_n_rows) in &tables_heights_sorted {
-        let n_rows = 1 << *log_n_rows;
-        for col_index in 0..table.n_columns() {
-            let col = &traces[table].columns[col_index];
-            global_polynomial[offset..][..n_rows].copy_from_slice(&col[..n_rows]);
-            offset += n_rows;
-        }
-    }
-    assert_eq!(log2_ceil_usize(offset), stacked_n_vars);
-    tracing::info!(
-        "{}",
-        format!(
-            "stacked PCS data: {} = 2^{} * (1 + {:.2})",
-            offset,
-            stacked_n_vars - 1,
-            (offset as f64) / (1 << (stacked_n_vars - 1)) as f64 - 1.0
-        )
-        .green()
-    );
-
-    let global_polynomial = MleOwned::Base(global_polynomial);
-
-    let inner_witness =
-        WhirConfig::new(whir_config_builder, stacked_n_vars).commit(prover_state, &global_polynomial, offset);
-    StackedPcsWitness {
-        stacked_n_vars,
-        inner_witness,
-        global_polynomial,
-    }
-}
-
 pub fn stacked_pcs_parse_commitment(
     whir_config_builder: &WhirConfigBuilder,
     verifier_state: &mut impl FSVerifier<EF>,
@@ -186,14 +198,7 @@ fn compute_stacked_n_vars(
     log_bytecode: usize,
     tables_log_heights: &BTreeMap<Table, VarCount>,
 ) -> VarCount {
-    let max_table_log_n_rows = tables_log_heights.values().copied().max().unwrap();
-    let total_len = (2 << log_memory)
-        + (1 << log_bytecode.max(max_table_log_n_rows))
-        + tables_log_heights
-            .iter()
-            .map(|(table, log_n_rows)| table.n_columns() << log_n_rows)
-            .sum::<usize>();
-    log2_ceil_usize(total_len)
+    stacked_layout(log_memory, log_bytecode, tables_log_heights).stacked_n_vars
 }
 
 pub fn min_stacked_n_vars(log_bytecode: usize) -> usize {

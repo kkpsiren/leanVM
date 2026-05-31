@@ -6,7 +6,7 @@ use field::PrimeCharacteristicRing;
 use field::{ExtensionField, Field, TwoAdicField};
 use poly::*;
 use rayon::prelude::*;
-use sumcheck::{ProductComputation, run_product_sumcheck, sumcheck_prove_many_rounds};
+use sumcheck::{ProductComputation, run_product_sumcheck, run_product_sumcheck_stacked, sumcheck_prove_many_rounds};
 use tracing::{info_span, instrument};
 
 use crate::{config::WhirConfig, *};
@@ -47,6 +47,31 @@ where
 
         let mut round_state =
             RoundState::initialize_first_round_state(self, prover_state, statement, witness, polynomial).unwrap();
+
+        for round in 0..=self.n_rounds() {
+            self.round(round, prover_state, &mut round_state).unwrap();
+        }
+
+        MultilinearPoint(round_state.randomness_vec)
+    }
+
+    /// Like [`prove`](Self::prove), but the committed polynomial is given as a [`StackedPoly`]
+    /// (segments). Only the first sumcheck fold reads the segments; everything after is contiguous.
+    #[instrument(name = "WHIR prove (stacked)", skip_all)]
+    pub fn prove_stacked(
+        &self,
+        prover_state: &mut impl FSProver<EF>,
+        statement: Vec<SparseStatement<EF>>,
+        witness: Witness<EF>,
+        polynomial: &StackedPoly<'_, EF>,
+    ) -> MultilinearPoint<EF> {
+        assert!(self.validate_parameters());
+        assert_eq!(polynomial.n_vars, self.num_variables);
+        self.validate_statement(&statement);
+
+        let mut round_state =
+            RoundState::initialize_first_round_state_stacked(self, prover_state, statement, witness, polynomial)
+                .unwrap();
 
         for round in 0..=self.n_rounds() {
             self.round(round, prover_state, &mut round_state).unwrap();
@@ -443,6 +468,30 @@ where
 
         (sumcheck, challengess)
     }
+
+    pub(crate) fn run_initial_sumcheck_rounds_stacked(
+        evals: &StackedPoly<'_, EF>,
+        statement: &[SparseStatement<EF>],
+        combination_randomness: EF,
+        prover_state: &mut impl FSProver<EF>,
+        folding_factor: usize,
+        pow_bits: usize,
+    ) -> (Self, MultilinearPoint<EF>) {
+        assert_ne!(folding_factor, 0);
+
+        let (weights, sum) = combine_statement::<EF>(statement, combination_randomness);
+
+        let (challengess, new_sum, new_evals, new_weights) =
+            run_product_sumcheck_stacked(evals, &weights, prover_state, sum, folding_factor, pow_bits);
+
+        let sumcheck = Self {
+            evals: new_evals,
+            weights: new_weights,
+            sum: new_sum,
+        };
+
+        (sumcheck, challengess)
+    }
 }
 
 #[derive(Debug)]
@@ -489,6 +538,51 @@ where
         let combination_randomness_gen: EF = prover_state.sample();
 
         let (sumcheck_prover, folding_randomness) = SumcheckSingle::run_initial_sumcheck_rounds(
+            polynomial,
+            &statement,
+            combination_randomness_gen,
+            prover_state,
+            prover.folding_factor.at_round(0),
+            prover.starting_folding_pow_bits,
+        );
+
+        Ok(Self {
+            domain_size: prover.starting_domain_size(),
+            next_domain_gen: PF::<EF>::two_adic_generator(
+                log2_strict_usize(prover.starting_domain_size()) - prover.folding_factor.at_round(0),
+            ),
+            sumcheck_prover,
+            merkle_prover_data: witness.prover_data,
+            commitment_merkle_prover_data_b: None,
+            randomness_vec: folding_randomness.0.clone(),
+        })
+    }
+
+    pub(crate) fn initialize_first_round_state_stacked(
+        prover: &WhirConfig<EF>,
+        prover_state: &mut impl FSProver<EF>,
+        mut statement: Vec<SparseStatement<EF>>,
+        witness: Witness<EF>,
+        polynomial: &StackedPoly<'_, EF>,
+    ) -> ProofResult<Self> {
+        let ood_statements = witness
+            .ood_points
+            .into_iter()
+            .zip(witness.ood_answers)
+            .map(|(point, evaluation)| {
+                SparseStatement::dense(
+                    MultilinearPoint::expand_from_univariate(point, prover.num_variables),
+                    evaluation,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        statement.splice(0..0, ood_statements);
+
+        prover_state.duplex();
+        let combination_randomness_gen: EF = prover_state.sample();
+
+        let (sumcheck_prover, folding_randomness) = SumcheckSingle::run_initial_sumcheck_rounds_stacked(
             polynomial,
             &statement,
             combination_randomness_gen,
