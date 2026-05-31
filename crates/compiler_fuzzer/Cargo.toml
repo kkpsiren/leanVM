@@ -1,0 +1,20 @@
+[package]
+name = "compiler_fuzzer"
+version.workspace = true
+edition.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+lean_compiler.workspace = true
+lean_vm.workspace = true
+backend.workspace = true
+rand.workspace = true
+serde = { workspace = true }
+serde_json.workspace = true
+libc = "0.2"
+
+[[bin]]
+name = "compiler_fuzz"
+path = "src/bin/compiler_fuzz.rs"
