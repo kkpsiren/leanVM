@@ -157,5 +157,5 @@ Add a `GadgetKind` variant and implement its `emit` / `honest_buffer` / `violati
 recursion/size stressors go in `probes::dynamic_stressors`. A gadget that reproduces a *known*
 (unfixed) bug stays out of `gen_gadget` and gets a dedicated detection test instead.
 
-See `FINDINGS.md` for bugs this harness has surfaced — including the two open ones it currently
-finds.
+See `FINDINGS.md` for the bugs this harness has surfaced (all fixed in `main`) and the by-design
+behaviours it considered and rejected. There are currently no open findings.

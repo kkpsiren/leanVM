@@ -855,8 +855,40 @@ def main():
     );
 }
 
-// NOTE: a `match_range` dispatch nested inside an `if` inside a `range` loop currently miscompiles
-// to bytecode that reads undefined memory on the honest path (a compiler limitation — it never
-// accepts a bad witness, so it is not a soundness issue). `match_range` directly in a loop (case
-// 25) and directly in an `if` both work; only the triple nesting breaks. Tracked separately; not
-// part of the faithfulness suite because no honest witness runs.
+// --- 30. `match_range` inside an `if` inside a `range` loop, result declared in the loop scope
+//         and read after the branch. Regression for the outer-scope-target shadowing miscompile
+//         (fixed in main bdbce03; see crates/lean_compiler/tests/test_data/program_183.py): the
+//         `match_range` expansion used to forward-declare its target at a second, shadowing cell,
+//         so the arms wrote one cell while the read after the branch hit the (uninitialized) outer
+//         one. Honest path exercises both the match_range arm (i=0) and the else arm (i=1). ---
+#[test]
+fn mega_match_range_in_if_in_loop() {
+    let src = r#"from snark_lib import *
+def sq(n: Const):
+    return n * n
+def main():
+    w = Array(6)
+    hint_witness("w", w)
+    acc: Mut = 0
+    for i in range(0, 2):
+        contrib: Imm
+        if w[i] != 0:
+            contrib = match_range(w[2 + i], range(0, 4), lambda k: sq(k))
+        else:
+            contrib = 100
+        acc = acc + contrib
+        assert acc == w[4 + i]
+    return
+"#;
+    // i0: w[0]=1≠0 ⇒ contrib=sq(w[2]=2)=4 ⇒ acc=4=w[4].
+    // i1: w[1]=0    ⇒ contrib=100        ⇒ acc=104=w[5].
+    assert_faithful(
+        "mega_match_range_in_if_in_loop",
+        src,
+        &[1, 0, 2, 0, 4, 104],
+        &[
+            ("break chk0", vec![1, 0, 2, 0, 5, 104]),
+            ("break chk1", vec![1, 0, 2, 0, 4, 105]),
+        ],
+    );
+}

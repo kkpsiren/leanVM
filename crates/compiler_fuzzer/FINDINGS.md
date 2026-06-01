@@ -61,12 +61,12 @@ dropped check, so the fuzzer's gadgets never do that.
 
 ---
 
-# History — crashes fixed in `main`
+# History — bugs fixed in `main`
 
-The crashes below were surfaced by earlier `--probes` runs and are **FIXED** (merged into `main`
-as `zkDSL compiler: various consolidations`; regression cases live in
-`crates/lean_compiler/tests/test_data/error_93..98.py`). They remain in the probe corpus as
-regression guards.
+The bugs below were surfaced by `compiler_fuzzer` and are **FIXED** in `main`. #1–3 (crashes, from
+`--probes`) were merged as `zkDSL compiler: various consolidations` (regression cases in
+`crates/lean_compiler/tests/test_data/error_93..98.py`, kept in the probe corpus). #4 (a silent
+miscompile, from the handwritten faithfulness suite) was merged as `bdbce03`.
 
 ## 1. `unroll` with a huge bound hangs the compiler
 
@@ -107,3 +107,33 @@ def main():
 
 **Symptom:** `Variable A not in scope` (an `unwrap`/`expect`) at `b_compile_intermediate.rs:62`.
 **Fixed:** const-array reads now route through bounds-checked `simplify_expr`; const-array *writes* are rejected by a target guard.
+
+## 4. `match_range` nested in an `if` in a `range` loop read uninitialized memory
+
+```python
+from snark_lib import *
+def sq(n: Const):
+    return n * n
+def main():
+    w = Array(6)
+    hint_witness("w", w)
+    acc: Mut = 0
+    for i in range(0, 2):
+        contrib: Imm
+        if w[i] != 0:
+            contrib = match_range(w[2 + i], range(0, 4), lambda k: sq(k))
+        else:
+            contrib = 100
+        acc = acc + contrib
+        assert acc == w[4 + i]
+    return
+```
+
+**Symptom:** the honest witness aborts with `undefined memory`. `x = match_range(...)` expands to a
+forward-declaration of `x` plus a match; when `x` was already declared in an enclosing scope, the
+inner declaration allocated a *second, shadowing* cell — the arms wrote it, but the read after the
+branch (`acc + contrib`) resolved to the original outer cell, which was never written. Not a
+soundness hole (no bad witness is accepted), but honest programs fail to run.
+**Fixed (main `bdbce03`):** a forward-declaration of an already-in-scope variable reuses its cell
+instead of allocating a shadowing one. Regression: handwritten case 30 (`mega_match_range_in_if_in_loop`)
++ `crates/lean_compiler/tests/test_data/program_183.py`.
