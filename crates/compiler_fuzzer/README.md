@@ -71,6 +71,23 @@ which is where dropped-check bugs are most likely:
 - `HintDiv` — `hint_div_floor` + correctness asserts; the target compares the quotient to an
   independent input (custom-hint-then-constrain).
 
+Plus gadgets aimed squarely at the simplifier passes that *could* silently drop a check
+(`post_optimization.rs`):
+
+- `CopyPropEq` — `v = x + 0; assert v == exp` (copy-propagation rewrites `v = mem + 0` away; the
+  assert must survive).
+- `CseEq` — two identical `in0 * in1` subexpressions, each asserted against its own bound.
+  Common-subexpression elimination collapses the second into the first; **both** asserts must
+  remain (two independent violations).
+- `TwoReadsEq` — `assert buf[0] == buf[1]`, both one-time memory reads — the exact shape
+  `fuse_raw_asserts` rewrites.
+- `RunningChain{len}` — a dependency chain `b_k = b_{k-1} + d_k` with an independent checkpoint
+  `assert b_k == c_k` at every step (`len` independent violations); stresses repeated
+  assert-fusion / copy-propagation along a chain.
+
+A gadget can enforce several independent checks (`Gadget::n_violations()`); the oracle breaks
+each one in isolation, so every link of a chain and every member of a CSE pair is tested.
+
 ## Running
 
 ```bash

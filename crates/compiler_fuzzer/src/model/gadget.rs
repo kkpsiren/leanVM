@@ -57,6 +57,20 @@ pub enum GadgetKind {
     /// `hint_div_floor` + correctness asserts; the target compares the quotient to an
     /// independent input (custom-hint-then-constrain coverage).
     HintDiv { d: u64 },
+    /// `v = in0 + 0; assert v == exp` — targets copy-propagation (`v = mem + 0` is rewritten
+    /// away). The assert must survive the rewrite.
+    CopyPropEq,
+    /// Two identical subexpressions (`in0 * in1`) each asserted against its own bound. Targets
+    /// common-subexpression elimination: CSE collapses the second into the first, and *both*
+    /// asserts must remain enforced. Two independent violations.
+    CseEq,
+    /// `v = buf[0]; w = buf[1]; assert v == w` — both sides are one-time memory reads, the exact
+    /// shape `fuse_raw_asserts` rewrites. The equality must survive.
+    TwoReadsEq,
+    /// A running sum `b_k = b_{k-1} + d_k` with an independent checkpoint `assert b_k == c_k` at
+    /// every step. Stresses repeated assert-fusion / copy-propagation along a dependency chain;
+    /// each of the `len` checkpoints is an independent violation.
+    RunningChain { len: usize },
 }
 
 /// A gadget instance: a kind plus the computation feeding its check.
@@ -91,6 +105,20 @@ impl Gadget {
             GadgetKind::Bool => 1,
             GadgetKind::RangeLt { .. } | GadgetKind::RangeLe { .. } => 1,
             GadgetKind::MatchDispatch { .. } | GadgetKind::HintDiv { .. } => 2,
+            GadgetKind::CopyPropEq | GadgetKind::TwoReadsEq => 2,
+            GadgetKind::CseEq => 4,
+            GadgetKind::RunningChain { len } => 2 * len,
+        }
+    }
+
+    /// How many independently-breakable checks this gadget enforces. A violation index `k` in
+    /// `0..n_violations()` selects which one [`Gadget::violating_buffer`] breaks.
+    #[must_use]
+    pub fn n_violations(&self) -> usize {
+        match self.kind {
+            GadgetKind::CseEq => 2,
+            GadgetKind::RunningChain { len } => len,
+            _ => 1,
         }
     }
 
@@ -129,6 +157,10 @@ impl Gadget {
             GadgetKind::MatchDispatch { m } => format!("MatchDispatch (match_range 0..{m})"),
             GadgetKind::InlineWrapped => "InlineWrapped (value via @inline)".to_string(),
             GadgetKind::HintDiv { d } => format!("HintDiv (q of a/{d} == buf[])"),
+            GadgetKind::CopyPropEq => "CopyPropEq (v = x + 0; v == buf[])".to_string(),
+            GadgetKind::CseEq => "CseEq (shared in0*in1, two asserts)".to_string(),
+            GadgetKind::TwoReadsEq => "TwoReadsEq (buf[0] == buf[1])".to_string(),
+            GadgetKind::RunningChain { len } => format!("RunningChain (len {len}, per-step checkpoints)"),
         };
         format!("g{}: {k}", self.id)
     }
@@ -228,6 +260,38 @@ impl Gadget {
                 e.line(&format!("{p}exp = {p}buf[1]"));
                 e.line(&format!("assert {p}q == {p}exp"));
             }
+            GadgetKind::CopyPropEq => {
+                e.line(&format!("{p}in0 = {p}buf[0]"));
+                e.line(&format!("{p}v = {p}in0 + 0")); // the `mem + 0` copy-propagation pattern
+                e.line(&format!("{p}exp = {p}buf[1]"));
+                e.line(&format!("assert {p}v == {p}exp"));
+            }
+            GadgetKind::CseEq => {
+                e.line(&format!("{p}in0 = {p}buf[0]"));
+                e.line(&format!("{p}in1 = {p}buf[1]"));
+                e.line(&format!("{p}t1 = {p}in0 * {p}in1"));
+                e.line(&format!("{p}exp1 = {p}buf[2]"));
+                e.line(&format!("assert {p}t1 == {p}exp1"));
+                e.line(&format!("{p}t2 = {p}in0 * {p}in1")); // identical subexpr → CSE-eligible
+                e.line(&format!("{p}exp2 = {p}buf[3]"));
+                e.line(&format!("assert {p}t2 == {p}exp2"));
+            }
+            GadgetKind::TwoReadsEq => {
+                e.line(&format!("{p}v = {p}buf[0]"));
+                e.line(&format!("{p}w = {p}buf[1]"));
+                e.line(&format!("assert {p}v == {p}w"));
+            }
+            GadgetKind::RunningChain { len } => {
+                e.line(&format!("{p}b0 = {p}buf[0]"));
+                e.line(&format!("{p}c0 = {p}buf[{len}]"));
+                e.line(&format!("assert {p}b0 == {p}c0"));
+                for k in 1..*len {
+                    e.line(&format!("{p}d{k} = {p}buf[{k}]"));
+                    e.line(&format!("{p}b{k} = {p}b{} + {p}d{k}", k - 1));
+                    e.line(&format!("{p}c{k} = {p}buf[{}]", len + k));
+                    e.line(&format!("assert {p}b{k} == {p}c{k}"));
+                }
+            }
         }
     }
 
@@ -284,12 +348,41 @@ impl Gadget {
                 let a = rng.below(*d as usize * 1000) as u64;
                 vec![a, a / d]
             }
+            GadgetKind::CopyPropEq => {
+                let x = rand_canonical(rng);
+                vec![x, x] // v = x + 0 == exp(=x)
+            }
+            GadgetKind::CseEq => {
+                let (a, b) = (rand_canonical(rng), rand_canonical(rng));
+                let prod = mul_mod(a, b);
+                vec![a, b, prod, prod] // both asserts: in0*in1 == prod
+            }
+            GadgetKind::TwoReadsEq => {
+                let v = rand_canonical(rng);
+                vec![v, v]
+            }
+            GadgetKind::RunningChain { len } => {
+                // inputs: b0, d1..d_{len-1}; checkpoints: b0, b1, ..., b_{len-1}
+                let inputs: Vec<u64> = (0..*len).map(|_| rand_canonical(rng)).collect();
+                let mut checkpoints = Vec::with_capacity(*len);
+                let mut acc = inputs[0];
+                checkpoints.push(acc);
+                for &d in &inputs[1..] {
+                    acc = add_mod(acc, d);
+                    checkpoints.push(acc);
+                }
+                let mut buf = inputs;
+                buf.extend(checkpoints);
+                buf
+            }
         }
     }
 
-    /// A buffer that makes *only this* check fail, derived from an honest buffer.
+    /// A buffer that makes *only* the `k`-th check of this gadget fail, derived from an honest
+    /// buffer. `k` must be in `0..self.n_violations()` (single-check gadgets ignore it).
     #[must_use]
-    pub fn violating_buffer(&self, honest: &[u64]) -> Vec<u64> {
+    pub fn violating_buffer(&self, honest: &[u64], k: usize) -> Vec<u64> {
+        debug_assert!(k < self.n_violations());
         let mut buf = honest.to_vec();
         let n = self.comp.n_inputs;
         match &self.kind {
@@ -301,8 +394,17 @@ impl Gadget {
             | GadgetKind::Loop => {
                 buf[n] = add_mod(buf[n], 1);
             }
-            GadgetKind::MatchDispatch { .. } | GadgetKind::HintDiv { .. } => {
+            GadgetKind::MatchDispatch { .. } | GadgetKind::HintDiv { .. } | GadgetKind::TwoReadsEq => {
                 buf[1] = add_mod(buf[1], 1);
+            }
+            GadgetKind::CopyPropEq => {
+                buf[1] = add_mod(buf[1], 1); // exp no longer equals v
+            }
+            GadgetKind::CseEq => {
+                buf[2 + k] = add_mod(buf[2 + k], 1); // k=0 → exp1, k=1 → exp2
+            }
+            GadgetKind::RunningChain { len } => {
+                buf[len + k] = add_mod(buf[len + k], 1); // break only checkpoint k
             }
             GadgetKind::Ne => {
                 buf[n] = self.comp.eval(&honest[..n]); // other := value ⇒ `!=` fails

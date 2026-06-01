@@ -63,11 +63,11 @@ impl CheckedProgram {
     }
 
     /// Buffers identical to `honest` except gadget `i`'s, which is replaced by a buffer that
-    /// makes only gadget `i`'s check fail.
+    /// makes only gadget `i`'s `k`-th check fail.
     #[must_use]
-    pub fn violating_buffers(&self, honest: &[Vec<u64>], i: usize) -> Vec<Vec<u64>> {
+    pub fn violating_buffers(&self, honest: &[Vec<u64>], i: usize, k: usize) -> Vec<Vec<u64>> {
         let mut bufs = honest.to_vec();
-        bufs[i] = self.gadgets[i].violating_buffer(&honest[i]);
+        bufs[i] = self.gadgets[i].violating_buffer(&honest[i], k);
         bufs
     }
 

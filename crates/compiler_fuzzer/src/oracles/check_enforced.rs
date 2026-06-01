@@ -58,44 +58,51 @@ pub fn evaluate(prog: &CheckedProgram, bc: &Bytecode, source: &str, rng: &mut Rn
     }
 
     for (i, g) in prog.gadgets.iter().enumerate() {
-        let bufs = prog.violating_buffers(&honest, i);
         let check = g.check_kind();
-        match run(bc, &input, &CheckedProgram::witness(&bufs)) {
-            RunOutcome::Ok(_) => findings.push(
-                Finding::new(
-                    FindingKind::DroppedCheck,
-                    seed,
-                    format!("violating witness for {} was ACCEPTED — check dropped", g.label()),
-                    source,
-                )
-                .with_gadget(i, check.as_str())
-                .with_buffers(bufs),
-            ),
-            RunOutcome::Error(e) => {
-                let cls = FailureClass::of(&e);
-                if !cls.consistent_with(check) {
-                    findings.push(
-                        Finding::new(
-                            FindingKind::InconsistentVariant,
-                            seed,
-                            format!("{} rejected with unexpected variant {e:?} (class {cls:?})", g.label()),
-                            source,
-                        )
-                        .with_gadget(i, check.as_str())
-                        .with_buffers(bufs),
-                    );
+        // A gadget may enforce several independent checks (CSE pairs, chain checkpoints, …);
+        // break each one in isolation and require the VM to reject it.
+        for k in 0..g.n_violations() {
+            let bufs = prog.violating_buffers(&honest, i, k);
+            match run(bc, &input, &CheckedProgram::witness(&bufs)) {
+                RunOutcome::Ok(_) => findings.push(
+                    Finding::new(
+                        FindingKind::DroppedCheck,
+                        seed,
+                        format!("violating witness #{k} for {} was ACCEPTED — check dropped", g.label()),
+                        source,
+                    )
+                    .with_gadget(i, check.as_str())
+                    .with_buffers(bufs),
+                ),
+                RunOutcome::Error(e) => {
+                    let cls = FailureClass::of(&e);
+                    if !cls.consistent_with(check) {
+                        findings.push(
+                            Finding::new(
+                                FindingKind::InconsistentVariant,
+                                seed,
+                                format!(
+                                    "{} #{k} rejected with unexpected variant {e:?} (class {cls:?})",
+                                    g.label()
+                                ),
+                                source,
+                            )
+                            .with_gadget(i, check.as_str())
+                            .with_buffers(bufs),
+                        );
+                    }
                 }
+                RunOutcome::Panicked(p) => findings.push(
+                    Finding::new(
+                        FindingKind::ViolationPanicked,
+                        seed,
+                        format!("VM panicked on violating {} #{k}: {}", g.label(), p.message),
+                        source,
+                    )
+                    .with_gadget(i, check.as_str())
+                    .with_buffers(bufs),
+                ),
             }
-            RunOutcome::Panicked(p) => findings.push(
-                Finding::new(
-                    FindingKind::ViolationPanicked,
-                    seed,
-                    format!("VM panicked on violating {}: {}", g.label(), p.message),
-                    source,
-                )
-                .with_gadget(i, check.as_str())
-                .with_buffers(bufs),
-            ),
         }
     }
 

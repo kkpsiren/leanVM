@@ -88,7 +88,7 @@ fn detects_dropped_check() {
 
     let mut rng = Rng::new(1);
     let honest = prog.honest_buffers(&mut rng);
-    let violating = prog.violating_buffers(&honest, 0);
+    let violating = prog.violating_buffers(&honest, 0, 0);
     let input = zero_public_input();
 
     // Honest witness passes on both.
@@ -156,6 +156,9 @@ fn generator_covers_hard_constructs() {
         "!=",              // inequality
         " < ",             // range check
         "if g",            // control flow
+        " + 0",            // copy-propagation pattern (CopyPropEq / inline)
+        "_t2 = ",          // CSE pair (CseEq)
+        "_b0 = ",          // running chain
     ] {
         assert!(all.contains(needle), "generator never emitted `{needle}`");
     }
@@ -191,6 +194,27 @@ fn hard_kinds_isolate() {
             kind: GadgetKind::HintDiv { d: 7 },
             comp: Computation::identity(1),
         },
+        // Fusion/CSE/copy-prop targets (the check-dropping suspects).
+        Gadget {
+            id: 5,
+            kind: GadgetKind::CopyPropEq,
+            comp: Computation::identity(1),
+        },
+        Gadget {
+            id: 6,
+            kind: GadgetKind::CseEq,
+            comp: Computation::identity(1),
+        },
+        Gadget {
+            id: 7,
+            kind: GadgetKind::TwoReadsEq,
+            comp: Computation::identity(1),
+        },
+        Gadget {
+            id: 8,
+            kind: GadgetKind::RunningChain { len: 4 },
+            comp: Computation::identity(1),
+        },
     ];
     let prog = CheckedProgram::new(gadgets);
     let bc = match compile_source(&prog.emit_source()) {
@@ -207,13 +231,16 @@ fn hard_kinds_isolate() {
         matches!(run(&bc, &input, &CheckedProgram::witness(&honest)), RunOutcome::Ok(_)),
         "honest witness must pass for the hard-kinds program"
     );
-    for i in 0..prog.gadgets.len() {
-        let bufs = prog.violating_buffers(&honest, i);
-        assert!(
-            !matches!(run(&bc, &input, &CheckedProgram::witness(&bufs)), RunOutcome::Ok(_)),
-            "violation for {} was accepted",
-            prog.gadgets[i].label()
-        );
+    // Break each independent check of each gadget in isolation; all must be rejected.
+    for (i, g) in prog.gadgets.iter().enumerate() {
+        for k in 0..g.n_violations() {
+            let bufs = prog.violating_buffers(&honest, i, k);
+            assert!(
+                !matches!(run(&bc, &input, &CheckedProgram::witness(&bufs)), RunOutcome::Ok(_)),
+                "violation #{k} for {} was accepted",
+                g.label()
+            );
+        }
     }
 }
 
