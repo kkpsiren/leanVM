@@ -296,16 +296,26 @@ impl Gadget {
                 let out = poseidon16_compress_half(&buf[..16]);
                 (0..8).all(|k| buf[16 + k] == out[k])
             }
-            // Skipped: free selectors (branch/match), runtime base (pointer arith), hint outputs,
-            // and div-by-zero gray areas — acceptance is not a pure function of the buffer alone.
+            // Always-active dispatch (the match/hint always runs, so random witnesses exercise it):
+            // an out-of-range selector is rejected, an in-range one must equal the arm's value.
+            GadgetKind::MatchDispatch { m } => buf[0] < *m && mul_mod(buf[0], buf[0]) == buf[1],
+            GadgetKind::MatchChained => {
+                buf[0] < 5
+                    && (if buf[0] < 2 {
+                        mul_mod(buf[0], 10)
+                    } else {
+                        mul_mod(buf[0], 100)
+                    }) == buf[1]
+            }
+            // hint_div_floor: q,r are the VM's (a//d, a%d); the only free check is q == buf[1].
+            GadgetKind::HintDiv { d } => buf[0] / *d == buf[1],
+            // Skipped: `if`-skip selectors (low-yield via generic random — covered by a forced-branch
+            // strategy), runtime base (pointer arith OOB), div-by-zero gray area, runner-only debug.
             GadgetKind::IfThen
             | GadgetKind::IfElse
             | GadgetKind::Panic
             | GadgetKind::DebugAssertLt { .. }
-            | GadgetKind::MatchDispatch { .. }
-            | GadgetKind::MatchChained
             | GadgetKind::NestedIfLoop { .. }
-            | GadgetKind::HintDiv { .. }
             | GadgetKind::Div
             | GadgetKind::PointerOffset
             | GadgetKind::PointerOffsetSub => return None,
