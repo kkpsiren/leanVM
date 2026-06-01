@@ -348,12 +348,9 @@ pub fn simplify_program(mut program: Program) -> Result<SimpleProgram, String> {
             })
             .collect();
 
-        let mut state = SimplifyState {
-            counters: &mut counters,
-        };
         let simplified_instructions = simplify_lines(
             &ctx,
-            &mut state,
+            &mut counters,
             &mut const_malloc,
             &mut new_functions,
             func.n_returned_vars,
@@ -1540,10 +1537,6 @@ struct SimplifyContext<'a> {
     const_arrays: &'a BTreeMap<String, ConstArrayValue>,
 }
 
-struct SimplifyState<'a> {
-    counters: &'a mut Counters,
-}
-
 #[derive(Debug, Clone, Default)]
 pub struct ConstMalloc {
     counter: usize,
@@ -1553,7 +1546,7 @@ pub struct ConstMalloc {
 #[allow(clippy::too_many_arguments)]
 fn simplify_lines(
     ctx: &SimplifyContext<'_>,
-    state: &mut SimplifyState<'_>,
+    counters: &mut Counters,
     const_malloc: &mut ConstMalloc,
     new_functions: &mut BTreeMap<String, SimpleFunction>,
     n_returned_vars: usize,
@@ -1579,13 +1572,13 @@ fn simplify_lines(
                     }
                 }
 
-                let simple_value = simplify_expr(ctx, state, const_malloc, value, &mut res)?;
+                let simple_value = simplify_expr(ctx, counters, const_malloc, value, &mut res)?;
 
                 let mut simple_arms = vec![];
                 for (_, statements) in arms.iter() {
                     simple_arms.push(simplify_lines(
                         ctx,
-                        state,
+                        counters,
                         const_malloc,
                         new_functions,
                         n_returned_vars,
@@ -1610,7 +1603,7 @@ fn simplify_lines(
                         if !targets.is_empty() {
                             return Err(format!("hint_witness has no return value, at {location}"));
                         }
-                        let simplified_ptr = simplify_expr(ctx, state, const_malloc, ptr, &mut res)?;
+                        let simplified_ptr = simplify_expr(ctx, counters, const_malloc, ptr, &mut res)?;
                         res.push(SimpleLine::HintWitness {
                             destination: simplified_ptr,
                             name: hint_name.clone(),
@@ -1638,7 +1631,8 @@ fn simplify_lines(
                             match target {
                                 AssignmentTarget::Var { var, .. } => {
                                     let target_var = var.clone();
-                                    let simplified_size = simplify_expr(ctx, state, const_malloc, &args[0], &mut res)?;
+                                    let simplified_size =
+                                        simplify_expr(ctx, counters, const_malloc, &args[0], &mut res)?;
                                     match simplified_size {
                                         SimpleExpr::Constant(const_size) => {
                                             let label = const_malloc.counter;
@@ -1670,7 +1664,7 @@ fn simplify_lines(
                         // Precompile / hint / print builtins (these take no return targets).
                         if try_lower_simple_builtin(
                             ctx,
-                            state,
+                            counters,
                             const_malloc,
                             function_name,
                             args,
@@ -1703,7 +1697,7 @@ fn simplify_lines(
 
                         let simplified_args = args
                             .iter()
-                            .map(|arg| simplify_expr(ctx, state, const_malloc, arg, &mut res))
+                            .map(|arg| simplify_expr(ctx, counters, const_malloc, arg, &mut res))
                             .collect::<Result<Vec<_>, _>>()?;
 
                         let mut temp_vars = Vec::new();
@@ -1715,7 +1709,7 @@ fn simplify_lines(
                                     temp_vars.push(var.clone());
                                 }
                                 AssignmentTarget::ArrayAccess { array, index } => {
-                                    temp_vars.push(state.counters.aux_var());
+                                    temp_vars.push(counters.aux_var());
                                     array_targets.push((i, array.clone(), index.clone()));
                                 }
                             }
@@ -1730,10 +1724,10 @@ fn simplify_lines(
 
                         // For array access targets, add DEREF instructions to copy temp to array element
                         for (i, array, index) in array_targets {
-                            let simplified_index = simplify_expr(ctx, state, const_malloc, &index, &mut res)?;
+                            let simplified_index = simplify_expr(ctx, counters, const_malloc, &index, &mut res)?;
                             let simplified_value = VarOrConstMallocAccess::Var(temp_vars[i].clone()).into();
                             handle_array_assignment(
-                                state,
+                                counters,
                                 const_malloc,
                                 &mut res,
                                 &array,
@@ -1752,7 +1746,7 @@ fn simplify_lines(
                                     Expression::Value(val) => {
                                         let simplified_val = simplify_expr(
                                             ctx,
-                                            state,
+                                            counters,
                                             const_malloc,
                                             &Expression::Value(val.clone()),
                                             &mut res,
@@ -1763,10 +1757,10 @@ fn simplify_lines(
                                         // Pre-simplify indices before version update
                                         let simplified_index = index
                                             .iter()
-                                            .map(|idx| simplify_expr(ctx, state, const_malloc, idx, &mut res))
+                                            .map(|idx| simplify_expr(ctx, counters, const_malloc, idx, &mut res))
                                             .collect::<Result<Vec<_>, _>>()?;
                                         handle_array_assignment(
-                                            state,
+                                            counters,
                                             const_malloc,
                                             &mut res,
                                             array,
@@ -1777,7 +1771,7 @@ fn simplify_lines(
                                     Expression::MathExpr(operation, args) => {
                                         let args_simplified = args
                                             .iter()
-                                            .map(|arg| simplify_expr(ctx, state, const_malloc, arg, &mut res))
+                                            .map(|arg| simplify_expr(ctx, counters, const_malloc, arg, &mut res))
                                             .collect::<Result<Vec<_>, _>>()?;
                                         // If all operands are constants, evaluate at compile time
                                         if let Some(const_args) = SimpleExpr::try_vec_as_constant(&args_simplified) {
@@ -1811,7 +1805,7 @@ fn simplify_lines(
                             }
                             AssignmentTarget::ArrayAccess { array, index } => {
                                 // Array element assignment - pre-simplify index first
-                                let simplified_index = simplify_expr(ctx, state, const_malloc, index, &mut res)?;
+                                let simplified_index = simplify_expr(ctx, counters, const_malloc, index, &mut res)?;
 
                                 // Optimization: direct math assignment to const_malloc array with constant index
                                 if let SimpleExpr::Constant(offset) = &simplified_index
@@ -1825,7 +1819,7 @@ fn simplify_lines(
                                     };
                                     let simplified_args = args
                                         .iter()
-                                        .map(|arg| simplify_expr(ctx, state, const_malloc, arg, &mut res))
+                                        .map(|arg| simplify_expr(ctx, counters, const_malloc, arg, &mut res))
                                         .collect::<Result<Vec<_>, _>>()?;
                                     // If all operands are constants, evaluate at compile time
                                     if let Some(const_args) = SimpleExpr::try_vec_as_constant(&simplified_args) {
@@ -1847,9 +1841,9 @@ fn simplify_lines(
                                     }
                                 } else {
                                     // General case: pre-simplify value and use handle_array_assignment
-                                    let simplified_value = simplify_expr(ctx, state, const_malloc, value, &mut res)?;
+                                    let simplified_value = simplify_expr(ctx, counters, const_malloc, value, &mut res)?;
                                     handle_array_assignment(
-                                        state,
+                                        counters,
                                         const_malloc,
                                         &mut res,
                                         array,
@@ -1866,7 +1860,7 @@ fn simplify_lines(
                 boolean,
                 debug,
                 location,
-            } => lower_assert(ctx, state, const_malloc, boolean, *debug, *location, &mut res)?,
+            } => lower_assert(ctx, counters, const_malloc, boolean, *debug, *location, &mut res)?,
             Line::IfCondition {
                 condition,
                 then_branch,
@@ -1880,10 +1874,10 @@ fn simplify_lines(
                     Boolean::LessThan | Boolean::LessOrEqual => unreachable!(),
                 };
 
-                let left_simplified = simplify_expr(ctx, state, const_malloc, left, &mut res)?;
-                let right_simplified = simplify_expr(ctx, state, const_malloc, right, &mut res)?;
+                let left_simplified = simplify_expr(ctx, counters, const_malloc, left, &mut res)?;
+                let right_simplified = simplify_expr(ctx, counters, const_malloc, right, &mut res)?;
 
-                let diff_var = state.counters.aux_var();
+                let diff_var = counters.aux_var();
                 res.push(SimpleLine::Assignment {
                     var: diff_var.clone().into(),
                     op: MathOperation::Sub,
@@ -1894,7 +1888,7 @@ fn simplify_lines(
 
                 let then_branch_simplified = simplify_lines(
                     ctx,
-                    state,
+                    counters,
                     const_malloc,
                     new_functions,
                     n_returned_vars,
@@ -1903,7 +1897,7 @@ fn simplify_lines(
                 )?;
                 let else_branch_simplified = simplify_lines(
                     ctx,
-                    state,
+                    counters,
                     const_malloc,
                     new_functions,
                     n_returned_vars,
@@ -1938,12 +1932,13 @@ fn simplify_lines(
                     ..ConstMalloc::default()
                 };
 
-                let simplified_body = simplify_lines(ctx, state, &mut loop_const_malloc, new_functions, 0, body, true)?;
+                let simplified_body =
+                    simplify_lines(ctx, counters, &mut loop_const_malloc, new_functions, 0, body, true)?;
 
                 const_malloc.counter = loop_const_malloc.counter;
 
                 let loop_prefix = if is_parallel { "@parallel_loop" } else { "@loop" };
-                let func_name = format!("{}_{}_{}", loop_prefix, state.counters.loops.get_next(), location);
+                let func_name = format!("{}_{}_{}", loop_prefix, counters.loops.get_next(), location);
 
                 // Find variables used inside loop but defined outside
                 let (_, mut external_vars) = find_variable_usage(body, ctx.const_arrays);
@@ -1958,13 +1953,13 @@ fn simplify_lines(
 
                 let mut external_vars: Vec<_> = external_vars.into_iter().collect();
 
-                let start_simplified = simplify_expr(ctx, state, const_malloc, start, &mut res)?;
-                let mut end_simplified = simplify_expr(ctx, state, const_malloc, end, &mut res)?;
+                let start_simplified = simplify_expr(ctx, counters, const_malloc, start, &mut res)?;
+                let mut end_simplified = simplify_expr(ctx, counters, const_malloc, end, &mut res)?;
                 if let SimpleExpr::Memory(VarOrConstMallocAccess::ConstMallocAccess { malloc_label, offset }) =
                     end_simplified.clone()
                 {
                     // we use an auxilary variable to store the end value (const malloc inside non-unrolled loops does not work)
-                    let aux_end_var = state.counters.aux_var();
+                    let aux_end_var = counters.aux_var();
                     res.push(SimpleLine::equality(
                         aux_end_var.clone(),
                         VarOrConstMallocAccess::ConstMallocAccess { malloc_label, offset },
@@ -2033,7 +2028,7 @@ fn simplify_lines(
                 }
                 let simplified_return_data = return_data
                     .iter()
-                    .map(|ret| simplify_expr(ctx, state, const_malloc, ret, &mut res))
+                    .map(|ret| simplify_expr(ctx, counters, const_malloc, ret, &mut res))
                     .collect::<Result<Vec<_>, _>>()?;
                 res.push(SimpleLine::FunctionRet {
                     return_data: simplified_return_data,
@@ -2061,7 +2056,7 @@ fn simplify_lines(
 #[allow(clippy::too_many_arguments)]
 fn try_lower_simple_builtin(
     ctx: &SimplifyContext<'_>,
-    state: &mut SimplifyState<'_>,
+    counters: &mut Counters,
     const_malloc: &ConstMalloc,
     function_name: &str,
     args: &[Expression],
@@ -2069,9 +2064,9 @@ fn try_lower_simple_builtin(
     location: SourceLocation,
     res: &mut Vec<SimpleLine>,
 ) -> Result<bool, String> {
-    let simplify_args = |state: &mut SimplifyState<'_>, res: &mut Vec<SimpleLine>| {
+    let simplify_args = |counters: &mut Counters, res: &mut Vec<SimpleLine>| {
         args.iter()
-            .map(|arg| simplify_expr(ctx, state, const_malloc, arg, res))
+            .map(|arg| simplify_expr(ctx, counters, const_malloc, arg, res))
             .collect::<Result<Vec<_>, _>>()
     };
 
@@ -2079,7 +2074,7 @@ fn try_lower_simple_builtin(
         if !targets.is_empty() {
             return Err(format!("print should not return values, at {location}"));
         }
-        let content = simplify_args(state, res)?;
+        let content = simplify_args(counters, res)?;
         res.push(SimpleLine::Print {
             line_info: format!("line {}", location.line_number),
             content,
@@ -2102,10 +2097,10 @@ fn try_lower_simple_builtin(
         }
         let simplified_args = args[..3]
             .iter()
-            .map(|arg| simplify_expr(ctx, state, const_malloc, arg, res))
+            .map(|arg| simplify_expr(ctx, counters, const_malloc, arg, res))
             .collect::<Result<Vec<_>, _>>()?;
         let size = if args.len() == 4 {
-            simplify_expr(ctx, state, const_malloc, &args[3], res)?
+            simplify_expr(ctx, counters, const_malloc, &args[3], res)?
                 .as_constant()
                 .expect("extension op size must be a constant")
         } else {
@@ -2158,7 +2153,7 @@ fn try_lower_simple_builtin(
                 args.len()
             ));
         }
-        let simplified_args = simplify_args(state, res)?;
+        let simplified_args = simplify_args(counters, res)?;
         let hardcoded_offset_left = if is_hardcoded_left {
             Some(simplified_args[3].as_constant().ok_or_else(|| {
                 format!("{function_name}: offset argument must be a compile-time constant, at {location}")
@@ -2191,7 +2186,7 @@ fn try_lower_simple_builtin(
                 "Custom hint {function_name}: invalid number of arguments, at {location}"
             ));
         }
-        let simplified_args = simplify_args(state, res)?;
+        let simplified_args = simplify_args(counters, res)?;
         res.push(SimpleLine::CustomHint(hint, simplified_args));
         return Ok(true);
     }
@@ -2207,15 +2202,15 @@ fn try_lower_simple_builtin(
 /// - `assert a < b` / `a <= b` → a `RangeCheck` (preceded by a sanity `DebugAssert`)
 fn lower_assert(
     ctx: &SimplifyContext<'_>,
-    state: &mut SimplifyState<'_>,
+    counters: &mut Counters,
     const_malloc: &ConstMalloc,
     boolean: &BooleanExpr<Expression>,
     debug: bool,
     location: SourceLocation,
     res: &mut Vec<SimpleLine>,
 ) -> Result<(), String> {
-    let left = simplify_expr(ctx, state, const_malloc, &boolean.left, res)?;
-    let right = simplify_expr(ctx, state, const_malloc, &boolean.right, res)?;
+    let left = simplify_expr(ctx, counters, const_malloc, &boolean.left, res)?;
+    let right = simplify_expr(ctx, counters, const_malloc, &boolean.right, res)?;
 
     if debug {
         res.push(SimpleLine::DebugAssert {
@@ -2232,7 +2227,7 @@ fn lower_assert(
 
     match boolean.kind {
         Boolean::Different => {
-            let diff_var = state.counters.aux_var();
+            let diff_var = counters.aux_var();
             res.push(SimpleLine::Assignment {
                 var: diff_var.clone().into(),
                 op: MathOperation::Sub,
@@ -2268,7 +2263,7 @@ fn lower_assert(
         }
         Boolean::LessThan => {
             // assert left < right is equivalent to assert left <= right - 1
-            let bound_minus_one = state.counters.aux_var();
+            let bound_minus_one = counters.aux_var();
             res.push(SimpleLine::Assignment {
                 var: bound_minus_one.clone().into(),
                 op: MathOperation::Sub,
@@ -2310,7 +2305,7 @@ fn lower_assert(
 
 fn simplify_expr(
     ctx: &SimplifyContext<'_>,
-    state: &mut SimplifyState<'_>,
+    counters: &mut Counters,
     const_malloc: &ConstMalloc,
     expr: &Expression,
     lines: &mut Vec<SimpleLine>,
@@ -2365,10 +2360,10 @@ fn simplify_expr(
             // Emit a fresh read into a new aux var. Repeated reads of the same
             // address are coalesced afterwards by the `dedup_array_reads`
             // post-pass (sound because memory is write-once).
-            let aux_arr = state.counters.aux_var();
-            let simplified_index = simplify_expr(ctx, state, const_malloc, &index, lines)?;
+            let aux_arr = counters.aux_var();
+            let simplified_index = simplify_expr(ctx, counters, const_malloc, &index, lines)?;
             handle_array_assignment(
-                state,
+                counters,
                 const_malloc,
                 lines,
                 array,
@@ -2380,7 +2375,7 @@ fn simplify_expr(
         Expression::MathExpr(op, args) => {
             let simplified_args = args
                 .iter()
-                .map(|arg| simplify_expr(ctx, state, const_malloc, arg, lines))
+                .map(|arg| simplify_expr(ctx, counters, const_malloc, arg, lines))
                 .collect::<Result<Vec<_>, _>>()?;
             if let Some(const_args) = SimpleExpr::try_vec_as_constant(&simplified_args) {
                 return Ok(SimpleExpr::Constant(ConstExpression::MathExpr(*op, const_args)));
@@ -2390,7 +2385,7 @@ fn simplify_expr(
                     "Operation `{op}` is compile-time only; all operands must be constants"
                 ));
             }
-            let aux_var = state.counters.aux_var();
+            let aux_var = counters.aux_var();
             assert_eq!(simplified_args.len(), 2);
             lines.push(SimpleLine::Assignment {
                 var: aux_var.clone().into(),
@@ -2418,11 +2413,11 @@ fn simplify_expr(
 
             let simplified_args = args
                 .iter()
-                .map(|arg| simplify_expr(ctx, state, const_malloc, arg, lines))
+                .map(|arg| simplify_expr(ctx, counters, const_malloc, arg, lines))
                 .collect::<Result<Vec<_>, _>>()?;
 
             // Create a temporary variable for the function result
-            let result_var = state.counters.aux_var();
+            let result_var = counters.aux_var();
 
             lines.push(SimpleLine::FunctionCall {
                 function_name: function_name.clone(),
@@ -2749,7 +2744,7 @@ pub enum ArrayAccessType {
 }
 
 fn handle_array_assignment(
-    state: &mut SimplifyState<'_>,
+    counters: &mut Counters,
     const_malloc: &ConstMalloc,
     res: &mut Vec<SimpleLine>,
     array: &SimpleExpr,
@@ -2787,7 +2782,7 @@ fn handle_array_assignment(
             name.clone().into()
         }
         None => {
-            let base_var = state.counters.aux_var();
+            let base_var = counters.aux_var();
             res.push(SimpleLine::Assignment {
                 var: base_var.clone().into(),
                 op: MathOperation::Add,
@@ -2809,7 +2804,7 @@ fn handle_array_assignment(
         SimpleExpr::Constant(c) => (base_addr, c),
         _ => {
             // Create pointer variable: ptr = base_addr + index
-            let ptr_var = state.counters.aux_var();
+            let ptr_var = counters.aux_var();
             res.push(SimpleLine::Assignment {
                 var: ptr_var.clone().into(),
                 op: MathOperation::Add,
