@@ -303,14 +303,18 @@ result = match_range(n,
     range(1, 8), lambda i: normal_case(i))
 ```
 
-Multiple return values are supported via tuple unpacking. The bindings produced
-by `match_range` are always immutable. Forward-declare with `: Mut` (and then
-reassign) if you need them mutable later:
+Multiple return values are supported via tuple unpacking. Like any binding, a
+`match_range` result is immutable; declare the target `: Mut` if you assign it
+more than once in a scope (assigning it once per `unroll` iteration stays
+immutable, each iteration is a fresh scope):
 
 ```python
 a: Mut
 a, b = match_range(n, range(0, 4), lambda i: two_values(i))
-a += 1
+a += 1                                                   # second assign in this scope ⇒ a is : Mut
+
+for k in unroll(0, n):
+    c = match_range(k, range(0, 4), lambda i: one_value(i))  # immutable: a fresh binding each iteration
 ```
 
 Idiomatic use: enables to dispatch a runtime value to a const-parameter function.
