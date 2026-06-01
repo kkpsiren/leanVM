@@ -4,6 +4,6 @@ pub mod bytecode;
 pub mod instruction;
 pub mod value;
 
-pub use bytecode::{IntermediateBytecode, MatchBlock};
+pub use bytecode::IntermediateBytecode;
 pub use instruction::IntermediateInstruction;
 pub use value::IntermediateValue;

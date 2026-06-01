@@ -5,7 +5,7 @@ use super::literal::{VarOrConstantParser, evaluate_const_expr};
 use super::{ConstArrayValue, Parse, ParseContext, next_inner_pair};
 use crate::lang::MathOperation;
 use crate::{
-    lang::{ConstExpression, ConstantValue, Expression, SimpleExpr},
+    lang::{Expression, SimpleExpr},
     parser::{
         error::{ParseResult, SemanticError},
         grammar::{ParsePair, Rule},
@@ -208,9 +208,7 @@ impl Parse<Expression> for LenParser {
                     ConstArrayValue::Array(arr) => arr.len(),
                 };
 
-                return Ok(Expression::Value(SimpleExpr::Constant(ConstExpression::Value(
-                    ConstantValue::Scalar(F::from_usize(length)),
-                ))));
+                return Ok(Expression::Value(SimpleExpr::scalar(F::from_usize(length))));
             }
         }
 

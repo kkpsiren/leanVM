@@ -40,14 +40,6 @@ pub fn compile_to_low_level_bytecode(
     source_code: BTreeMap<FileId, String>,
     filepaths: BTreeMap<FileId, String>,
 ) -> Result<Bytecode, String> {
-    intermediate_bytecode.bytecode.insert(
-        Label::EndProgram,
-        vec![IntermediateInstruction::Jump {
-            dest: IntermediateValue::label(Label::EndProgram),
-            updated_fp: None,
-        }],
-    );
-
     let starting_frame_memory = *intermediate_bytecode
         .memory_size_per_function
         .get("main")
@@ -56,11 +48,12 @@ pub fn compile_to_low_level_bytecode(
     let mut hints = BTreeMap::new();
     let mut label_to_pc = BTreeMap::new();
 
-    let exit_point = intermediate_bytecode
-        .bytecode
-        .remove(&Label::EndProgram)
-        .ok_or("No end_program label found in the compiled program")?;
-    assert_eq!(count_real_instructions(&exit_point), 1);
+    // The self-looping exit block, appended last. A single real Jump instruction.
+    let exit_point = vec![IntermediateInstruction::Jump {
+        dest: IntermediateValue::label(Label::EndProgram),
+        updated_fp: None,
+    }];
+    debug_assert_eq!(count_real_instructions(&exit_point), 1);
 
     label_to_pc.insert(Label::function("main"), STARTING_PC);
     let entrypoint = intermediate_bytecode
@@ -79,7 +72,7 @@ pub fn compile_to_low_level_bytecode(
 
     let mut match_block_sizes = Vec::new();
     let mut match_first_block_starts = Vec::new();
-    for MatchBlock { match_cases } in intermediate_bytecode.match_blocks {
+    for match_cases in intermediate_bytecode.match_blocks {
         let max_block_size = match_cases
             .iter()
             .map(|block| count_real_instructions(block))
@@ -228,7 +221,7 @@ fn compile_block(
             MemOrConstant::MemoryAfterFp { offset } => Label::custom(format!("fp+{offset}")),
         };
         let updated_fp = updated_fp
-            .map(|fp| fp.try_into_mem_or_fp_or_constant(compiler).unwrap())
+            .map(|fp| fp.to_mem_or_fp_or_constant(compiler))
             .unwrap_or(MemOrFpOrConstant::FpRelative { offset: 0 });
         low_level_bytecode.push(Instruction::Jump {
             condition: try_as_mem_or_constant(&condition).unwrap(),
@@ -257,7 +250,7 @@ fn compile_block(
                     low_level_bytecode.push(Instruction::Computation {
                         operation: Operation::Add,
                         arg_a: MemOrConstant::zero(),
-                        arg_c: res.try_into_mem_or_fp_or_constant(compiler).unwrap(),
+                        arg_c: res.to_mem_or_fp_or_constant(compiler),
                         res: MemOrConstant::Constant(op_res),
                     });
                     pc += 1;
@@ -271,7 +264,7 @@ fn compile_block(
                 low_level_bytecode.push(Instruction::Computation {
                     operation,
                     arg_a: try_as_mem_or_constant(&arg_a).unwrap(),
-                    arg_c: arg_b.try_into_mem_or_fp_or_constant(compiler).unwrap(),
+                    arg_c: arg_b.to_mem_or_fp_or_constant(compiler),
                     res: try_as_mem_or_constant(&res).unwrap(),
                 });
             }
@@ -288,7 +281,7 @@ fn compile_block(
                 low_level_bytecode.push(Instruction::Deref {
                     shift_0: eval_const_expression(&shift_0, compiler).to_usize(),
                     shift_1: eval_const_expression(&shift_1, compiler).to_usize(),
-                    res: res.try_into_mem_or_fp_or_constant(compiler).unwrap(),
+                    res: res.to_mem_or_fp_or_constant(compiler),
                 });
             }
             IntermediateInstruction::JumpIfNotZero {
@@ -305,9 +298,9 @@ fn compile_block(
                     .data
                     .map_size(|size| eval_const_expression_usize(&size, compiler));
                 let args = PrecompileArgs {
-                    arg_0: precompile.arg_0.try_into_mem_or_fp_or_constant(compiler).unwrap(),
-                    arg_1: precompile.arg_1.try_into_mem_or_fp_or_constant(compiler).unwrap(),
-                    res: precompile.res.try_into_mem_or_fp_or_constant(compiler).unwrap(),
+                    arg_0: precompile.arg_0.to_mem_or_fp_or_constant(compiler),
+                    arg_1: precompile.arg_1.to_mem_or_fp_or_constant(compiler),
+                    res: precompile.res.to_mem_or_fp_or_constant(compiler),
                     data,
                 };
                 low_level_bytecode.push(Instruction::Precompile(args));
@@ -316,7 +309,7 @@ fn compile_block(
                 let hint = Hint::Custom(
                     hint,
                     args.into_iter()
-                        .map(|expr| expr.try_into_mem_or_fp_or_constant(compiler).unwrap())
+                        .map(|expr| expr.to_mem_or_fp_or_constant(compiler))
                         .collect(),
                 );
                 hints.entry(pc).or_default().push(hint);
@@ -454,15 +447,15 @@ fn try_as_constant(value: &IntermediateValue, compiler: &Compiler) -> Option<F> 
 }
 
 impl IntermediateValue {
-    fn try_into_mem_or_fp_or_constant(&self, compiler: &Compiler) -> Result<MemOrFpOrConstant, String> {
+    fn to_mem_or_fp_or_constant(&self, compiler: &Compiler) -> MemOrFpOrConstant {
         match self {
-            Self::MemoryAfterFp { offset } => Ok(MemOrFpOrConstant::MemoryAfterFp {
+            Self::MemoryAfterFp { offset } => MemOrFpOrConstant::MemoryAfterFp {
                 offset: eval_const_expression_usize(offset, compiler),
-            }),
-            Self::FpRelative { offset } => Ok(MemOrFpOrConstant::FpRelative {
+            },
+            Self::FpRelative { offset } => MemOrFpOrConstant::FpRelative {
                 offset: eval_const_expression_usize(offset, compiler),
-            }),
-            Self::Constant(c) => Ok(MemOrFpOrConstant::Constant(eval_const_expression(c, compiler))),
+            },
+            Self::Constant(c) => MemOrFpOrConstant::Constant(eval_const_expression(c, compiler)),
         }
     }
 }

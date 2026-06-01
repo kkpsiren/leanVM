@@ -516,15 +516,7 @@ fn compile_time_transform_in_lines(
         // 5. Recurse into nested blocks. Constants propagate into blocks that stay
         //    inline (if / match arms), but not into `range` loop bodies.
         let no_consts = BTreeMap::new();
-        let inner_consts = if matches!(
-            lines[i],
-            Line::IfCondition { .. }
-                | Line::Match { .. }
-                | Line::ForLoop {
-                    loop_kind: LoopKind::Unroll,
-                    ..
-                }
-        ) {
+        let inner_consts = if matches!(lines[i], Line::IfCondition { .. } | Line::Match { .. }) {
             &const_var_exprs
         } else {
             &no_consts
@@ -998,17 +990,15 @@ fn extract_preprocessed_calls(
 fn compile_time_transform_in_expr(
     expr: &mut Expression,
     const_arrays: &BTreeMap<String, ConstArrayValue>,
-) -> Result<bool, String> {
+) -> Result<(), String> {
     if expr.is_scalar() {
-        return Ok(false);
+        return Ok(());
     }
-    let mut changed = false;
     for inner_expr in expr.inner_exprs_mut() {
-        changed |= compile_time_transform_in_expr(inner_expr, const_arrays)?;
+        compile_time_transform_in_expr(inner_expr, const_arrays)?;
     }
     if let Some(scalar) = expr.compile_time_eval(const_arrays) {
         *expr = Expression::scalar(scalar);
-        changed = true;
     } else if let Expression::Len { .. } = &*expr {
         return Err("Cannot call len() on a scalar value".to_string());
     } else if let Expression::MathExpr(op, args) = &*expr
@@ -1016,22 +1006,20 @@ fn compile_time_transform_in_expr(
     {
         return Err(format!("compile-time `{op}` failed"));
     }
-    Ok(changed)
+    Ok(())
 }
 
-fn substitute_const_vars_in_expr(expr: &mut Expression, const_var_exprs: &BTreeMap<Var, F>) -> bool {
+fn substitute_const_vars_in_expr(expr: &mut Expression, const_var_exprs: &BTreeMap<Var, F>) {
     if let Expression::Value(SimpleExpr::Memory(VarOrConstMallocAccess::Var(var))) = expr
         && let Some(replacement) = const_var_exprs.get(var)
     {
         *expr = Expression::scalar(*replacement);
-        return true;
+        return;
     }
 
-    let mut changed = false;
     for inner in expr.inner_exprs_mut() {
-        changed |= substitute_const_vars_in_expr(inner, const_var_exprs);
+        substitute_const_vars_in_expr(inner, const_var_exprs);
     }
-    changed
 }
 
 // ============================================================================
@@ -1531,6 +1519,25 @@ impl Counters {
     fn aux_var(&mut self) -> Var {
         format!("@aux_var_{}", self.aux_vars.get_next())
     }
+
+    /// Emit `aux = arg0 op arg1` into `out` (allocating a fresh aux var) and
+    /// return the aux var as a `SimpleExpr`.
+    fn emit_op(
+        &mut self,
+        out: &mut Vec<SimpleLine>,
+        op: MathOperation,
+        arg0: SimpleExpr,
+        arg1: SimpleExpr,
+    ) -> SimpleExpr {
+        let var = self.aux_var();
+        out.push(SimpleLine::Assignment {
+            var: var.clone().into(),
+            op,
+            arg0,
+            arg1,
+        });
+        var.into()
+    }
 }
 
 struct SimplifyContext<'a> {
@@ -1542,6 +1549,38 @@ struct SimplifyContext<'a> {
 pub struct ConstMalloc {
     counter: usize,
     map: BTreeMap<Var, ConstMallocLabel>,
+}
+
+/// Lower `dest = op(simplified_args)`: fold to a constant when every operand is
+/// constant, otherwise emit a runtime `Assignment` (after checking `op` supports
+/// runtime evaluation). Used for the two statement-position MathExpr targets
+/// (a plain variable and a const-malloc array element).
+fn push_math(
+    res: &mut Vec<SimpleLine>,
+    dest: SimpleExpr,
+    op: MathOperation,
+    simplified_args: &[SimpleExpr],
+) -> Result<(), String> {
+    if let Some(const_args) = SimpleExpr::try_vec_as_constant(simplified_args) {
+        res.push(SimpleLine::equality(
+            dest,
+            SimpleExpr::Constant(ConstExpression::MathExpr(op, const_args)),
+        ));
+    } else {
+        if !op.supports_runtime() {
+            return Err(format!(
+                "Operation `{op}` is compile-time only; all operands must be constants"
+            ));
+        }
+        assert_eq!(simplified_args.len(), 2);
+        res.push(SimpleLine::Assignment {
+            var: dest,
+            op,
+            arg0: simplified_args[0].clone(),
+            arg1: simplified_args[1].clone(),
+        });
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1791,23 +1830,7 @@ fn simplify_lines(
                                             .iter()
                                             .map(|arg| simplify_expr(ctx, counters, const_malloc, arg, &mut res))
                                             .collect::<Result<Vec<_>, _>>()?;
-                                        // If all operands are constants, evaluate at compile time
-                                        if let Some(const_args) = SimpleExpr::try_vec_as_constant(&args_simplified) {
-                                            let result = ConstExpression::MathExpr(*operation, const_args);
-                                            res.push(SimpleLine::equality(var.clone(), SimpleExpr::Constant(result)));
-                                        } else {
-                                            if !operation.supports_runtime() {
-                                                return Err(format!(
-                                                    "Operation `{operation}` is compile-time only; all operands must be constants"
-                                                ));
-                                            }
-                                            res.push(SimpleLine::Assignment {
-                                                var: var.clone().into(),
-                                                op: *operation,
-                                                arg0: args_simplified[0].clone(),
-                                                arg1: args_simplified[1].clone(),
-                                            });
-                                        }
+                                        push_math(&mut res, var.clone().into(), *operation, &args_simplified)?;
                                     }
                                     Expression::Len { .. } => unreachable!(),
                                     Expression::FunctionCall { .. } => {
@@ -1839,24 +1862,7 @@ fn simplify_lines(
                                         .iter()
                                         .map(|arg| simplify_expr(ctx, counters, const_malloc, arg, &mut res))
                                         .collect::<Result<Vec<_>, _>>()?;
-                                    // If all operands are constants, evaluate at compile time
-                                    if let Some(const_args) = SimpleExpr::try_vec_as_constant(&simplified_args) {
-                                        let result = ConstExpression::MathExpr(*op, const_args);
-                                        res.push(SimpleLine::equality(var, SimpleExpr::Constant(result)));
-                                    } else {
-                                        if !op.supports_runtime() {
-                                            return Err(format!(
-                                                "Operation `{op}` is compile-time only; all operands must be constants"
-                                            ));
-                                        }
-                                        assert_eq!(simplified_args.len(), 2);
-                                        res.push(SimpleLine::Assignment {
-                                            var: var.into(),
-                                            op: *op,
-                                            arg0: simplified_args[0].clone(),
-                                            arg1: simplified_args[1].clone(),
-                                        });
-                                    }
+                                    push_math(&mut res, var.into(), *op, &simplified_args)?;
                                 } else {
                                     // General case: pre-simplify value and use handle_array_assignment
                                     let simplified_value = simplify_expr(ctx, counters, const_malloc, value, &mut res)?;
@@ -1895,14 +1901,8 @@ fn simplify_lines(
                 let left_simplified = simplify_expr(ctx, counters, const_malloc, left, &mut res)?;
                 let right_simplified = simplify_expr(ctx, counters, const_malloc, right, &mut res)?;
 
-                let diff_var = counters.aux_var();
-                res.push(SimpleLine::Assignment {
-                    var: diff_var.clone().into(),
-                    op: MathOperation::Sub,
-                    arg0: left_simplified,
-                    arg1: right_simplified,
-                });
-                let condition_simplified: SimpleExpr = diff_var.into();
+                let condition_simplified =
+                    counters.emit_op(&mut res, MathOperation::Sub, left_simplified, right_simplified);
 
                 let then_branch_simplified = simplify_lines(
                     ctx,
@@ -2245,15 +2245,9 @@ fn lower_assert(
 
     match boolean.kind {
         Boolean::Different => {
-            let diff_var = counters.aux_var();
-            res.push(SimpleLine::Assignment {
-                var: diff_var.clone().into(),
-                op: MathOperation::Sub,
-                arg0: left,
-                arg1: right,
-            });
+            let condition = counters.emit_op(res, MathOperation::Sub, left, right);
             res.push(SimpleLine::IfNotZero {
-                condition: diff_var.into(),
+                condition,
                 then_branch: vec![],
                 else_branch: vec![SimpleLine::Panic { message: None }],
                 location,
@@ -2281,25 +2275,19 @@ fn lower_assert(
         }
         Boolean::LessThan => {
             // assert left < right is equivalent to assert left <= right - 1
-            let bound_minus_one = counters.aux_var();
-            res.push(SimpleLine::Assignment {
-                var: bound_minus_one.clone().into(),
-                op: MathOperation::Sub,
-                arg0: right,
-                arg1: SimpleExpr::one(),
-            });
+            let bound_minus_one = counters.emit_op(res, MathOperation::Sub, right, SimpleExpr::one());
             res.push(SimpleLine::DebugAssert {
                 expr: BooleanExpr {
                     kind: Boolean::LessOrEqual,
                     left: left.clone(),
-                    right: bound_minus_one.clone().into(),
+                    right: bound_minus_one.clone(),
                 },
                 location,
                 preceds_runtime_inequality: true,
             });
             res.push(SimpleLine::RangeCheck {
                 val: left,
-                bound: bound_minus_one.into(),
+                bound: bound_minus_one,
             });
         }
         Boolean::LessOrEqual => {
@@ -2403,15 +2391,8 @@ fn simplify_expr(
                     "Operation `{op}` is compile-time only; all operands must be constants"
                 ));
             }
-            let aux_var = counters.aux_var();
             assert_eq!(simplified_args.len(), 2);
-            lines.push(SimpleLine::Assignment {
-                var: aux_var.clone().into(),
-                op: *op,
-                arg0: simplified_args[0].clone(),
-                arg1: simplified_args[1].clone(),
-            });
-            Ok(VarOrConstMallocAccess::Var(aux_var).into())
+            Ok(counters.emit_op(lines, *op, simplified_args[0].clone(), simplified_args[1].clone()))
         }
         Expression::FunctionCall {
             function_name,
@@ -2799,16 +2780,7 @@ fn handle_array_assignment(
 
             name.clone().into()
         }
-        None => {
-            let base_var = counters.aux_var();
-            res.push(SimpleLine::Assignment {
-                var: base_var.clone().into(),
-                op: MathOperation::Add,
-                arg0: array.clone(),
-                arg1: SimpleExpr::zero(),
-            });
-            base_var.into()
-        }
+        None => counters.emit_op(res, MathOperation::Add, array.clone(), SimpleExpr::zero()),
     };
 
     let value_simplified = match access_type {
@@ -2820,20 +2792,11 @@ fn handle_array_assignment(
     let simplified_index = simplified_index[0].clone();
     let (index_var, shift) = match simplified_index {
         SimpleExpr::Constant(c) => (base_addr, c),
-        _ => {
-            // Create pointer variable: ptr = base_addr + index
-            let ptr_var = counters.aux_var();
-            res.push(SimpleLine::Assignment {
-                var: ptr_var.clone().into(),
-                op: MathOperation::Add,
-                arg0: base_addr,
-                arg1: simplified_index,
-            });
-            (
-                SimpleExpr::Memory(VarOrConstMallocAccess::Var(ptr_var)),
-                ConstExpression::zero(),
-            )
-        }
+        // Create pointer variable: ptr = base_addr + index
+        _ => (
+            counters.emit_op(res, MathOperation::Add, base_addr, simplified_index),
+            ConstExpression::zero(),
+        ),
     };
 
     res.push(SimpleLine::RawAccess {

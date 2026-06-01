@@ -138,6 +138,19 @@ fn apply_substitutions(lines: &mut Vec<SimpleLine>, subst: &BTreeMap<Var, Simple
     });
 }
 
+/// Drop lines at the given indices, plus any `ForwardDeclaration` of a dropped var.
+/// `drop_indices` is keyed on the pre-removal positions (the two sets target
+/// disjoint line variants, so a single pass is exact).
+fn retain_dropping(lines: &mut Vec<SimpleLine>, drop_indices: &BTreeSet<usize>, drop_decls: &BTreeSet<Var>) {
+    let mut idx = 0;
+    lines.retain(|line| {
+        let keep = !drop_indices.contains(&idx)
+            && !matches!(line, SimpleLine::ForwardDeclaration { var } if drop_decls.contains(var));
+        idx += 1;
+        keep
+    });
+}
+
 #[derive(Default)]
 struct Fusions {
     replacements: BTreeMap<usize, SimpleLine>,
@@ -183,80 +196,83 @@ fn apply_fusions(lines: &mut Vec<SimpleLine>, fusions: Fusions) {
     for (j, new_line) in fusions.replacements {
         lines[j] = new_line;
     }
-    let mut idx = 0;
-    lines.retain(|_| {
-        let keep = !fusions.lines_to_drop.contains(&idx);
-        idx += 1;
-        keep
-    });
-    lines.retain(
-        |line| !matches!(line, SimpleLine::ForwardDeclaration { var } if fusions.declarations_to_drop.contains(var)),
-    );
+    retain_dropping(lines, &fusions.lines_to_drop, &fusions.declarations_to_drop);
+}
+
+/// Shared driver for the two assert-fusion passes. For each line that `classify`
+/// recognizes as a one-time-defined producer, search for a fusable `AssertEq` and,
+/// on a hit, drop the producer (+ its forward-decl) and replace the assert with
+/// `rewrite(producer, other_side)`.
+fn fuse_defs_into_asserts(
+    lines: &mut Vec<SimpleLine>,
+    refs: &BTreeMap<Var, VarRefs>,
+    classify: &impl Fn(&SimpleLine) -> Option<&Var>,
+    rewrite: &impl Fn(&SimpleLine, &SimpleExpr) -> SimpleLine,
+) {
+    for line in lines.iter_mut() {
+        for block in line.nested_blocks_mut() {
+            fuse_defs_into_asserts(block, refs, classify, rewrite);
+        }
+    }
+
+    let mut fusions = Fusions::default();
+    for i in 0..lines.len() {
+        let Some(v) = classify(&lines[i]) else { continue };
+        if !is_one_time_var(v, refs) {
+            continue;
+        }
+        let v = v.clone();
+        if let Some((j, other)) = find_fusable_assert(lines, i, &v, &fusions) {
+            let new_line = rewrite(&lines[i], other);
+            fusions.lines_to_drop.insert(i);
+            fusions.declarations_to_drop.insert(v);
+            fusions.replacements.insert(j, new_line);
+        }
+    }
+    apply_fusions(lines, fusions);
 }
 
 fn fuse_raw_asserts(lines: &mut Vec<SimpleLine>, refs: &BTreeMap<Var, VarRefs>) {
-    for line in lines.iter_mut() {
-        for block in line.nested_blocks_mut() {
-            fuse_raw_asserts(block, refs);
-        }
-    }
-
-    let mut fusions = Fusions::default();
-    for i in 0..lines.len() {
-        let SimpleLine::RawAccess { res, index, shift } = &lines[i] else {
-            continue;
-        };
-        let Some(v) = res.as_var() else { continue };
-        if !is_one_time_var(v, refs) {
-            continue;
-        }
-        if let Some((j, other)) = find_fusable_assert(lines, i, v, &fusions) {
-            fusions.lines_to_drop.insert(i);
-            fusions.declarations_to_drop.insert(v.clone());
-            fusions.replacements.insert(
-                j,
-                SimpleLine::RawAccess {
-                    res: other.clone(),
-                    index: index.clone(),
-                    shift: shift.clone(),
-                },
-            );
-        }
-    }
-    apply_fusions(lines, fusions);
+    fuse_defs_into_asserts(
+        lines,
+        refs,
+        &|l| match l {
+            SimpleLine::RawAccess { res, .. } => res.as_var(),
+            _ => None,
+        },
+        &|l, other| {
+            let SimpleLine::RawAccess { index, shift, .. } = l else {
+                unreachable!()
+            };
+            SimpleLine::RawAccess {
+                res: other.clone(),
+                index: index.clone(),
+                shift: shift.clone(),
+            }
+        },
+    );
 }
 
 fn fuse_assign_asserts(lines: &mut Vec<SimpleLine>, refs: &BTreeMap<Var, VarRefs>) {
-    for line in lines.iter_mut() {
-        for block in line.nested_blocks_mut() {
-            fuse_assign_asserts(block, refs);
-        }
-    }
-
-    let mut fusions = Fusions::default();
-    for i in 0..lines.len() {
-        let SimpleLine::Assignment { var, op, arg0, arg1 } = &lines[i] else {
-            continue;
-        };
-        let Some(v) = var.as_var() else { continue };
-        if !is_one_time_var(v, refs) {
-            continue;
-        }
-        if let Some((j, other)) = find_fusable_assert(lines, i, v, &fusions) {
-            fusions.lines_to_drop.insert(i);
-            fusions.declarations_to_drop.insert(v.clone());
-            fusions.replacements.insert(
-                j,
-                SimpleLine::Assignment {
-                    var: other.clone(),
-                    op: *op,
-                    arg0: arg0.clone(),
-                    arg1: arg1.clone(),
-                },
-            );
-        }
-    }
-    apply_fusions(lines, fusions);
+    fuse_defs_into_asserts(
+        lines,
+        refs,
+        &|l| match l {
+            SimpleLine::Assignment { var, .. } => var.as_var(),
+            _ => None,
+        },
+        &|l, other| {
+            let SimpleLine::Assignment { op, arg0, arg1, .. } = l else {
+                unreachable!()
+            };
+            SimpleLine::Assignment {
+                var: other.clone(),
+                op: *op,
+                arg0: arg0.clone(),
+                arg1: arg1.clone(),
+            }
+        },
+    );
 }
 
 /// The simplifier lowers `arr[base + K]` (runtime `base`, compile-time const `K`)
@@ -369,13 +385,7 @@ fn fold_const_offset_into_deref(lines: &mut Vec<SimpleLine>, refs: &BTreeMap<Var
         decls_to_drop.insert(var);
     }
 
-    let mut idx = 0;
-    lines.retain(|line| {
-        let keep = !to_drop.contains(&idx)
-            && !matches!(line, SimpleLine::ForwardDeclaration { var } if decls_to_drop.contains(var));
-        idx += 1;
-        keep
-    });
+    retain_dropping(lines, &to_drop, &decls_to_drop);
 }
 
 /// CSE (Common Subexpression Elimination)

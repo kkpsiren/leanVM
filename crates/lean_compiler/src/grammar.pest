@@ -47,7 +47,6 @@ simple_statement = {
 return_statement = { "return" ~ (("(" ~ tuple_expression ~ ")") | tuple_expression)? }
 
 
-mut_keyword = @{ "mut" ~ !(ASCII_ALPHANUMERIC | "_") }
 mut_annotation = { ":" ~ "Mut" }
 im_annotation = { ":" ~ "Imm" }
 

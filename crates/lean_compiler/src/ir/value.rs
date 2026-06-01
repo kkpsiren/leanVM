@@ -35,12 +35,6 @@ impl From<ConstExpression> for IntermediateValue {
     }
 }
 
-impl From<Label> for IntermediateValue {
-    fn from(label: Label) -> Self {
-        Self::label(label)
-    }
-}
-
 impl Display for IntermediateValue {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {

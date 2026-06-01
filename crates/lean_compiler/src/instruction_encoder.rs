@@ -85,30 +85,27 @@ pub fn field_representation(instr: &Instruction) -> [F; N_INSTRUCTION_COLUMNS] {
     fields
 }
 
-fn set_nu_a(fields: &mut [F; N_INSTRUCTION_COLUMNS], a: &MemOrConstant) {
-    match a {
+/// Pack a `nu` operand into its flag/operand column pair: a constant sets flag=1
+/// and stores the value; a memory reference sets flag=0 and stores the fp offset.
+fn set_nu_operand(fields: &mut [F; N_INSTRUCTION_COLUMNS], value: &MemOrConstant, flag_col: usize, operand_col: usize) {
+    match value {
         MemOrConstant::Constant(cst) => {
-            fields[instr_idx(EXEC_COL_FLAG_A)] = F::ONE;
-            fields[instr_idx(EXEC_COL_OPERAND_A)] = *cst;
+            fields[instr_idx(flag_col)] = F::ONE;
+            fields[instr_idx(operand_col)] = *cst;
         }
         MemOrConstant::MemoryAfterFp { offset } => {
-            fields[instr_idx(EXEC_COL_FLAG_A)] = F::ZERO;
-            fields[instr_idx(EXEC_COL_OPERAND_A)] = F::from_usize(*offset);
+            fields[instr_idx(flag_col)] = F::ZERO;
+            fields[instr_idx(operand_col)] = F::from_usize(*offset);
         }
     }
 }
 
+fn set_nu_a(fields: &mut [F; N_INSTRUCTION_COLUMNS], a: &MemOrConstant) {
+    set_nu_operand(fields, a, EXEC_COL_FLAG_A, EXEC_COL_OPERAND_A);
+}
+
 fn set_nu_b(fields: &mut [F; N_INSTRUCTION_COLUMNS], b: &MemOrConstant) {
-    match b {
-        MemOrConstant::Constant(cst) => {
-            fields[instr_idx(EXEC_COL_FLAG_B)] = F::ONE;
-            fields[instr_idx(EXEC_COL_OPERAND_B)] = *cst;
-        }
-        MemOrConstant::MemoryAfterFp { offset } => {
-            fields[instr_idx(EXEC_COL_FLAG_B)] = F::ZERO;
-            fields[instr_idx(EXEC_COL_OPERAND_B)] = F::from_usize(*offset);
-        }
-    }
+    set_nu_operand(fields, b, EXEC_COL_FLAG_B, EXEC_COL_OPERAND_B);
 }
 
 #[inline(always)]

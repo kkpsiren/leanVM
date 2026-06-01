@@ -17,16 +17,6 @@ pub struct Program {
     pub filepaths: BTreeMap<FileId, String>,
 }
 
-impl Program {
-    pub fn inlined_function_names(&self) -> BTreeSet<FunctionName> {
-        self.functions
-            .iter()
-            .filter(|(_, func)| func.inlined)
-            .map(|(name, _)| name.clone())
-            .collect()
-    }
-}
-
 /// A function argument with its modifiers
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct FunctionArg {
@@ -182,10 +172,6 @@ impl ConstExpression {
 
     pub const fn scalar(scalar: F) -> Self {
         Self::Value(ConstantValue::Scalar(scalar))
-    }
-
-    pub fn from_usize(value: usize) -> Self {
-        Self::Value(ConstantValue::Scalar(F::from_usize(value)))
     }
 
     pub const fn function_size(function_name: Label) -> Self {
@@ -428,8 +414,8 @@ impl Expression {
             Self::ArrayAccess { index, .. } => index.iter().collect(),
             Self::MathExpr(_, args) => args.iter().collect(),
             Self::FunctionCall { args, .. } => args.iter().collect(),
-            Self::Lambda { body, .. } => vec![body.as_ref()],
             Self::Len { indices, .. } => indices.iter().collect(),
+            Self::Lambda { body, .. } => vec![body.as_ref()],
             Self::HintWitness { ptr, .. } => vec![ptr.as_ref()],
         }
     }
@@ -718,12 +704,10 @@ impl Line {
                     .map(|line| line.to_string_with_indent(indent + 1))
                     .collect::<Vec<_>>()
                     .join("\n");
-                let range_fn = if loop_kind.is_unroll() {
-                    "unroll"
-                } else if loop_kind.is_parallel() {
-                    "parallel_range"
-                } else {
-                    "range"
+                let range_fn = match loop_kind {
+                    LoopKind::Range => "range",
+                    LoopKind::ParallelRange => "parallel_range",
+                    LoopKind::Unroll => "unroll",
                 };
                 format!(
                     "for {} in {}({}, {}) {{\n{}\n{}}}",

@@ -1,3 +1,4 @@
+use backend::PrimeCharacteristicRing;
 use lean_vm::F;
 use utils::ToUsize;
 
@@ -170,6 +171,14 @@ impl ParseContext {
     /// Looks up a scalar constant value.
     pub fn get_constant(&self, name: &str) -> Option<F> {
         self.constants.get(name).copied()
+    }
+
+    /// Resolves a textual token to a scalar `F`: a named constant if defined,
+    /// otherwise a numeric literal. Returns `None` if neither (the caller decides
+    /// the fallback).
+    pub fn resolve_scalar_text(&self, text: &str) -> Option<F> {
+        self.get_constant(text)
+            .or_else(|| text.parse::<usize>().ok().map(F::from_usize))
     }
 
     /// Looks up an array constant.

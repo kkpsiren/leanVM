@@ -6,7 +6,7 @@ use utils::ToUsize;
 #[derive(Default)]
 struct Compiler {
     bytecode: BTreeMap<Label, Vec<IntermediateInstruction>>,
-    match_blocks: Vec<MatchBlock>,
+    match_blocks: Vec<Vec<Vec<IntermediateInstruction>>>,
     if_counter: usize,
     call_counter: usize,
     match_counter: usize,
@@ -34,13 +34,17 @@ struct ScopeLayout {
 }
 
 impl Compiler {
+    /// Offset of `var` from fp, resolving to the innermost scope that binds it.
+    fn lookup_var_offset(&self, var: &Var) -> Option<usize> {
+        self.stack_frame_layout
+            .scopes
+            .iter()
+            .rev()
+            .find_map(|scope| scope.var_positions.get(var).copied())
+    }
+
     fn is_in_scope(&self, var: &Var) -> bool {
-        for scope in self.stack_frame_layout.scopes.iter() {
-            if let Some(_offset) = scope.var_positions.get(var) {
-                return true;
-            }
-        }
-        false
+        self.lookup_var_offset(var).is_some()
     }
 
     fn register_var_if_needed(&mut self, var: &Var) {
@@ -53,14 +57,10 @@ impl Compiler {
 
     fn get_offset(&self, var: &VarOrConstMallocAccess) -> ConstExpression {
         match var {
-            VarOrConstMallocAccess::Var(var) => {
-                for scope in self.stack_frame_layout.scopes.iter().rev() {
-                    if let Some(offset) = scope.var_positions.get(var) {
-                        return (*offset).into();
-                    }
-                }
-                panic!("Variable {var} not in scope");
-            }
+            VarOrConstMallocAccess::Var(var) => self
+                .lookup_var_offset(var)
+                .map(Into::into)
+                .unwrap_or_else(|| panic!("Variable {var} not in scope")),
             VarOrConstMallocAccess::ConstMallocAccess { malloc_label, offset } => {
                 let base = self.const_mallocs.get(malloc_label).unwrap_or_else(|| {
                     panic!("Const malloc {malloc_label} not in scope");
@@ -69,22 +69,30 @@ impl Compiler {
             }
         }
     }
+
+    /// Spill a compile-time constant into a fresh frame slot (`m[fp + off] = c`)
+    /// and return that slot's offset. Bumps `stack_pos` by one.
+    fn materialize_constant(
+        &mut self,
+        instructions: &mut Vec<IntermediateInstruction>,
+        c: ConstExpression,
+    ) -> ConstExpression {
+        let off: ConstExpression = self.stack_pos.into();
+        self.stack_pos += 1;
+        instructions.push(IntermediateInstruction::equality(
+            IntermediateValue::Constant(c),
+            IntermediateValue::MemoryAfterFp { offset: off.clone() },
+        ));
+        off
+    }
 }
 
 impl IntermediateValue {
     fn from_simple_expr(expr: &SimpleExpr, compiler: &Compiler) -> Self {
         match expr {
-            SimpleExpr::Memory(VarOrConstMallocAccess::Var(var)) => Self::MemoryAfterFp {
-                offset: compiler.get_offset(&var.clone().into()),
+            SimpleExpr::Memory(var_or_const) => Self::MemoryAfterFp {
+                offset: compiler.get_offset(var_or_const),
             },
-            SimpleExpr::Memory(VarOrConstMallocAccess::ConstMallocAccess { malloc_label, offset }) => {
-                Self::MemoryAfterFp {
-                    offset: compiler.get_offset(&VarOrConstMallocAccess::ConstMallocAccess {
-                        malloc_label: *malloc_label,
-                        offset: offset.clone(),
-                    }),
-                }
-            }
             SimpleExpr::Constant(c) => Self::Constant(c.clone()),
         }
     }
@@ -116,6 +124,15 @@ fn try_precompile_fp_relative(expr: &SimpleExpr, compiler: &Compiler) -> Option<
     } else {
         None
     }
+}
+
+/// Lower an operand that sinks into a precompile/hint: reject a negative derived
+/// fp-relative offset, then encode it as `fp + offset` when possible, else as a
+/// plain memory/constant value.
+fn lower_operand_fp_rel(expr: &SimpleExpr, compiler: &Compiler) -> Result<IntermediateValue, String> {
+    check_non_negative_fp_rel_sink(expr, compiler)?;
+    Ok(try_precompile_fp_relative(expr, compiler)
+        .unwrap_or_else(|| IntermediateValue::from_simple_expr(expr, compiler)))
 }
 
 /// Recognize an assignment whose right-hand side derives a new pointer from a base
@@ -319,9 +336,7 @@ fn compile_lines(
                     new_stack_pos = new_stack_pos.max(compiler.stack_pos);
                 }
                 compiler.stack_pos = new_stack_pos;
-                compiler.match_blocks.push(MatchBlock {
-                    match_cases: compiled_arms,
-                });
+                compiler.match_blocks.push(compiled_arms);
                 // Get the actual index AFTER pushing (nested matches may have pushed their blocks first)
                 let match_index = compiler.match_blocks.len() - 1;
 
@@ -561,21 +576,10 @@ fn compile_lines(
             SimpleLine::Precompile(precompile) => {
                 // if res is constant, create a variable (in memory) to hold it
                 let res = if let SimpleExpr::Constant(cst) = &precompile.res {
-                    instructions.push(IntermediateInstruction::Computation {
-                        operation: Operation::Add,
-                        arg_a: IntermediateValue::Constant(cst.clone()),
-                        arg_b: IntermediateValue::Constant(0.into()),
-                        res: IntermediateValue::MemoryAfterFp {
-                            offset: compiler.stack_pos.into(),
-                        },
-                    });
-                    let offset = compiler.stack_pos;
-                    compiler.stack_pos += 1;
-                    IntermediateValue::MemoryAfterFp { offset: offset.into() }
+                    let offset = compiler.materialize_constant(&mut instructions, cst.clone());
+                    IntermediateValue::MemoryAfterFp { offset }
                 } else {
-                    check_non_negative_fp_rel_sink(&precompile.res, compiler)?;
-                    try_precompile_fp_relative(&precompile.res, compiler)
-                        .unwrap_or_else(|| IntermediateValue::from_simple_expr(&precompile.res, compiler))
+                    lower_operand_fp_rel(&precompile.res, compiler)?
                 };
                 check_non_negative_fp_rel_sink(&precompile.arg_0, compiler)?;
                 check_non_negative_fp_rel_sink(&precompile.arg_1, compiler)?;
@@ -600,16 +604,8 @@ fn compile_lines(
             SimpleLine::FunctionRet { return_data } => {
                 if compiler.func_name == "main" {
                     // pc -> ending_pc, fp -> 0
-                    let zero_value_offset = IntermediateValue::MemoryAfterFp {
-                        offset: compiler.stack_pos.into(),
-                    };
-                    compiler.stack_pos += 1;
-                    instructions.push(IntermediateInstruction::Computation {
-                        operation: Operation::Add,
-                        arg_a: IntermediateValue::Constant(0.into()),
-                        arg_b: IntermediateValue::Constant(0.into()),
-                        res: zero_value_offset.clone(),
-                    });
+                    let offset = compiler.materialize_constant(&mut instructions, ConstExpression::zero());
+                    let zero_value_offset = IntermediateValue::MemoryAfterFp { offset };
                     instructions.push(IntermediateInstruction::Jump {
                         dest: IntermediateValue::label(Label::EndProgram),
                         updated_fp: Some(zero_value_offset),
@@ -638,11 +634,7 @@ fn compile_lines(
             SimpleLine::CustomHint(hint, args) => {
                 let simplified_args = args
                     .iter()
-                    .map(|expr| {
-                        check_non_negative_fp_rel_sink(expr, compiler)?;
-                        Ok(try_precompile_fp_relative(expr, compiler)
-                            .unwrap_or_else(|| IntermediateValue::from_simple_expr(expr, compiler)))
-                    })
+                    .map(|expr| lower_operand_fp_rel(expr, compiler))
                     .collect::<Result<Vec<_>, String>>()?;
                 instructions.push(IntermediateInstruction::CustomHint(*hint, simplified_args));
             }
@@ -719,28 +711,18 @@ fn compile_lines(
                 // Get the offset of the value being range-checked
                 let val_offset = match val {
                     SimpleExpr::Memory(var_or_const) => compiler.get_offset(var_or_const),
+                    // For constants, we need to store in a temp variable first.
                     SimpleExpr::Constant(val_const) => {
-                        // For constants, we need to store in a temp variable first
-                        let temp_offset = compiler.stack_pos;
-                        compiler.stack_pos += 1;
-                        instructions.push(IntermediateInstruction::Computation {
-                            operation: Operation::Add,
-                            arg_a: IntermediateValue::Constant(val_const.clone()),
-                            arg_b: IntermediateValue::Constant(ConstExpression::zero()),
-                            res: IntermediateValue::MemoryAfterFp {
-                                offset: ConstExpression::from_usize(temp_offset),
-                            },
-                        });
-                        ConstExpression::from_usize(temp_offset)
+                        compiler.materialize_constant(&mut instructions, val_const.clone())
                     }
                 };
 
                 // Allocate 3 auxiliary cells
-                let aux1_offset = ConstExpression::from_usize(compiler.stack_pos);
+                let aux1_offset: ConstExpression = compiler.stack_pos.into();
                 compiler.stack_pos += 1;
-                let aux2_offset = ConstExpression::from_usize(compiler.stack_pos);
+                let aux2_offset: ConstExpression = compiler.stack_pos.into();
                 compiler.stack_pos += 1;
-                let aux3_offset = ConstExpression::from_usize(compiler.stack_pos);
+                let aux3_offset: ConstExpression = compiler.stack_pos.into();
                 compiler.stack_pos += 1;
 
                 // DerefHint for first DEREF: memory[aux1] = memory[memory[val_offset]]
