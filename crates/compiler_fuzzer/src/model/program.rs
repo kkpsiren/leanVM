@@ -27,7 +27,8 @@ impl CheckedProgram {
         Self { gadgets }
     }
 
-    /// Emit the full zkDSL source.
+    /// Emit the full zkDSL source: `main()` followed by any helper functions the gadgets need
+    /// (deduplicated, in first-use order).
     #[must_use]
     pub fn emit_source(&self) -> String {
         let mut e = Emitter::new();
@@ -40,7 +41,19 @@ impl CheckedProgram {
             }
             e.line("return");
         });
-        e.finish()
+        let mut source = e.finish();
+
+        let mut seen: Vec<&str> = Vec::new();
+        for g in &self.gadgets {
+            for (name, def) in g.helpers() {
+                if !seen.contains(name) {
+                    seen.push(name);
+                    source.push('\n');
+                    source.push_str(def);
+                }
+            }
+        }
+        source
     }
 
     /// One honest buffer per gadget (in consumption order).

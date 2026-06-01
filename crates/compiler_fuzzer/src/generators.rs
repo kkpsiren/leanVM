@@ -51,29 +51,48 @@ pub fn gen_program(rng: &mut Rng, cfg: &GenConfig) -> CheckedProgram {
     CheckedProgram::new(gadgets)
 }
 
-/// Generate a single gadget with a given id.
+/// Generate a single gadget with a given id, spanning all kinds (and thus all of the compiler's
+/// harder lowering paths).
 #[must_use]
 pub fn gen_gadget(rng: &mut Rng, cfg: &GenConfig, id: usize) -> Gadget {
-    // 6 kinds, weighted slightly toward the equality family (the fusion-pass targets).
-    let (kind, comp) = match rng.below(8) {
-        0 | 1 => (GadgetKind::EqBound, gen_computation(rng, cfg)),
-        2 => (
+    let range_bound = |rng: &mut Rng| 2 + rng.next_u64() % (crate::model::RANGE_MAX - 1);
+    // A loop length kept small so range→recursion stays cheap.
+    let loop_len = |rng: &mut Rng| Computation::identity(rng.range(1, 4));
+
+    let (kind, comp) = match rng.below(12) {
+        0 => (GadgetKind::EqBound, gen_computation(rng, cfg)),
+        1 => (
             GadgetKind::EqConst {
                 c: rng.next_u64() % cfg.max_eq_const,
             },
             gen_computation(rng, cfg),
         ),
-        3 | 4 => (GadgetKind::Ne, gen_computation(rng, cfg)),
-        5 => (GadgetKind::Bool, Computation::identity(1)),
-        6 => (
+        2 => (GadgetKind::Ne, gen_computation(rng, cfg)),
+        3 => (GadgetKind::Bool, Computation::identity(1)),
+        4 => (
             GadgetKind::RangeLt {
-                bound: 2 + rng.next_u64() % (crate::model::RANGE_MAX - 1),
+                bound: range_bound(rng),
             },
             Computation::identity(1),
         ),
-        _ => (
+        5 => (
             GadgetKind::RangeLe {
-                bound: 2 + rng.next_u64() % (crate::model::RANGE_MAX - 1),
+                bound: range_bound(rng),
+            },
+            Computation::identity(1),
+        ),
+        6 => (GadgetKind::IfThen, gen_computation(rng, cfg)),
+        7 => (GadgetKind::Loop, loop_len(rng)),
+        8 => (
+            GadgetKind::MatchDispatch {
+                m: rng.range(2, 8) as u64,
+            },
+            Computation::identity(1),
+        ),
+        9 => (GadgetKind::InlineWrapped, gen_computation(rng, cfg)),
+        _ => (
+            GadgetKind::HintDiv {
+                d: rng.range(2, 64) as u64,
             },
             Computation::identity(1),
         ),

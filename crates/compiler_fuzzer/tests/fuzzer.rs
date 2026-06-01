@@ -139,6 +139,84 @@ fn subprocess_classifies_clean_outcomes() {
     );
 }
 
+/// The generator must actually emit every hard lowering construct over a modest seed range —
+/// otherwise "0 findings" could just mean a construct is never generated.
+#[test]
+fn generator_covers_hard_constructs() {
+    let mut all = String::new();
+    let cfg = GenConfig::default();
+    for seed in 0..200u64 {
+        all.push_str(&gen_program(&mut Rng::new(seed), &cfg).emit_source());
+    }
+    for needle in [
+        "match_range(",    // match expansion
+        "for g",           // range loop
+        "fz_id(",          // @inline expansion
+        "hint_div_floor(", // custom hint + constrain
+        "!=",              // inequality
+        " < ",             // range check
+        "if g",            // control flow
+    ] {
+        assert!(all.contains(needle), "generator never emitted `{needle}`");
+    }
+}
+
+/// Each of the harder-lowering gadget kinds must compile, accept its honest witness, and reject
+/// each single-gadget violation — independently and in isolation.
+#[test]
+fn hard_kinds_isolate() {
+    let gadgets = vec![
+        Gadget {
+            id: 0,
+            kind: GadgetKind::IfThen,
+            comp: Computation::identity(2),
+        },
+        Gadget {
+            id: 1,
+            kind: GadgetKind::Loop,
+            comp: Computation::identity(3),
+        },
+        Gadget {
+            id: 2,
+            kind: GadgetKind::MatchDispatch { m: 5 },
+            comp: Computation::identity(1),
+        },
+        Gadget {
+            id: 3,
+            kind: GadgetKind::InlineWrapped,
+            comp: Computation::identity(2),
+        },
+        Gadget {
+            id: 4,
+            kind: GadgetKind::HintDiv { d: 7 },
+            comp: Computation::identity(1),
+        },
+    ];
+    let prog = CheckedProgram::new(gadgets);
+    let bc = match compile_source(&prog.emit_source()) {
+        CompileOutcome::Ok(bc) => bc,
+        other => panic!(
+            "hard-kinds program failed to compile: {other:?}\n{}",
+            prog.emit_source()
+        ),
+    };
+    let mut rng = Rng::new(3);
+    let honest = prog.honest_buffers(&mut rng);
+    let input = zero_public_input();
+    assert!(
+        matches!(run(&bc, &input, &CheckedProgram::witness(&honest)), RunOutcome::Ok(_)),
+        "honest witness must pass for the hard-kinds program"
+    );
+    for i in 0..prog.gadgets.len() {
+        let bufs = prog.violating_buffers(&honest, i);
+        assert!(
+            !matches!(run(&bc, &input, &CheckedProgram::witness(&bufs)), RunOutcome::Ok(_)),
+            "violation for {} was accepted",
+            prog.gadgets[i].label()
+        );
+    }
+}
+
 /// Bounded baseline: the real compiler must produce no Critical/High findings over a fixed seed
 /// range. This is the regression guard that runs as part of the suite.
 #[test]
