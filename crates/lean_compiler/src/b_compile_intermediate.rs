@@ -118,6 +118,34 @@ fn try_precompile_fp_relative(expr: &SimpleExpr, compiler: &Compiler) -> Option<
     }
 }
 
+/// Recognize an assignment whose right-hand side derives a new pointer from a base
+/// variable: `base + c`, `c + base`, or `base - c` (with `c` a compile-time
+/// constant). Returns the base variable and the signed offset delta, or `None` if
+/// the RHS is not of that shape.
+///
+/// A single source of truth for "is this a derived fp-relative pointer", used both
+/// while laying out the frame (to track concrete offsets in `const_malloc_vars`) and
+/// during dead-variable analysis (to discover fp-relative-capable variables).
+fn derived_fp_pointer<'a>(op: MathOperation, arg0: &'a SimpleExpr, arg1: &'a SimpleExpr) -> Option<(&'a Var, isize)> {
+    let as_var = |e: &'a SimpleExpr| match e {
+        SimpleExpr::Memory(VarOrConstMallocAccess::Var(v)) => Some(v),
+        _ => None,
+    };
+    let as_const = |e: &SimpleExpr| match e {
+        SimpleExpr::Constant(c) => c.naive_eval().map(|f| f.to_usize() as isize),
+        _ => None,
+    };
+    match op {
+        // Addition is commutative: `base + c` or `c + base`.
+        MathOperation::Add => as_var(arg0)
+            .zip(as_const(arg1))
+            .or_else(|| as_var(arg1).zip(as_const(arg0))),
+        // Subtraction only as `base - c`.
+        MathOperation::Sub => as_var(arg0).zip(as_const(arg1)).map(|(x, d)| (x, -d)),
+        _ => None,
+    }
+}
+
 pub fn compile_to_intermediate_bytecode(simple_program: SimpleProgram) -> Result<IntermediateBytecode, String> {
     let mut compiler = Compiler::default();
     let mut memory_sizes = BTreeMap::new();
@@ -195,6 +223,23 @@ fn compile_function(
     Ok(instructions)
 }
 
+/// Lower a sequence of `SimpleLine`s into intermediate instructions, allocating
+/// each variable a slot in the current stack frame the first time it is seen.
+///
+/// Control flow is lowered in continuation-passing style. The VM has no structured
+/// control flow — only jumps between program-counter addresses — so every construct
+/// that branches (`IfNotZero`, `Match`, and function calls) splits the function into
+/// labeled blocks: the construct emits its jump(s), and *everything after it in
+/// `lines`* is compiled into a fresh block, stored under a new label in
+/// `compiler.bytecode` and reached via those jumps. `final_jump` is the label such a
+/// continuation block should jump to once it falls off its end (e.g. the `end` label
+/// shared by an if/else). This is why those arms recurse on `lines[i + 1..]` and then
+/// `return` early instead of continuing the loop: the rest of the block lives in the
+/// continuation, so a function body becomes a tree of labeled blocks.
+///
+/// `compiler.stack_pos` is the next free frame offset; `compiler.stack_size` is the
+/// high-water mark across every block (the frame must fit all paths). Both live on
+/// `compiler` so sibling blocks agree on one layout.
 fn compile_lines(
     lines: &[SimpleLine],
     compiler: &mut Compiler,
@@ -222,38 +267,11 @@ fn compile_lines(
                 // then the result is also fp-relative (e.g. `ptr = arr + 8` or `ptr = arr - 1`)
                 let mut is_dead_derived = false;
                 if let Some(v) = var.as_var()
-                    && (*op == MathOperation::Add || *op == MathOperation::Sub)
+                    && let Some((base, delta)) = derived_fp_pointer(*op, arg0, arg1)
+                    && let Some(base_offset) = compiler.const_malloc_vars.get(base).copied()
                 {
-                    let fp_offset = match (op, arg0, arg1) {
-                        // Add: commutative, either order
-                        (
-                            MathOperation::Add,
-                            SimpleExpr::Memory(VarOrConstMallocAccess::Var(x)),
-                            SimpleExpr::Constant(c),
-                        )
-                        | (
-                            MathOperation::Add,
-                            SimpleExpr::Constant(c),
-                            SimpleExpr::Memory(VarOrConstMallocAccess::Var(x)),
-                        ) => compiler
-                            .const_malloc_vars
-                            .get(x)
-                            .and_then(|&base| c.naive_eval().map(|f| base + f.to_usize() as isize)),
-                        // Sub: only var - constant
-                        (
-                            MathOperation::Sub,
-                            SimpleExpr::Memory(VarOrConstMallocAccess::Var(x)),
-                            SimpleExpr::Constant(c),
-                        ) => compiler
-                            .const_malloc_vars
-                            .get(x)
-                            .and_then(|&base| c.naive_eval().map(|f| base - f.to_usize() as isize)),
-                        _ => None,
-                    };
-                    if let Some(offset) = fp_offset {
-                        compiler.const_malloc_vars.insert(v.clone(), offset);
-                        is_dead_derived = compiler.dead_fp_relative_vars.contains(v);
-                    }
+                    compiler.const_malloc_vars.insert(v.clone(), base_offset + delta);
+                    is_dead_derived = compiler.dead_fp_relative_vars.contains(v);
                 }
 
                 if is_dead_derived {
@@ -997,28 +1015,12 @@ fn collect_fp_rel_capable(
                 op,
                 arg0,
                 arg1,
-            } if *op == MathOperation::Add || *op == MathOperation::Sub => {
-                let base_var = match (op, arg0, arg1) {
-                    (
-                        MathOperation::Add,
-                        SimpleExpr::Memory(VarOrConstMallocAccess::Var(x)),
-                        SimpleExpr::Constant(c),
-                    )
-                    | (
-                        MathOperation::Add,
-                        SimpleExpr::Constant(c),
-                        SimpleExpr::Memory(VarOrConstMallocAccess::Var(x)),
-                    ) if fp_rel_capable.contains(x) && c.naive_eval().is_some() => Some(x.clone()),
-                    (
-                        MathOperation::Sub,
-                        SimpleExpr::Memory(VarOrConstMallocAccess::Var(x)),
-                        SimpleExpr::Constant(c),
-                    ) if fp_rel_capable.contains(x) && c.naive_eval().is_some() => Some(x.clone()),
-                    _ => None,
-                };
-                if let Some(base) = base_var {
+            } => {
+                if let Some((base, _delta)) = derived_fp_pointer(*op, arg0, arg1)
+                    && fp_rel_capable.contains(base)
+                {
                     fp_rel_capable.insert(v.clone());
-                    derived_base.insert(v.clone(), base);
+                    derived_base.insert(v.clone(), base.clone());
                 }
             }
             _ => {}
