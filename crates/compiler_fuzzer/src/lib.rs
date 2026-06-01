@@ -20,20 +20,24 @@
 //!
 //! ## Techniques
 //!
-//! - **No-panic fuzzing** ([`oracles::no_panic`]): generate / mutate programs and assert the
-//!   compiler returns a `Result`, never unwinds.
-//! - **Check-enforcement / metamorphic soundness** ([`oracles::check_enforced`]): the core
+//! - **Check-enforcement (differential soundness)** ([`oracles::check_enforced`]): the core
 //!   technique. Generate programs built from *independent* check gadgets; run the honest
 //!   witness (must pass) and, for each check, a witness that violates *only that check*
-//!   (must be rejected with the error variant matching the check's kind). Failures isolate
-//!   to a single check, avoiding false positives.
-//! - **Reference-model differential** ([`oracles::honest_runs`]): the generator is also a
-//!   reference interpreter; the VM's observable results must match.
-//! - **Metamorphic transforms** ([`oracles::metamorphic`]): semantics-preserving rewrites
-//!   (rename, reorder, inline↔call, unroll↔range, wrap) must preserve pass/fail behaviour.
-//! - **Bytecode-structural survival** ([`oracles::structural`]): count the recognizable
-//!   lowerings (`Hint::DerefHint`, `Hint::Panic`, `Hint::DebugAssert`, the `0 * fp == 1`
-//!   panic computation) that must appear for each emitted check.
+//!   (must be rejected). Failures isolate to a single check, avoiding false positives. The
+//!   generator doubles as a canonical-integer reference interpreter, so witnesses pass/fail
+//!   by construction.
+//! - **Bytecode-structural survival** ([`oracles::structural`]): a range-check constraint can
+//!   be dropped behind a surviving prover-side `debug_assert` companion (invisible to the
+//!   runtime oracle). Require exactly `2 * n_range` `Hint::DerefHint`s and one companion per
+//!   `<` / `<=`.
+//! - **Structural-diff** ([`oracles::structural_diff`]): removing any emitted `assert` line
+//!   must change the bytecode hash; needs no witness, so it covers checks no witness can
+//!   violate (e.g. `hint_div_floor`'s always-true `q*D + r == a`).
+//! - **No-crash probes** ([`probes`] + [`subprocess`]): panics / aborts / OOM / hangs / stack
+//!   overflows, by compiling edge-case programs (and programmatic recursion/size stressors) in a
+//!   bounded child process.
+//! - **Metamorphic transforms** ([`transforms`]): semantics-preserving reorder / duplicate of
+//!   independent gadgets must preserve pass/fail behaviour.
 //!
 //! Every run is driven by a 64-bit seed, so any finding reproduces exactly. See
 //! [`campaign`] for the driver and [`triage`] for finding serialization.

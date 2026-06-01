@@ -7,6 +7,9 @@
 //! simplification of *checks*, not to exercise field pathologies (those have dedicated
 //! generators).
 
+use crate::field_util::{
+    ExtMode, ExtOp, add_mod, div_ceil_int, div_floor_int, log2_ceil_int, mul_mod, next_multiple_int, pow_mod, sub_mod,
+};
 use crate::model::{CheckedProgram, Computation, Gadget, GadgetKind, Op, Operand, Step};
 use crate::rng::Rng;
 
@@ -58,8 +61,17 @@ pub fn gen_gadget(rng: &mut Rng, cfg: &GenConfig, id: usize) -> Gadget {
     let range_bound = |rng: &mut Rng| 2 + rng.next_u64() % (crate::model::RANGE_MAX - 1);
     // A loop length kept small so range→recursion stays cheap.
     let loop_len = |rng: &mut Rng| Computation::identity(rng.range(1, 4));
+    let ext_op = |rng: &mut Rng| {
+        let op = *rng.choice(&[ExtOp::Add, ExtOp::Dot, ExtOp::PolyEq]);
+        let mode = *rng.choice(&[ExtMode::Ee, ExtMode::Be]);
+        GadgetKind::ExtOp {
+            op,
+            mode,
+            n: rng.range(1, 3),
+        }
+    };
 
-    let (kind, comp) = match rng.below(18) {
+    let (kind, comp) = match rng.below(28) {
         0 => (GadgetKind::EqBound, gen_computation(rng, cfg)),
         1 => (
             GadgetKind::EqConst {
@@ -104,13 +116,99 @@ pub fn gen_gadget(rng: &mut Rng, cfg: &GenConfig, id: usize) -> Gadget {
             GadgetKind::RunningChain { len: rng.range(2, 6) },
             Computation::identity(1),
         ),
-        15 => (GadgetKind::ExtMulEq, Computation::identity(1)),
-        _ => (
+        15 => (ext_op(rng), Computation::identity(1)),
+        16 => (
             GadgetKind::NestedIfLoop { n: rng.range(2, 5) },
             Computation::identity(1),
         ),
+        // The canonical hint-then-constrain decomposition (boolean + reconstruction).
+        17 => (GadgetKind::BitDecomp { n: rng.range(2, 12) }, Computation::identity(1)),
+        18 => (GadgetKind::Panic, Computation::identity(1)),
+        19 => (
+            GadgetKind::DebugAssertLt {
+                bound: range_bound(rng),
+            },
+            Computation::identity(1),
+        ),
+        20 => (GadgetKind::IfElse, gen_computation(rng, cfg)),
+        21 => (GadgetKind::CompoundAssign, Computation::identity(1)),
+        22 => (GadgetKind::Div, Computation::identity(1)),
+        23 => (GadgetKind::MultiReturn, Computation::identity(1)),
+        24 => (GadgetKind::PointerOffset, Computation::identity(1)),
+        25 => (
+            GadgetKind::ParallelLoop { n: rng.range(2, 5) },
+            Computation::identity(1),
+        ),
+        26 => (GadgetKind::ForwardDeclEq, Computation::identity(1)),
+        _ => {
+            let (src, value) = gen_const_fold(rng);
+            (GadgetKind::ConstFold { src, value }, Computation::identity(1))
+        }
     };
     Gadget { id, kind, comp }
+}
+
+/// Generate a compile-time constant expression mixing every const built-in, paired with an
+/// *independent* reference value (computed here, never via the compiler). The emitted expression
+/// is fully parenthesized so its left-to-right evaluation matches the fold below regardless of the
+/// parser's precedence. A miscompiled constant fold makes `assert v == <expr>` reject the honest
+/// witness (`v == reference`).
+#[must_use]
+pub fn gen_const_fold(rng: &mut Rng) -> (String, u64) {
+    // A single term: (source, reference value in [0, P)).
+    fn term(rng: &mut Rng) -> (String, u64) {
+        match rng.below(7) {
+            0 => {
+                let base = 2 + rng.below(2) as u64; // 2 or 3
+                let exp = rng.range(1, 30) as u64;
+                (format!("{base} ** {exp}"), pow_mod(base, exp))
+            }
+            1 => {
+                let a = rng.next_u64() % 100_000;
+                let b = 1 + rng.next_u64() % 1000;
+                (format!("div_floor({a}, {b})"), div_floor_int(a, b))
+            }
+            2 => {
+                let a = rng.next_u64() % 100_000;
+                let b = 1 + rng.next_u64() % 1000;
+                (format!("div_ceil({a}, {b})"), div_ceil_int(a, b))
+            }
+            3 => {
+                let a = rng.next_u64() % 100_000;
+                let b = rng.next_u64() % 100_000;
+                (format!("saturating_sub({a}, {b})"), a.saturating_sub(b))
+            }
+            4 => {
+                let a = rng.next_u64() % 10_000;
+                let b = 1 + rng.next_u64() % 1000;
+                (format!("next_multiple_of({a}, {b})"), next_multiple_int(a, b))
+            }
+            5 => {
+                let a = 2 + rng.next_u64() % 65_534;
+                (format!("log2_ceil({a})"), log2_ceil_int(a))
+            }
+            _ => {
+                let a = rng.next_u64() % 100_000;
+                let b = 1 + rng.next_u64() % 1000;
+                (format!("{a} % {b}"), a % b)
+            }
+        }
+    }
+
+    let (mut src, mut val) = term(rng);
+    src = format!("({src})");
+    let n_more = rng.range(1, 3);
+    for _ in 0..n_more {
+        let (ts, tv) = term(rng);
+        let (sym, nv) = match rng.below(3) {
+            0 => ("+", add_mod(val, tv)),
+            1 => ("-", sub_mod(val, tv)),
+            _ => ("*", mul_mod(val, tv)),
+        };
+        src = format!("({src} {sym} ({ts}))");
+        val = nv;
+    }
+    (src, val)
 }
 
 /// Generate a random straight-line computation with at least one input.

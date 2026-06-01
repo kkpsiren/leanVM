@@ -61,8 +61,12 @@ pub fn expected_range_checks(prog: &CheckedProgram) -> usize {
         .count()
 }
 
-/// Evaluate the structural property: at least one inequality companion per range check must
-/// survive, and if there are range checks there must be deref hints.
+/// Evaluate the structural property. Each `<` / `<=` must leave behind exactly one inequality
+/// companion (`DebugAssert { preceds_runtime_inequality: true }`) **and** exactly two `DerefHint`s
+/// (the actual range-check constraint). The deref count is the important one: the companion fires
+/// *first* at runtime, so dropping the derefs alone is invisible to the runtime oracle — a witness
+/// with an out-of-range value would be rejected by the surviving companion even though the real
+/// constraint is gone. Counting the derefs closes that blind spot.
 #[must_use]
 pub fn evaluate(prog: &CheckedProgram, bc: &Bytecode, seed: u64, source: &str) -> Vec<Finding> {
     let mut findings = Vec::new();
@@ -80,11 +84,19 @@ pub fn evaluate(prog: &CheckedProgram, bc: &Bytecode, seed: u64, source: &str) -
             source,
         ));
     }
-    if n_range > 0 && counts.deref_hints == 0 {
+    // Every range check is exactly two DerefHints (`val` and `bound-1-val`); since DerefHints are
+    // emitted *only* by range checks, fewer than `2 * n_range` means a range constraint was
+    // silently dropped while its prover-side `debug_assert` companion survived (a soundness hole).
+    if counts.deref_hints < 2 * n_range {
         findings.push(Finding::new(
             FindingKind::MissingLowering,
             seed,
-            format!("{n_range} range checks in source but no DerefHints in bytecode"),
+            format!(
+                "expected {} range-check DerefHints ({n_range} checks x2), found {} — a range-check \
+                 constraint was dropped (its debug_assert companion may still mask it at runtime)",
+                2 * n_range,
+                counts.deref_hints
+            ),
             source,
         ));
     }

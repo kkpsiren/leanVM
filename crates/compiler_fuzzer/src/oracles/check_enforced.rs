@@ -11,6 +11,15 @@
 //! gadget perturbation is attributable to that gadget. The error *variant* is checked against
 //! the gadget's kind for diagnostics; an inconsistent variant is reported as `Info` (a possible
 //! non-isolated perturbation), never as a confirmed drop.
+//!
+//! **Soundness of the signal.** "Violating witness accepted ⇒ dropped check" holds only when the
+//! perturbation keeps every operand of the check *constrained* and merely changes a value the
+//! check should reject. A perturbation that instead makes an operand *unconstrained* (e.g. by
+//! changing control flow so a `: Imm` cell is never assigned and becomes a free, prover-filled
+//! witness) yields a legitimately-satisfiable assert — that is **not** a dropped check (the
+//! `assert` is still emitted), so gadgets must never perturb that way. The compile-time
+//! [`super::structural_diff`] oracle is the witness-free ground truth for "the `assert` emitted
+//! instructions".
 
 use lean_vm::Bytecode;
 

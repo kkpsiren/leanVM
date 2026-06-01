@@ -100,8 +100,11 @@ pub fn run_campaign(cfg: &CampaignConfig) -> CampaignReport {
             let mut vrng = Rng::new(seed ^ 0x5EED_BEEF_5EED_BEEF);
             let reordered = transforms::reorder(&prog, &mut vrng);
             findings.extend(oracles::evaluate(&reordered, &mut vrng, seed, false));
+            // The duplicate variant places two structurally identical gadgets adjacent — exactly
+            // where CSE / assert-fusion could collapse the second copy's checks — so it earns the
+            // (more expensive) structural-diff pass too.
             let duplicated = transforms::duplicate(&prog);
-            findings.extend(oracles::evaluate(&duplicated, &mut vrng, seed, false));
+            findings.extend(oracles::evaluate(&duplicated, &mut vrng, seed, cfg.structural_diff));
         }
 
         let mut hit_critical = false;

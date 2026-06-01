@@ -1,21 +1,89 @@
 # Findings
 
 Compiler bugs surfaced by `compiler_fuzzer`. Each is a *parseable* program that the compiler
-must handle gracefully (compile, or reject with a clean `CompileError`) but did not.
+must handle gracefully (compile, or reject with a clean `CompileError`) but did not — or, worse,
+a program whose verifier-enforced check the compiler silently drops.
 
-> **Status: all crashes below are FIXED** (merged into `main` as
-> `zkDSL compiler: various consolidations`; this branch has the fix via the `main` merge).
-> `--probes` now reports `0 / N crashed`, and the regression cases live in
-> `crates/lean_compiler/tests/test_data/error_93..98.py`.
-
-```bash
-cargo run --release -p compiler_fuzzer -- --probes   # 0 crashes after the fix
-```
-
-The check-enforcement campaign (goal #2) has found **no dropped checks** across 90k+ generated
-programs spanning every gadget kind and the metamorphic variants.
+All measurements below were taken with the **release** build of the compiler (`cargo run
+--release` / the release `compiler_fuzz` binary); the fuzzer always compiles in release. Debug
+frame sizes would only change the deep-recursion threshold, not the soundness result.
 
 ---
+
+## OPEN — robustness/DoS: deeply nested expression overflows the compiler stack
+
+```python
+from snark_lib import *
+def main():
+    x = ((((( … ~3000 deep … 1 … )))))
+    return
+```
+
+**Symptom (release):** a parenthesized-expression nesting depth of ~3000 aborts the compiler with
+`thread 'main' has overflowed its stack` (SIGABRT). Depth 2000 compiles; depth 3000 crashes; the
+`deep_nested_parens` probe uses 6000 to be safely past the threshold on any stack size. The
+parser/simplifier recurse per nesting level with no depth guard. (The other size stressors —
+40k-term fold chains, 1500 nested `if`s, 3000-deep array literals, 3000-deep call chains, 40k
+sequential statements — all compile or reject cleanly.)
+
+**Detected by:** the `deep_nested_parens` dynamic stressor in `probes::dynamic_stressors`
+(`--probes`).
+
+**Recommended fix:** a recursion/nesting-depth limit in the parser (and the simplifier's
+expression walk) that rejects with a clean `CompileError` instead of overflowing.
+
+---
+
+## Reproducing
+
+```bash
+# The crash probes (reports the deep-nesting stack overflow):
+cargo run --release -p compiler_fuzzer -- --probes
+```
+
+---
+
+# Considered and rejected — *not* bugs (by design)
+
+## Reading an unassigned `: Imm` is a free witness cell, not a dropped check
+
+```python
+def main():
+    pub = 0
+    x: Imm
+    if pub[0] != 0:
+        x = 42
+    assert x == 7        # accepted when the branch is skipped
+    return
+```
+
+When the branch is skipped, `x` is never written, and `assert x == 7` lowers to a write-once
+*write* of that cell (`x := 7`) rather than disappearing — so the program runs and the assert is
+satisfiable for any value. This is **intended language semantics**: an unwritten cell is a free,
+prover-filled witness (exactly like a `hint_*` cell), and constraining it is the program's
+responsibility — the same stance the language takes for `match` range-validity. The verifier is
+*not* fooled into accepting a false statement about the trace; the assert simply constrains a free
+variable.
+
+The genuine soundness property — and what the fuzzer actually checks — is that **an emitted
+`assert` must produce instructions in the final bytecode** (it must not be optimized away). That is
+covered by the structural-diff oracle (removing an `assert` line must change the bytecode) and the
+runtime oracle on gadgets whose violating witness perturbs a *constrained* value. A "violation"
+that instead frees a cell (changing control flow so the operand becomes unconstrained) is **not** a
+dropped check, so the fuzzer's gadgets never do that.
+
+> An earlier audit flagged the pattern above as a critical bug; on review it is by-design behavior.
+> The fuzzer's `ForwardDeclEq` gadget therefore exercises the *valid* shape (a `: Imm` assigned on
+> **both** branches, with the assert genuinely constraining it).
+
+---
+
+# History — crashes fixed in `main`
+
+The crashes below were surfaced by earlier `--probes` runs and are **FIXED** (merged into `main`
+as `zkDSL compiler: various consolidations`; regression cases live in
+`crates/lean_compiler/tests/test_data/error_93..98.py`). They remain in the probe corpus as
+regression guards.
 
 ## 1. `unroll` with a huge bound hangs the compiler
 
@@ -29,9 +97,6 @@ def main():
 
 **Symptom:** the compiler does not return within 10s (it attempts to materialize ~10¹¹ unrolled
 iterations). Wall-clock hang / unbounded memory.
-**Suspected site:** the unroll expansion (`a_simplify_lang/mod.rs`, the `start..end` /
-`to_usize()` loop). A bound check (e.g. a cap on total unrolled iterations) would turn this into
-a clean error.
 **Fixed:** `MAX_UNROLL_ITERATIONS` cap in `a_simplify_lang/mod.rs` (reversed `start>end` stays a valid empty no-op).
 
 ## 2. `match_range` over an empty range panics
@@ -44,9 +109,7 @@ def main():
     return
 ```
 
-**Symptom:** `called `Option::unwrap()` on a `None` value` at
-`crates/lean_compiler/src/c_compile_final.rs:87`.
-A degenerate/empty `match_range` should be a clean compile error.
+**Symptom:** `called `Option::unwrap()` on a `None` value` at `c_compile_final.rs:87`.
 **Fixed:** `.max()` now `ok_or_else(...)?` in `c_compile_final.rs` → clean error.
 
 ## 3. Out-of-bounds compile-time array index panics
@@ -59,16 +122,5 @@ def main():
     return
 ```
 
-**Symptom:** `Variable A not in scope` (an `unwrap`/`expect`) at
-`crates/lean_compiler/src/b_compile_intermediate.rs:62`. A constant index past the end of a
-constant array should be a clean compile error, with a message about the index, not a panic
-about the variable being out of scope.
-**Fixed:** the assignment arm now routes const-array reads to `simplify_expr` (bounds-checked), and a target guard rejects const-array *writes*.
-
----
-
-### Note
-
-The understanding pass suspected `len(<scalar>)` would panic; it does **not** (it compiles), so
-that probe is retained only as a regression guard. New crash corners should be added to
-`probes::PROBES`.
+**Symptom:** `Variable A not in scope` (an `unwrap`/`expect`) at `b_compile_intermediate.rs:62`.
+**Fixed:** const-array reads now route through bounds-checked `simplify_expr`; const-array *writes* are rejected by a target guard.
