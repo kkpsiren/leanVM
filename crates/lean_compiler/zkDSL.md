@@ -334,6 +334,13 @@ Restrictions shared by all three forms:
 
 - No `break` or `continue` (not in the grammar).
 
+**Empty / reversed bounds (`start >= end`).** The two loop kinds behave differently:
+
+- `unroll(start, end)` with `start >= end` expands to **nothing** (zero iterations).
+- `range(start, end)` / `parallel_range(start, end)` count up until the counter *equals*
+  `end`, so `start > end` wraps around modulo `p` and may run up to ≈ `p` steps.
+  A runtime `range` must always have `start <= end`.
+
 #### `range(a, b)`: runtime loop
 
 The general-purpose runtime loop. `a` and `b` may be runtime values. The
