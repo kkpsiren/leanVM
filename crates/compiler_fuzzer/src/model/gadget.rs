@@ -101,10 +101,11 @@ pub enum GadgetKind {
     /// (value, expected) pairs. Stresses assert survival through if-in-loop nesting and
     /// loop→recursion. `n` independent violations.
     NestedIfLoop { n: usize },
-    /// Two independent mutables carried across an `outer`×`inner` nested `range` loop, each
-    /// accumulating a per-iteration buffer value, with a post-loop checkpoint per mutable. Stresses
-    /// the simplifier's loop-carried-mutable buffer rewriting under *nesting* (the single-level
-    /// `Loop` gadget never reaches this). Two independent violations (one per mutable).
+    /// Two array chains accumulated across an `outer`×`inner` nested `range` loop (indexed by the
+    /// flattened `i*inner + j`), each reading the previous iteration's cell and checked after the
+    /// loop. Stresses cross-iteration array data-dependencies through nested loop→recursion — the
+    /// buffer-based replacement for loop-carried mutables, which the compiler now forbids. Two
+    /// independent violations (one per chain).
     NestedMutLoop { outer: usize, inner: usize },
     /// `n` prover-supplied bits, each constrained boolean (`b*(b-1)==0`) and reconstructed
     /// (`acc = acc*2 + b`), with a final `assert acc == expected`. This is the canonical
@@ -359,13 +360,17 @@ impl Gadget {
                 });
             }
             GadgetKind::Loop => {
-                e.line(&format!("{p}acc: Mut = 0"));
+                // Loop-carried mutables in a `range` loop are no longer allowed (the compiler
+                // requires an explicit buffer). Accumulate through an array chain instead:
+                // acc[i+1] = acc[i] + buf[i], reading the previous iteration's cell.
+                e.line(&format!("{p}acc = Array({})", n + 1));
+                e.line(&format!("{p}acc[0] = 0"));
                 e.line(&format!("for {p}i in range(0, {n}):"));
                 e.indented(|e| {
-                    e.line(&format!("{p}acc = {p}acc + {p}buf[{p}i]"));
+                    e.line(&format!("{p}acc[{p}i + 1] = {p}acc[{p}i] + {p}buf[{p}i]"));
                 });
                 e.line(&format!("{p}exp = {p}buf[{n}]"));
-                e.line(&format!("assert {p}acc == {p}exp"));
+                e.line(&format!("assert {p}acc[{n}] == {p}exp"));
             }
             GadgetKind::MatchDispatch { m } => {
                 e.line(&format!("{p}sel = {p}buf[0]"));
@@ -475,23 +480,28 @@ impl Gadget {
                 });
             }
             GadgetKind::NestedMutLoop { outer, inner } => {
-                // buf = [a0, b0, da, db, exp_a, exp_b]. Two mutables carried across a nested
-                // range loop, each accumulating its per-iteration delta. After outer*inner
-                // iterations: a = a0 + (outer*inner)*da, b = b0 + (outer*inner)*db.
-                e.line(&format!("{p}a: Mut = {p}buf[0]"));
-                e.line(&format!("{p}b: Mut = {p}buf[1]"));
+                // buf = [a0, b0, da, db, exp_a, exp_b]. Loop-carried mutables are no longer allowed,
+                // so two array chains accumulate their per-iteration delta across the nested range
+                // loop, indexed by the flattened iteration count `i*inner + j`. After outer*inner
+                // iterations: chainA[k] = a0 + k*da, chainB[k] = b0 + k*db (k = outer*inner).
+                let iters = outer * inner;
+                e.line(&format!("{p}chainA = Array({})", iters + 1));
+                e.line(&format!("{p}chainB = Array({})", iters + 1));
+                e.line(&format!("{p}chainA[0] = {p}buf[0]"));
+                e.line(&format!("{p}chainB[0] = {p}buf[1]"));
                 e.line(&format!("for {p}i in range(0, {outer}):"));
                 e.indented(|e| {
                     e.line(&format!("for {p}j in range(0, {inner}):"));
                     e.indented(|e| {
-                        e.line(&format!("{p}a = {p}a + {p}buf[2]"));
-                        e.line(&format!("{p}b = {p}b + {p}buf[3]"));
+                        e.line(&format!("{p}idx = {p}i * {inner} + {p}j"));
+                        e.line(&format!("{p}chainA[{p}idx + 1] = {p}chainA[{p}idx] + {p}buf[2]"));
+                        e.line(&format!("{p}chainB[{p}idx + 1] = {p}chainB[{p}idx] + {p}buf[3]"));
                     });
                 });
                 e.line(&format!("{p}exp_a = {p}buf[4]"));
                 e.line(&format!("{p}exp_b = {p}buf[5]"));
-                e.line(&format!("assert {p}a == {p}exp_a"));
-                e.line(&format!("assert {p}b == {p}exp_b"));
+                e.line(&format!("assert {p}chainA[{iters}] == {p}exp_a"));
+                e.line(&format!("assert {p}chainB[{iters}] == {p}exp_b"));
             }
             GadgetKind::BitDecomp { n } => {
                 // buf = [bit_0 .. bit_{n-1} | expected]; acc = sum bit_i * 2^(n-1-i).

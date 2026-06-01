@@ -207,11 +207,12 @@ fn range_loop_running_checkpoints() {
 def main():
     w = Array(8)
     hint_witness("w", w)
-    acc: Mut = w[0]
-    assert acc == w[4]
+    acc = Array(4)
+    acc[0] = w[0]
+    assert acc[0] == w[4]
     for i in range(1, 4):
-        acc = acc + w[i]
-        assert acc == w[4 + i]
+        acc[i] = acc[i - 1] + w[i]
+        assert acc[i] == w[4 + i]
     return
 "#;
     // b0=10, d=[1,2,3]; checkpoints 10,11,13,16.
@@ -347,10 +348,11 @@ def main():
     assert p1 == w[2]
     q = a + b
     assert q == w[3]
-    acc: Mut = p2
+    acc = Array(3)
+    acc[0] = p2
     for i in range(0, 2):
-        acc = acc + w[2]
-    assert acc == w[4]
+        acc[i + 1] = acc[i] + w[2]
+    assert acc[2] == w[4]
     return
 "#;
     // x=3,y=5 ⇒ p=15, q=8, acc = 15 + 2*15 = 45.
@@ -433,11 +435,13 @@ fn nested_range_loops_grid_sum() {
 def main():
     w = Array(10)
     hint_witness("w", w)
-    acc: Mut = 0
+    acc = Array(10)
+    acc[0] = 0
     for i in range(0, 3):
         for j in range(0, 3):
-            acc = acc + w[i * 3 + j]
-    assert acc == w[9]
+            idx = i * 3 + j
+            acc[idx + 1] = acc[idx] + w[i * 3 + j]
+    assert acc[9] == w[9]
     return
 "#;
     // sum of 1..9 = 45.
@@ -482,10 +486,11 @@ def main():
     hint_witness("w", w)
     sel = w[0]
     base = match_range(sel, range(1, 5), lambda i: sq(i))
-    acc: Mut = base
+    acc = Array(4)
+    acc[0] = base
     for i in range(0, 3):
-        acc = acc + base
-    assert acc == w[1]
+        acc[i + 1] = acc[i] + base
+    assert acc[3] == w[1]
     return
 "#;
     // sel=3 ⇒ base=9; acc = 9 + 3*9 = 36.
@@ -654,14 +659,16 @@ def f(v):
 def main():
     w = Array(13)
     hint_witness("w", w)
-    total: Mut = 0
+    total = Array(4)
+    total[0] = 0
+    row = Array(12)
     for i in range(0, 3):
-        row: Mut = 0
+        row[i * 4] = 0
         for j in range(0, 3):
-            row = row + f(w[i * 3 + j])
-        assert row == w[9 + i]
-        total = total + row
-    assert total == w[12]
+            row[i * 4 + j + 1] = row[i * 4 + j] + f(w[i * 3 + j])
+        assert row[i * 4 + 3] == w[9 + i]
+        total[i + 1] = total[i] + row[i * 4 + 3]
+    assert total[3] == w[12]
     return
 "#;
     // grid 1..9, f(v)=v*v+1 ⇒ rows 17,80,197 ; total 294.
@@ -685,12 +692,13 @@ def cube(n: Const):
 def main():
     w = Array(8)
     hint_witness("w", w)
-    acc: Mut = 1
+    acc = Array(5)
+    acc[0] = 1
     for i in range(0, 4):
         s = w[i]
         c = match_range(s, range(0, 4), lambda k: cube(k))
-        acc = acc * c
-        assert acc == w[4 + i]
+        acc[i + 1] = acc[i] * c
+        assert acc[i + 1] == w[4 + i]
     return
 "#;
     // sels 1,2,3,2 ⇒ cubes 1,8,27,8 ⇒ acc 1,8,216,1728.
@@ -767,14 +775,17 @@ def w2(v):
 def main():
     w = Array(25)
     hint_witness("w", w)
-    acc: Mut = 0
+    acc = Array(6)
+    acc[0] = 0
     for i in range(0, 5):
         x = w[i]
+        delta: Imm
         if x == 0:
-            acc = acc + 1
+            delta = 1
         else:
-            acc = acc + w2(x)
-        assert acc == w[5 + i]
+            delta = w2(x)
+        acc[i + 1] = acc[i] + delta
+        assert acc[i + 1] == w[5 + i]
     res = Array(5)
     dot_product_ee(w + 10, w + 15, res)
     for i in unroll(0, 5):
@@ -824,7 +835,8 @@ fn mega_deep_nested_if_in_loop() {
 def main():
     w = Array(6)
     hint_witness("w", w)
-    acc: Mut = 0
+    acc = Array(3)
+    acc[0] = 0
     for i in range(0, 2):
         a = w[2 * i]
         b = w[2 * i + 1]
@@ -839,8 +851,8 @@ def main():
                 r = 3
             else:
                 r = 4
-        acc = acc + r
-        assert acc == w[4 + i]
+        acc[i + 1] = acc[i] + r
+        assert acc[i + 1] == w[4 + i]
     return
 "#;
     // i0: a=0,b=1 ⇒ r=2 ⇒ acc=2 ; i1: a=1,b=1 ⇒ r=4 ⇒ acc=6.
@@ -869,15 +881,16 @@ def sq(n: Const):
 def main():
     w = Array(6)
     hint_witness("w", w)
-    acc: Mut = 0
+    acc = Array(3)
+    acc[0] = 0
     for i in range(0, 2):
         contrib: Imm
         if w[i] != 0:
             contrib = match_range(w[2 + i], range(0, 4), lambda k: sq(k))
         else:
             contrib = 100
-        acc = acc + contrib
-        assert acc == w[4 + i]
+        acc[i + 1] = acc[i] + contrib
+        assert acc[i + 1] == w[4 + i]
     return
 "#;
     // i0: w[0]=1≠0 ⇒ contrib=sq(w[2]=2)=4 ⇒ acc=4=w[4].
