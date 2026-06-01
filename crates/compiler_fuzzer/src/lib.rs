@@ -40,4 +40,5 @@
 
 pub mod field_util;
 pub mod harness;
+pub mod model;
 pub mod rng;

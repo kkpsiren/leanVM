@@ -6,9 +6,16 @@
 //! reference model is what lets the [`crate::model`] act as an oracle for the VM.
 
 use backend::*;
-use lean_vm::{DIMENSION, EF, F};
+use lean_vm::{DIMENSION, EF, F, PUBLIC_INPUT_LEN};
 
 use crate::rng::Rng;
+
+/// The all-zero public input. Generated programs feed their data through hint buffers, not the
+/// public input, so this is the default.
+#[must_use]
+pub fn zero_public_input() -> [F; PUBLIC_INPUT_LEN] {
+    [F::ZERO; PUBLIC_INPUT_LEN]
+}
 
 /// The KoalaBear prime, `p = 2^31 - 2^24 + 1`.
 pub const P: u64 = (1 << 31) - (1 << 24) + 1;
