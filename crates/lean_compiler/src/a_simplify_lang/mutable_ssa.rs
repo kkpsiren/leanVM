@@ -52,6 +52,7 @@ struct Tracker {
 }
 
 impl Tracker {
+    /// Whether `var` is being tracked as mutable (and therefore versioned).
     fn is_mutable(&self, var: &Var) -> bool {
         self.versions.contains_key(var)
     }
@@ -70,9 +71,13 @@ impl Tracker {
         self.versions.insert(var.clone(), 0);
     }
 
-    /// Bump `var` to its next version and return that versioned name.
+    /// Bump `var` to its next version and return that versioned name. Only called
+    /// for an already-mutable `var` (see `is_mutable` check at the call site).
     fn next_version(&mut self, var: &Var) -> Var {
-        let version = self.versions.entry(var.clone()).or_insert(0);
+        let version = self
+            .versions
+            .get_mut(var)
+            .expect("next_version on a non-mutable variable");
         *version += 1;
         format!("@mut_{var}_{version}")
     }
@@ -145,9 +150,11 @@ fn ssa_lines(lines: &[Line], tracker: &mut Tracker) -> Result<Vec<Line>, String>
                 rename_reads(&mut end, tracker);
                 // The loop body becomes its own function, so immutable assignments
                 // inside it don't collide with names outside. Mutable versions
-                // persist: a non-unrolled loop never reassigns an external mutable
-                // (those were turned into buffer arrays by an earlier pass), so the
-                // only reassignments here are to body-local mutables.
+                // persist (no snapshot/restore): a non-unrolled loop never reassigns
+                // an external mutable — `transform_mutable_in_loops_in_program`, which
+                // runs before this pass, has already turned those into buffer arrays —
+                // so the only reassignments here are to body-local mutables, whose
+                // leaked versions are harmless (they aren't read after the loop).
                 let saved_assigned = std::mem::take(&mut tracker.assigned);
                 let body = ssa_lines(body, tracker)?;
                 tracker.assigned = saved_assigned;
@@ -297,79 +304,71 @@ fn ssa_branch(
 /// the branch sees a single version. Returns forward-declarations to emit before
 /// the branch; may append phi-copy assignments to the ends of `branches`. Updates
 /// `tracker.versions` to the merged versions.
+///
+/// `branches` and `branch_versions` are parallel: entry `i` is the rewritten body
+/// and the end-of-body versions of the `i`-th branch.
+///
+/// Only variables that were live *before* the branch (i.e. in `snapshot`) need
+/// reconciling — a variable introduced inside a branch is scoped to it and cannot
+/// be read afterwards. The branches were each processed on a clone of the tracker
+/// (see `ssa_branch`), so `tracker.versions` is still exactly `snapshot` here; we
+/// iterate `snapshot` directly.
 fn unify_branch_versions(
     tracker: &mut Tracker,
     snapshot: &BTreeMap<Var, usize>,
     branch_versions: &[BTreeMap<Var, usize>],
     branches: &mut [Vec<Line>],
 ) -> Vec<Line> {
+    assert_eq!(branches.len(), branch_versions.len());
     let mut forward_decls = Vec::new();
     let exits_early: Vec<bool> = branches.iter().map(|b| ends_with_early_exit(b)).collect();
-    let mut branch_local = Vec::new();
 
-    for var in tracker.versions.clone().keys() {
-        let was_in_snapshot = snapshot.contains_key(var);
-        let snapshot_v = snapshot.get(var).copied().unwrap_or(0);
-
-        // Versions from branches that fall through (those that return/panic never
-        // reach the code after the construct, so they don't constrain the merge).
-        let continuing: Vec<(bool, usize)> = branch_versions
+    for (var, &before_v) in snapshot {
+        // The variable's final version in each branch that falls through to the code
+        // after the construct (branches that return/panic never reach it, so they
+        // don't constrain the merge).
+        let versions: Vec<usize> = branch_versions
             .iter()
             .zip(&exits_early)
             .filter(|(_, exits)| !**exits)
-            .map(|(v, _)| (v.contains_key(var), v.get(var).copied().unwrap_or(0)))
+            .map(|(branch, _)| branch.get(var).copied().unwrap_or(before_v))
             .collect();
 
-        if continuing.is_empty() {
-            // Every branch exits early: keep the pre-branch version.
-            tracker.versions.insert(var.clone(), snapshot_v);
-            continue;
-        }
+        let Some(&first) = versions.first() else {
+            continue; // every branch exits early: nothing flows out, version stays `before_v`
+        };
 
-        // A variable introduced inside only some branches is branch-local and dies
-        // with them.
-        if !was_in_snapshot && !continuing.iter().all(|(has, _)| *has) {
-            branch_local.push(var.clone());
-            continue;
-        }
-
-        let versions: Vec<usize> = continuing.iter().map(|(_, v)| *v).collect();
-        if versions.iter().all(|&v| v == versions[0]) {
-            // All continuing branches end on the same version.
-            let merged = versions[0];
-            if merged > snapshot_v {
-                // It was (re)assigned identically in every branch; declare it in
-                // the enclosing scope so it survives past the branch. If a nested
-                // branch already declared this version inside itself, move that
-                // declaration out here to avoid an inner declaration shadowing the
-                // enclosing one (which would split it across two memory slots).
-                let merged_var = versioned(var, merged);
+        if versions.iter().all(|&v| v == first) {
+            // Every continuing branch ends on the same version.
+            if first > before_v {
+                // It was (re)assigned to that new version in all of them; declare the
+                // version in the enclosing scope so it outlives the branch. A nested
+                // branch may already have declared it inside itself — move that
+                // declaration out here, or it would shadow this one and split the
+                // variable across two memory slots.
+                let merged_var = versioned(var, first);
                 forward_decls.push(forward_decl(&merged_var));
                 for branch in branches.iter_mut() {
                     remove_forward_declarations(branch, &merged_var);
                 }
             }
-            tracker.versions.insert(var.clone(), merged);
+            tracker.versions.insert(var.clone(), first);
         } else {
-            // Branches disagree: introduce a fresh merged version and copy each
-            // branch's final version into it (a phi node, as ordinary copies).
+            // Branches disagree: make a fresh version and copy each branch's final
+            // version into it at the branch's end (a phi node, as ordinary copies).
             let merged = versions.iter().copied().max().unwrap() + 1;
             let merged_var = versioned(var, merged);
             forward_decls.push(forward_decl(&merged_var));
-            for (branch_idx, branch_versions) in branch_versions.iter().enumerate() {
-                if exits_early[branch_idx] {
-                    continue;
+            for ((branch, branch_v), exits) in branches.iter_mut().zip(branch_versions).zip(&exits_early) {
+                if !*exits {
+                    let branch_v = branch_v.get(var).copied().unwrap_or(before_v);
+                    branch.push(copy_var(&merged_var, &versioned(var, branch_v)));
                 }
-                let branch_v = branch_versions.get(var).copied().unwrap_or(0);
-                branches[branch_idx].push(copy_var(&merged_var, &versioned(var, branch_v)));
             }
             tracker.versions.insert(var.clone(), merged);
         }
     }
 
-    for var in branch_local {
-        tracker.versions.remove(&var);
-    }
     forward_decls
 }
 

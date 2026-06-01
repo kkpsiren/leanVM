@@ -457,6 +457,9 @@ fn dedup_array_reads(lines: &mut Vec<SimpleLine>, refs: &BTreeMap<Var, VarRefs>)
         else {
             continue;
         };
+        // Only coalesce genuine reads: `v` must be defined solely by this access.
+        // A `RawAccess` that stores a value (an array write) has `res` defined
+        // elsewhere too, so `is_uniquely_defined` excludes it.
         if !is_uniquely_defined(v, refs) {
             continue;
         }
