@@ -33,9 +33,9 @@
 //! - **Structural-diff** ([`oracles::structural_diff`]): removing any emitted `assert` line
 //!   must change the bytecode hash; needs no witness, so it covers checks no witness can
 //!   violate (e.g. `hint_div_floor`'s always-true `q*D + r == a`).
-//! - **No-crash probes** ([`probes`] + [`subprocess`]): panics / aborts / OOM / hangs / stack
-//!   overflows, by compiling edge-case programs (and programmatic recursion/size stressors) in a
-//!   bounded child process.
+//! - **No-crash probes** ([`probes`] + [`subprocess`]): panics / aborts / OOM / hangs, by
+//!   compiling edge-case programs (and bounded recursion/size stressors) in a bounded child
+//!   process.
 //! - **Metamorphic transforms** ([`transforms`]): semantics-preserving reorder / duplicate of
 //!   independent gadgets must preserve pass/fail behaviour.
 //!

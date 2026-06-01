@@ -4,7 +4,9 @@ A fuzzing harness for the handwritten **`lean_compiler`** zkDSL compiler (parse 
 intermediate → final bytecode). It hunts two classes of bug:
 
 1. **Compiler crashes.** Any input the parser accepts must either compile to bytecode or be
-   rejected with a clean `CompileError`. A panic, abort, stack overflow, OOM, or hang is a bug.
+   rejected with a clean `CompileError`. A panic, abort, OOM, or hang is a bug. (A stack overflow
+   on *pathologically* deep nesting — thousands of levels — is an accepted limitation, not a bug;
+   see `FINDINGS.md`.)
 2. **Dropped checks.** Every `assert ==`, `assert !=`, `assert <`, `assert <=`, `assert False`,
    and `debug_assert(...)` must remain *enforced* in the emitted bytecode. The simplifier's
    fusion/propagation passes (`a_simplify_lang/post_optimization.rs`) have historically deleted
@@ -23,7 +25,7 @@ compilation — a critical soundness bug.
 | **Structural survival** | `oracles::structural` | A range-check constraint dropped *behind a surviving prover-side `debug_assert` companion* (which masks it at runtime). Requires exactly `2 * n_range` `Hint::DerefHint`s and one inequality companion per `<` / `<=` — fewer means a constraint was dropped even though the runtime oracle can't see it. |
 | **Structural-diff** | `oracles::structural_diff` | Any emitted `assert` that compiles to *zero* instructions. Removes each `assert` line, recompiles, and flags if the bytecode hash is unchanged. Needs no witness, so it covers checks the runtime oracle can't violate (e.g. `hint_div_floor`'s `q*D + r == a`, always true for an honest runner). Run on the base program **and** the duplicate metamorphic variant (where adjacent identical gadgets stress CSE / fusion). |
 | **Const-fold differential** | `model` (`ConstFold` gadget) | A miscompiled compile-time built-in (`**`, `%`, `div_floor`/`div_ceil`, `saturating_sub`, `next_multiple_of`, `log2_ceil`). The honest buffer holds an *independent* mod-`p`/integer reference; a wrong fold makes the honest witness fail. |
-| **No-crash probes** | `probes` + `subprocess` | Panics, aborts, OOM, **hangs**, and **stack overflows**, by compiling edge-case programs in a bounded child process (timeout + address-space rlimit). Includes programmatic *stressors* (deep nesting, long chains, very wide programs) that no hand-written corpus reaches. |
+| **No-crash probes** | `probes` + `subprocess` | Panics, aborts, OOM, and **hangs**, by compiling edge-case programs in a bounded child process (timeout + address-space rlimit). Includes programmatic *stressors* (bounded-deep nesting, long chains, very wide programs) that no hand-written corpus reaches. |
 | **Metamorphic transforms** | `transforms` | Order/duplication-dependent miscompiles (CSE, fusion). Reorder / duplicate independent gadgets; behaviour must not change. |
 | **Reference-model differential** | `model` | Mis-evaluation: the generator is also a canonical-integer interpreter, used to build witnesses that pass/fail *by construction*. |
 

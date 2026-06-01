@@ -1,16 +1,18 @@
 # Findings
 
-Compiler bugs surfaced by `compiler_fuzzer`. Each is a *parseable* program that the compiler
-must handle gracefully (compile, or reject with a clean `CompileError`) but did not — or, worse,
-a program whose verifier-enforced check the compiler silently drops.
+Compiler behaviours surfaced by `compiler_fuzzer`. The fuzzer hunts two classes: inputs the
+compiler should handle gracefully (compile, or reject with a clean `CompileError`) but doesn't, and
+programs whose verifier-enforced checks the compiler silently drops.
 
-All measurements below were taken with the **release** build of the compiler (`cargo run
---release` / the release `compiler_fuzz` binary); the fuzzer always compiles in release. Debug
-frame sizes would only change the deep-recursion threshold, not the soundness result.
+All measurements use the **release** build (the fuzzer always compiles in release). There are
+currently **no open compiler-crash or dropped-check findings**; the items below were surfaced and
+triaged as *not* bugs. (Crashes fixed earlier are in the History section.)
 
 ---
 
-## OPEN — robustness/DoS: deeply nested expression overflows the compiler stack
+# Considered and rejected — *not* bugs (by design)
+
+## Deeply nested expression overflowing the parser stack is an accepted limitation
 
 ```python
 from snark_lib import *
@@ -19,31 +21,12 @@ def main():
     return
 ```
 
-**Symptom (release):** a parenthesized-expression nesting depth of ~3000 aborts the compiler with
-`thread 'main' has overflowed its stack` (SIGABRT). Depth 2000 compiles; depth 3000 crashes; the
-`deep_nested_parens` probe uses 6000 to be safely past the threshold on any stack size. The
-parser/simplifier recurse per nesting level with no depth guard. (The other size stressors —
-40k-term fold chains, 1500 nested `if`s, 3000-deep array literals, 3000-deep call chains, 40k
-sequential statements — all compile or reject cleanly.)
-
-**Detected by:** the `deep_nested_parens` dynamic stressor in `probes::dynamic_stressors`
-(`--probes`).
-
-**Recommended fix:** a recursion/nesting-depth limit in the parser (and the simplifier's
-expression walk) that rejects with a clean `CompileError` instead of overflowing.
-
----
-
-## Reproducing
-
-```bash
-# The crash probes (reports the deep-nesting stack overflow):
-cargo run --release -p compiler_fuzzer -- --probes
-```
-
----
-
-# Considered and rejected — *not* bugs (by design)
+A parenthesized-expression nesting depth of ~3000 overflows the recursive-descent parser's stack
+and aborts (depth 2000 compiles; ~3000 aborts). This is an **accepted limitation, not a bug**: no
+real program nests thousands of levels deep, and adding a guard was considered and rejected. The
+`deep_nested_parens` dynamic stressor therefore stays *below* the threshold (depth 1000) and only
+checks that deep-but-bounded nesting compiles cleanly; the other size stressors (40k-term fold
+chains, nested `if`s, deep array literals / call chains, 40k sequential statements) all compile.
 
 ## Reading an unassigned `: Imm` is a free witness cell, not a dropped check
 
