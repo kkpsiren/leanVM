@@ -15,6 +15,8 @@ use utils::{Counter, ToUsize};
 mod mutable_ssa;
 mod post_optimization;
 
+const MAX_UNROLL_ITERATIONS: usize = 1 << 20;
+
 #[derive(Debug, Clone)]
 pub struct SimpleProgram {
     pub functions: BTreeMap<FunctionName, SimpleFunction>,
@@ -696,12 +698,19 @@ fn unroll_loop(
     let (Some(start), Some(end)) = (start.as_scalar(), end.as_scalar()) else {
         return Err(format!("line {location}: Cannot unroll loop with non-constant bounds"));
     };
+    let (start, end) = (start.to_usize(), end.to_usize());
+    let count = end.saturating_sub(start);
+    if count > MAX_UNROLL_ITERATIONS {
+        return Err(format!(
+            "line {location}: `unroll` loop is too large ({count} iterations; max {MAX_UNROLL_ITERATIONS})"
+        ));
+    }
     let unroll_index = unroll_counter.get_next();
     let (internal_vars, _) = find_variable_usage(body, const_arrays);
     let iterator = iterator.clone();
     let body = body.clone();
     let mut unrolled = Vec::new();
-    for j in start.to_usize()..end.to_usize() {
+    for j in start..end {
         let mut body_copy = body.clone();
         replace_vars_for_unroll(&mut body_copy, &iterator, unroll_index, j, &internal_vars);
         unrolled.extend(body_copy);
@@ -1598,6 +1607,16 @@ fn simplify_lines(
                 value,
                 location,
             } => {
+                // Reject assignment into a compile-time-immutable const array.
+                for target in targets {
+                    if let AssignmentTarget::ArrayAccess { array, .. } = target
+                        && let Some(name) = array.as_var()
+                        && ctx.const_arrays.contains_key(name)
+                    {
+                        return Err(format!("cannot assign to const array '{name}', at {location}"));
+                    }
+                }
+
                 match value {
                     Expression::HintWitness { name: hint_name, ptr } => {
                         if !targets.is_empty() {
@@ -1754,19 +1773,26 @@ fn simplify_lines(
                                         res.push(SimpleLine::equality(var.clone(), simplified_val));
                                     }
                                     Expression::ArrayAccess { array, index } => {
-                                        // Pre-simplify indices before version update
-                                        let simplified_index = index
-                                            .iter()
-                                            .map(|idx| simplify_expr(ctx, counters, const_malloc, idx, &mut res))
-                                            .collect::<Result<Vec<_>, _>>()?;
-                                        handle_array_assignment(
-                                            counters,
-                                            const_malloc,
-                                            &mut res,
-                                            array,
-                                            &simplified_index,
-                                            ArrayAccessType::VarIsAssigned(var.clone()),
-                                        );
+                                        if array.as_var().is_some_and(|n| ctx.const_arrays.contains_key(n)) {
+                                            // Const array read: `simplify_expr` folds it to a
+                                            // constant (or errors on out-of-bounds).
+                                            let simplified_val =
+                                                simplify_expr(ctx, counters, const_malloc, value, &mut res)?;
+                                            res.push(SimpleLine::equality(var.clone(), simplified_val));
+                                        } else {
+                                            let simplified_index = index
+                                                .iter()
+                                                .map(|idx| simplify_expr(ctx, counters, const_malloc, idx, &mut res))
+                                                .collect::<Result<Vec<_>, _>>()?;
+                                            handle_array_assignment(
+                                                counters,
+                                                const_malloc,
+                                                &mut res,
+                                                array,
+                                                &simplified_index,
+                                                ArrayAccessType::VarIsAssigned(var.clone()),
+                                            );
+                                        }
                                     }
                                     Expression::MathExpr(operation, args) => {
                                         let args_simplified = args
@@ -2403,7 +2429,7 @@ fn simplify_expr(
             let function = ctx
                 .functions
                 .get(function_name)
-                .unwrap_or_else(|| panic!("Function used but not defined: {function_name}"));
+                .ok_or_else(|| format!("Function used but not defined: {function_name}"))?;
             if function.n_returned_vars != 1 {
                 return Err(format!(
                     "Nested function calls must return exactly one value (function {function_name} returns {} values)",
