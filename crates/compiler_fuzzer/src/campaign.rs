@@ -28,6 +28,9 @@ pub struct CampaignConfig {
     pub stop_on_critical: bool,
     /// Also evaluate semantics-preserving transforms (reorder, duplicate) of each program.
     pub metamorphic: bool,
+    /// Run the structural-diff oracle on the base program (recompiles once per assert; the most
+    /// rigorous "no check dropped" check, but the slowest). Disable for large runtime-only soaks.
+    pub structural_diff: bool,
 }
 
 impl Default for CampaignConfig {
@@ -40,6 +43,7 @@ impl Default for CampaignConfig {
             verbose: false,
             stop_on_critical: false,
             metamorphic: true,
+            structural_diff: true,
         }
     }
 }
@@ -87,15 +91,17 @@ pub fn run_campaign(cfg: &CampaignConfig) -> CampaignReport {
 
         let mut rng = Rng::new(seed);
         let prog = gen_program(&mut rng, &cfg.gen_config);
-        let mut findings = oracles::evaluate(&prog, &mut rng, seed);
+        // `deep` runs the structural-diff oracle on the base program only (it recompiles once
+        // per assert); the metamorphic variants get the cheaper oracles.
+        let mut findings = oracles::evaluate(&prog, &mut rng, seed, cfg.structural_diff);
 
         if cfg.metamorphic {
             // Distinct rng stream so variant witnesses don't shadow the base's.
             let mut vrng = Rng::new(seed ^ 0x5EED_BEEF_5EED_BEEF);
             let reordered = transforms::reorder(&prog, &mut vrng);
-            findings.extend(oracles::evaluate(&reordered, &mut vrng, seed));
+            findings.extend(oracles::evaluate(&reordered, &mut vrng, seed, false));
             let duplicated = transforms::duplicate(&prog);
-            findings.extend(oracles::evaluate(&duplicated, &mut vrng, seed));
+            findings.extend(oracles::evaluate(&duplicated, &mut vrng, seed, false));
         }
 
         let mut hit_critical = false;

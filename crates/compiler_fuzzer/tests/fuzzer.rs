@@ -139,6 +139,32 @@ fn subprocess_classifies_clean_outcomes() {
     );
 }
 
+/// Teeth for the structural-diff oracle: a const-true `assert 5 == 5` folds to zero
+/// instructions, so removing it leaves the bytecode unchanged and must be flagged; a runtime
+/// `assert p[0] == p[1]` emits an instruction, so removing it changes the bytecode and must not
+/// be flagged.
+#[test]
+fn structural_diff_flags_no_instruction_assert_only() {
+    let src =
+        "from snark_lib import *\ndef main():\n    p = 0\n    assert 5 == 5\n    assert p[0] == p[1]\n    return\n";
+    let bc = match compile_source(src) {
+        CompileOutcome::Ok(bc) => bc,
+        other => panic!("compile failed: {other:?}"),
+    };
+    let findings = compiler_fuzzer::oracles::structural_diff::evaluate(&bc, src, 0);
+    let details: Vec<_> = findings.iter().map(|f| f.detail.clone()).collect();
+    assert_eq!(
+        findings.len(),
+        1,
+        "exactly the const-true assert should be flagged, got {details:?}"
+    );
+    assert!(
+        findings[0].detail.contains("5 == 5"),
+        "flagged the wrong assert: {}",
+        findings[0].detail
+    );
+}
+
 /// The generator must actually emit every hard lowering construct over a modest seed range —
 /// otherwise "0 findings" could just mean a construct is never generated.
 #[test]
@@ -264,7 +290,7 @@ fn baseline_campaign_is_clean() {
     // variants are on by default, so this exercises reorder/duplicate transforms too.
     let cfg = CampaignConfig {
         start_seed: 0,
-        iterations: 128,
+        iterations: 64,
         ..Default::default()
     };
     let report = run_campaign(&cfg);

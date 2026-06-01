@@ -21,6 +21,7 @@ compilation — a critical soundness bug.
 |-----------|--------|-----------------|
 | **Check-enforcement (differential soundness)** | `oracles::check_enforced` | Dropped checks. Generate programs from *independent* gadgets; run the honest witness (must pass) and, per gadget, a witness that violates *only that gadget's* check (must be rejected). |
 | **Structural survival** | `oracles::structural` | Range-check lowerings dropped *behind a surviving prover-side companion* (which masks them at runtime). Counts `Hint::DerefHint` / inequality `Hint::DebugAssert` in the bytecode. |
+| **Structural-diff** | `oracles::structural_diff` | Any emitted `assert` that compiles to *zero* instructions. Removes each `assert` line, recompiles, and flags if the bytecode hash is unchanged. Needs no witness, so it covers checks the runtime oracle can't violate (e.g. `hint_div_floor`'s `q*D + r == a`, always true for an honest runner). |
 | **No-crash probes** | `probes` + `subprocess` | Panics, aborts, OOM, and **hangs**, by compiling edge-case programs in a bounded child process (timeout + address-space rlimit). |
 | **Metamorphic transforms** | `transforms` | Order/duplication-dependent miscompiles (CSE, fusion). Reorder / duplicate independent gadgets; behaviour must not change. |
 | **Reference-model differential** | `model` | Mis-evaluation: the generator is also a canonical-integer interpreter, used to build witnesses that pass/fail *by construction*. |

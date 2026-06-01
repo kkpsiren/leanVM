@@ -40,6 +40,7 @@ fn main() -> ExitCode {
             "--out" => cfg.out_dir = args.next().map(PathBuf::from),
             "--quiet" => cfg.verbose = false,
             "--no-metamorphic" => cfg.metamorphic = false,
+            "--no-structural-diff" => cfg.structural_diff = false,
             "--stop-on-critical" => cfg.stop_on_critical = true,
             "--probes" => run_probes = true,
             "--corpus" => corpus_iters = Some(args.next().and_then(|v| v.parse().ok()).unwrap_or(10000)),

@@ -4,9 +4,13 @@
 //! - [`check_enforced`] — the core runtime property: emitted checks must be enforced.
 //! - [`structural`] — the emitted bytecode must contain the recognizable lowering of each
 //!   range check / panic / debug-assert (catches drops that runtime can mask).
+//! - [`structural_diff`] — removing any emitted `assert` must change the bytecode (catches
+//!   drops even for checks no witness can violate). Run only on the base program (`deep`),
+//!   since it recompiles once per assert.
 
 pub mod check_enforced;
 pub mod structural;
+pub mod structural_diff;
 
 use crate::harness::{CompileOutcome, compile_source};
 use crate::model::CheckedProgram;
@@ -14,9 +18,10 @@ use crate::rng::Rng;
 use crate::triage::{Finding, FindingKind};
 
 /// Compile a program once and run every oracle against it. This is the per-program entry point
-/// the campaign uses.
+/// the campaign uses. `deep` additionally runs the (more expensive) structural-diff oracle; the
+/// campaign enables it for base programs but not for metamorphic variants.
 #[must_use]
-pub fn evaluate(prog: &CheckedProgram, rng: &mut Rng, seed: u64) -> Vec<Finding> {
+pub fn evaluate(prog: &CheckedProgram, rng: &mut Rng, seed: u64, deep: bool) -> Vec<Finding> {
     let source = prog.emit_source();
 
     let bc = match compile_source(&source) {
@@ -40,6 +45,9 @@ pub fn evaluate(prog: &CheckedProgram, rng: &mut Rng, seed: u64) -> Vec<Finding>
     };
 
     let mut findings = structural::evaluate(prog, &bc, seed, &source);
+    if deep {
+        findings.extend(structural_diff::evaluate(&bc, &source, seed));
+    }
     findings.extend(check_enforced::evaluate(prog, &bc, &source, rng, seed));
     findings
 }
