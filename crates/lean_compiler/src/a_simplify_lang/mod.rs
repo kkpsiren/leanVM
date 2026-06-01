@@ -369,6 +369,17 @@ pub fn simplify_program(mut program: Program) -> Result<SimpleProgram, String> {
     Ok(simple_program)
 }
 
+/// Read-only context threaded through the compile-time transform pass: the const
+/// arrays, the snapshot of all functions visible this round, and the inlined
+/// functions. (The mutable accumulators — `new_functions`, the counters — stay
+/// explicit args, since bundling them with these `&` refs would fight the borrow
+/// checker.)
+struct CompileTimeCtx<'a> {
+    const_arrays: &'a BTreeMap<String, ConstArrayValue>,
+    existing_functions: &'a BTreeMap<String, Function>,
+    inlined_functions: &'a BTreeMap<String, Function>,
+}
+
 fn compile_time_transform_in_program(
     program: &mut Program,
     unroll_counter: &mut Counter,
@@ -409,15 +420,18 @@ fn compile_time_transform_in_program(
         }
 
         let existing_functions = program.functions.clone();
+        let ctx = CompileTimeCtx {
+            const_arrays: &const_arrays,
+            existing_functions: &existing_functions,
+            inlined_functions: &inlined_functions,
+        };
         for func_name in to_process {
             processed.insert(func_name.clone());
             let func = program.functions.get_mut(&func_name).unwrap();
             let mut new_functions = BTreeMap::new();
             compile_time_transform_in_lines(
                 &mut func.body,
-                &const_arrays,
-                &existing_functions,
-                &inlined_functions,
+                &ctx,
                 &mut new_functions,
                 unroll_counter,
                 inline_counter,
@@ -431,12 +445,9 @@ fn compile_time_transform_in_program(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 fn compile_time_transform_in_lines(
     lines: &mut Vec<Line>,
-    const_arrays: &BTreeMap<String, ConstArrayValue>,
-    existing_functions: &BTreeMap<String, Function>,
-    inlined_functions: &BTreeMap<String, Function>,
+    ctx: &CompileTimeCtx<'_>,
     new_functions: &mut BTreeMap<String, Function>,
     unroll_counter: &mut Counter,
     inline_counter: &mut Counter,
@@ -461,7 +472,7 @@ fn compile_time_transform_in_lines(
             value,
             location,
         } = &lines[i]
-            && let Some(expanded) = try_expand_match_range(value, targets, *location, const_arrays)?
+            && let Some(expanded) = try_expand_match_range(value, targets, *location, ctx.const_arrays)?
         {
             lines.splice(i..=i, expanded);
             continue;
@@ -470,20 +481,24 @@ fn compile_time_transform_in_lines(
         // 2. Substitute known constants, then fold constant subexpressions. This
         //    is what lets later steps recognize const-arg calls / unroll bounds /
         //    constant `if` conditions via `as_scalar()`.
-        fold_expressions_in_line(&mut lines[i], &const_var_exprs, const_arrays)?;
+        fold_expressions_in_line(&mut lines[i], &const_var_exprs, ctx.const_arrays)?;
 
         // 3. Hoist nested inlined / const-arg calls (e.g. `a + f(b)`) into temps,
         //    so steps 4a/4b only ever see *direct* calls with simple arguments.
-        if let Some(new_lines) =
-            extract_preprocessed_calls(&mut lines[i], inlined_functions, existing_functions, inline_counter)?
-        {
+        if let Some(new_lines) = extract_preprocessed_calls(
+            &mut lines[i],
+            ctx.inlined_functions,
+            ctx.existing_functions,
+            inline_counter,
+        )? {
             lines.splice(i..=i, new_lines);
             continue;
         }
 
         // 4a. Inline a direct call to an `@inline` function.
         if let Line::Statement { targets, value, .. } = &lines[i]
-            && let Some(inlined) = try_inline_call(value, targets, inlined_functions, const_arrays, inline_counter)
+            && let Some(inlined) =
+                try_inline_call(value, targets, ctx.inlined_functions, ctx.const_arrays, inline_counter)
         {
             lines.splice(i..=i, inlined);
             continue;
@@ -491,7 +506,7 @@ fn compile_time_transform_in_lines(
 
         // 4b. Monomorphize a direct call to a function with `Const` parameters
         //     (generating the specialized function on demand). No-op otherwise.
-        specialize_const_arg_call(&mut lines[i], existing_functions, new_functions)?;
+        specialize_const_arg_call(&mut lines[i], ctx.existing_functions, new_functions)?;
 
         // 4c. Remember `x = <scalar>` bindings for immutable `x` (feeds step 2).
         record_const_binding(&lines[i], &mut const_var_exprs);
@@ -509,7 +524,7 @@ fn compile_time_transform_in_lines(
                 ..
             }
         ) {
-            unroll_loop(lines, i, const_arrays, unroll_counter)?;
+            unroll_loop(lines, i, ctx.const_arrays, unroll_counter)?;
             continue;
         }
 
@@ -522,16 +537,7 @@ fn compile_time_transform_in_lines(
             &no_consts
         };
         for block in lines[i].nested_blocks_mut() {
-            compile_time_transform_in_lines(
-                block,
-                const_arrays,
-                existing_functions,
-                inlined_functions,
-                new_functions,
-                unroll_counter,
-                inline_counter,
-                inner_consts,
-            )?;
+            compile_time_transform_in_lines(block, ctx, new_functions, unroll_counter, inline_counter, inner_consts)?;
         }
 
         i += 1;
