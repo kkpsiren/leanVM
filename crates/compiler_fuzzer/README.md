@@ -57,7 +57,9 @@ src/
   triage.rs       Finding (severity, kind, seed, source, witness) + on-disk reproducers
   campaign.rs     the deterministic generate→evaluate loop
   bin/compiler_fuzz.rs  CLI soak driver + --compile-stdin child + --probes
-tests/fuzzer.rs   self-tests incl. the negative control + a clean-baseline regression guard
+  tests/          in-crate unit tests (no `tests/` integration dir):
+    fuzzer.rs       self-tests, the negative control, the gadget isolation matrix, clean baseline
+    handwritten.rs  curated faithfulness cases — tangled programs whose constraints must survive
 ```
 
 ## Gadget kinds

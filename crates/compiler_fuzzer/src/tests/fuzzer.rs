@@ -5,16 +5,15 @@
 //! oracle actually fires when a check is missing. Without it, "0 findings" could just mean the
 //! oracle is blind.
 
-use std::path::Path;
 use std::time::Duration;
 
-use compiler_fuzzer::campaign::{CampaignConfig, run_campaign};
-use compiler_fuzzer::field_util::{ExtMode, ExtOp, zero_public_input};
-use compiler_fuzzer::generators::{GenConfig, gen_const_fold, gen_program};
-use compiler_fuzzer::harness::{CompileOutcome, RunOutcome, compile_source, run};
-use compiler_fuzzer::model::{CheckedProgram, Computation, Gadget, GadgetKind, Op, Operand, Step};
-use compiler_fuzzer::rng::Rng;
-use compiler_fuzzer::subprocess::{SubprocessOutcome, compile_in_subprocess};
+use crate::campaign::{CampaignConfig, run_campaign};
+use crate::field_util::{ExtMode, ExtOp, zero_public_input};
+use crate::generators::{GenConfig, gen_const_fold, gen_program};
+use crate::harness::{CompileOutcome, RunOutcome, compile_source, run};
+use crate::model::{CheckedProgram, Computation, Gadget, GadgetKind, Op, Operand, Step};
+use crate::rng::Rng;
+use crate::subprocess::{SubprocessOutcome, compile_in_subprocess};
 
 fn one_eq_gadget_program() -> CheckedProgram {
     // value = in0 + in1 ; assert value == buf[2]
@@ -123,18 +122,18 @@ fn detects_dropped_check() {
 /// bug being present (so it is stable across compiler fixes).
 #[test]
 fn subprocess_classifies_clean_outcomes() {
-    let bin = Path::new(env!("CARGO_BIN_EXE_compiler_fuzz"));
+    let bin = super::fuzz_bin();
     let good = "from snark_lib import *\ndef main():\n    x = 1\n    assert x == 1\n    return\n";
     let bad = "@@@ this is not valid zkDSL @@@\n";
     let lim = 2 << 30;
     let timeout = Duration::from_secs(60);
 
     assert_eq!(
-        compile_in_subprocess(bin, good, timeout, lim).unwrap(),
+        compile_in_subprocess(&bin, good, timeout, lim).unwrap(),
         SubprocessOutcome::Compiled
     );
     assert_eq!(
-        compile_in_subprocess(bin, bad, timeout, lim).unwrap(),
+        compile_in_subprocess(&bin, bad, timeout, lim).unwrap(),
         SubprocessOutcome::Rejected
     );
 }
@@ -151,7 +150,7 @@ fn structural_diff_flags_no_instruction_assert_only() {
         CompileOutcome::Ok(bc) => bc,
         other => panic!("compile failed: {other:?}"),
     };
-    let findings = compiler_fuzzer::oracles::structural_diff::evaluate(&bc, src, 0);
+    let findings = crate::oracles::structural_diff::evaluate(&bc, src, 0);
     let details: Vec<_> = findings.iter().map(|f| f.detail.clone()).collect();
     assert_eq!(
         findings.len(),
@@ -226,7 +225,7 @@ fn structural_counts_match_range_check_lowering() {
         CompileOutcome::Ok(bc) => bc,
         other => panic!("compile failed: {other:?}"),
     };
-    let counts = compiler_fuzzer::oracles::structural::count_lowerings(&bc);
+    let counts = crate::oracles::structural::count_lowerings(&bc);
     assert_eq!(
         counts.inequality_companions, 2,
         "expected one companion per range check"
@@ -236,7 +235,7 @@ fn structural_counts_match_range_check_lowering() {
         "expected two DerefHints per range check (and none elsewhere)"
     );
     // And the oracle is clean on a correctly-compiled program.
-    assert!(compiler_fuzzer::oracles::structural::evaluate(&prog, &bc, 0, &prog.emit_source()).is_empty());
+    assert!(crate::oracles::structural::evaluate(&prog, &bc, 0, &prog.emit_source()).is_empty());
 }
 
 /// The generator must actually emit every hard lowering construct over a modest seed range —

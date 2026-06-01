@@ -54,3 +54,6 @@ pub mod rng;
 pub mod subprocess;
 pub mod transforms;
 pub mod triage;
+
+#[cfg(test)]
+mod tests;
