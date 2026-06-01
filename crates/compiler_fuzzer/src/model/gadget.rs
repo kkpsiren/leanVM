@@ -236,6 +236,82 @@ impl Gadget {
         }
     }
 
+    /// Reference predicate for the random-differential oracle: does `buf` satisfy this gadget's
+    /// check, as a *pure function of the buffer*? `Some(true)`/`Some(false)` for kinds whose
+    /// acceptance is fully determined by the buffer (no free selector, runtime base, hint output,
+    /// or out-of-spec semantics); `None` for kinds the differential oracle must skip. For a pure
+    /// kind the VM's accept/reject MUST equal this for *every* buffer — an evil compiler that
+    /// weakens the constraint (OR-escape, wrong operand, implicit-zero, hidden free parameter) is
+    /// caught the moment a single random witness disagrees.
+    #[must_use]
+    pub fn accepts(&self, buf: &[u64]) -> Option<bool> {
+        let n = self.comp.n_inputs;
+        let sum = |s: &[u64]| s.iter().fold(0u64, |a, &b| add_mod(a, b));
+        Some(match &self.kind {
+            GadgetKind::EqBound | GadgetKind::InlineWrapped => self.comp.eval(&buf[..n]) == buf[n],
+            GadgetKind::EqConst { c } => add_mod(self.comp.eval(&buf[..n]), buf[n]) == *c,
+            GadgetKind::Ne => self.comp.eval(&buf[..n]) != buf[n],
+            GadgetKind::Bool => buf[0] == 0 || buf[0] == 1,
+            GadgetKind::RangeLt { bound } => buf[0] < *bound,
+            GadgetKind::RangeLe { bound } => buf[0] <= *bound,
+            GadgetKind::UnrolledRangeLt { n: cnt, bound } => buf[..*cnt].iter().all(|&v| v < *bound),
+            GadgetKind::Loop => sum(&buf[..n]) == buf[n],
+            GadgetKind::CopyPropEq | GadgetKind::TwoReadsEq => buf[0] == buf[1],
+            GadgetKind::CseEq => {
+                let p = mul_mod(buf[0], buf[1]);
+                p == buf[2] && p == buf[3]
+            }
+            GadgetKind::CompoundAssign => mul_mod(add_mod(buf[0], buf[1]), buf[2]) == buf[3],
+            GadgetKind::ConstFold { value, .. } => buf[0] == *value,
+            GadgetKind::MultiReturn => buf[1] == add_mod(buf[0], 1) && buf[2] == add_mod(buf[0], 2),
+            GadgetKind::ParallelLoop { n: cnt } => (0..*cnt).all(|k| buf[k] == buf[cnt + k]),
+            GadgetKind::ForwardDeclEq => {
+                let x = if buf[2] == 1 { buf[0] } else { buf[1] };
+                x == buf[3]
+            }
+            GadgetKind::RunningChain { len } => {
+                let mut acc = buf[0];
+                let mut ok = acc == buf[*len];
+                for k in 1..*len {
+                    acc = add_mod(acc, buf[k]);
+                    ok = ok && acc == buf[len + k];
+                }
+                ok
+            }
+            GadgetKind::NestedMutLoop { outer, inner } => {
+                let iters = (outer * inner) as u64;
+                add_mod(buf[0], mul_mod(iters, buf[2])) == buf[4] && add_mod(buf[1], mul_mod(iters, buf[3])) == buf[5]
+            }
+            GadgetKind::BitDecomp { n: cnt } => {
+                buf[..*cnt].iter().all(|&x| x == 0 || x == 1)
+                    && buf[..*cnt].iter().fold(0u64, |a, &b| add_mod(mul_mod(a, 2), b)) == buf[*cnt]
+            }
+            GadgetKind::ExtOp { op, mode, n: len } => {
+                let a_len = ext_a_len(*mode, *len);
+                let r = ext_op_eval(*op, *mode, &buf[..a_len], &buf[a_len..a_len + len * DIMENSION], *len);
+                let off = a_len + len * DIMENSION;
+                (0..DIMENSION).all(|k| buf[off + k] == r[k])
+            }
+            GadgetKind::Poseidon => {
+                let out = poseidon16_compress_half(&buf[..16]);
+                (0..8).all(|k| buf[16 + k] == out[k])
+            }
+            // Skipped: free selectors (branch/match), runtime base (pointer arith), hint outputs,
+            // and div-by-zero gray areas — acceptance is not a pure function of the buffer alone.
+            GadgetKind::IfThen
+            | GadgetKind::IfElse
+            | GadgetKind::Panic
+            | GadgetKind::DebugAssertLt { .. }
+            | GadgetKind::MatchDispatch { .. }
+            | GadgetKind::MatchChained
+            | GadgetKind::NestedIfLoop { .. }
+            | GadgetKind::HintDiv { .. }
+            | GadgetKind::Div
+            | GadgetKind::PointerOffset
+            | GadgetKind::PointerOffsetSub => return None,
+        })
+    }
+
     /// Top-level helper functions this gadget's emitted code calls.
     #[must_use]
     pub fn helpers(&self) -> &'static [(&'static str, &'static str)] {

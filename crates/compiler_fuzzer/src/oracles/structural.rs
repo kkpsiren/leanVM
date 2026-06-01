@@ -93,6 +93,25 @@ pub fn evaluate(prog: &CheckedProgram, bc: &Bytecode, seed: u64, source: &str) -
     // Every range check is exactly two DerefHints (`val` and `bound-1-val`); since DerefHints are
     // emitted *only* by range checks, fewer than `2 * n_range` means a range constraint was
     // silently dropped while its prover-side `debug_assert` companion survived (a soundness hole).
+    // Each `Panic` gadget (`assert False` in a taken `if`) must leave behind a `Hint::Panic`; a
+    // deficit means a simplifier dead-coded the block away (e.g. statically deciding the guard is
+    // never taken), which a witness that *does* take it would then sail through.
+    let n_panics = prog
+        .gadgets
+        .iter()
+        .filter(|g| matches!(g.kind, GadgetKind::Panic))
+        .count();
+    if counts.panics < n_panics {
+        findings.push(Finding::new(
+            FindingKind::MissingLowering,
+            seed,
+            format!(
+                "expected {n_panics} Panic lowerings, found {} (an `assert False` block was dead-coded away)",
+                counts.panics
+            ),
+            source,
+        ));
+    }
     if counts.deref_hints < 2 * n_range {
         findings.push(Finding::new(
             FindingKind::MissingLowering,

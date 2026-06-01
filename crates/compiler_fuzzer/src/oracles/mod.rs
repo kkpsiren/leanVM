@@ -7,8 +7,13 @@
 //! - [`structural_diff`] — removing any emitted `assert` must change the bytecode (catches
 //!   drops even for checks no witness can violate). Run only on the base program (`deep`),
 //!   since it recompiles once per assert.
+//! - [`differential`] — the VM's accept/reject must match the reference model on many random
+//!   witnesses (not just one honest + the canonical violating cell). Catches *weakened* checks
+//!   (OR-escape, implicit-zero, wrong operand) that still reject the canonical violator. `deep`
+//!   only (many extra VM runs per gadget).
 
 pub mod check_enforced;
+pub mod differential;
 pub mod structural;
 pub mod structural_diff;
 
@@ -47,6 +52,7 @@ pub fn evaluate(prog: &CheckedProgram, rng: &mut Rng, seed: u64, deep: bool) -> 
     let mut findings = structural::evaluate(prog, &bc, seed, &source);
     if deep {
         findings.extend(structural_diff::evaluate(&bc, &source, seed));
+        findings.extend(differential::evaluate(prog, &bc, &source, rng, seed));
     }
     findings.extend(check_enforced::evaluate(prog, &bc, &source, rng, seed));
     findings

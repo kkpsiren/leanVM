@@ -390,6 +390,38 @@ fn hard_kinds_isolate() {
     }
 }
 
+/// Safety net for the random-differential oracle: against the CORRECT compiler, the VM's
+/// accept/reject must equal `Gadget::accepts` for every random witness of every pure gadget kind.
+/// Any finding here means a `Gadget::accepts` predicate disagrees with the real VM semantics (a
+/// false positive that would flood a campaign) — caught before it can. Runs many witness rounds.
+#[test]
+fn differential_oracle_clean_on_all_kinds() {
+    let gadgets: Vec<Gadget> = all_gadget_kinds()
+        .into_iter()
+        .enumerate()
+        .map(|(id, kind)| {
+            let comp = comp_for(&kind);
+            Gadget { id, kind, comp }
+        })
+        .collect();
+    let prog = CheckedProgram::new(gadgets);
+    let source = prog.emit_source();
+    let bc = match compile_source(&source) {
+        CompileOutcome::Ok(bc) => bc,
+        other => panic!("all-kinds program failed to compile: {other:?}"),
+    };
+    // 20 rounds × 16 witnesses/gadget = a thorough sweep of each pure predicate.
+    for round in 0..20u64 {
+        let mut rng = Rng::new(0xD1FF_0000 ^ round);
+        let findings = crate::oracles::differential::evaluate(&prog, &bc, &source, &mut rng, round);
+        assert!(
+            findings.is_empty(),
+            "differential oracle false-positived on the correct compiler (round {round}): {:?}",
+            findings.iter().map(|f| f.detail.clone()).collect::<Vec<_>>()
+        );
+    }
+}
+
 /// Bounded baseline: the real compiler must produce no Critical/High findings over a fixed seed
 /// range. This is the regression guard that runs as part of the suite.
 #[test]
