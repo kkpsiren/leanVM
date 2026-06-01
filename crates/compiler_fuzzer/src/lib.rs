@@ -38,7 +38,11 @@
 //! Every run is driven by a 64-bit seed, so any finding reproduces exactly. See
 //! [`campaign`] for the driver and [`triage`] for finding serialization.
 
+pub mod campaign;
 pub mod field_util;
+pub mod generators;
 pub mod harness;
 pub mod model;
+pub mod oracles;
 pub mod rng;
+pub mod triage;

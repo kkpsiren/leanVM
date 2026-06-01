@@ -1,91 +1,64 @@
-//! TEMPORARY model validation driver.
+//! Soak driver for the compiler fuzzer.
+//!
+//! ```text
+//! cargo run --release -p compiler_fuzzer -- [--seed S] [--iters N] [--out DIR] [--quiet] [--stop-on-critical]
+//! ```
+//!
+//! Each iteration generates a program from a consecutive seed, compiles it, and runs every
+//! oracle. Findings are printed (one line each) and, with `--out DIR`, written as replayable
+//! `.py` + `.json` reproducers. Exit code is non-zero if any Critical/High finding appeared.
 
-use compiler_fuzzer::field_util::zero_public_input;
-use compiler_fuzzer::harness::{CompileOutcome, RunOutcome, compile_source, run};
-use compiler_fuzzer::model::{CheckedProgram, Computation, Gadget, GadgetKind, Op, Operand, Step};
-use compiler_fuzzer::rng::Rng;
+use std::path::PathBuf;
+use std::process::ExitCode;
 
-fn comp2() -> Computation {
-    // value = in0 + in1
-    Computation {
-        n_inputs: 2,
-        steps: vec![Step {
-            op: Op::Add,
-            a: Operand::Input(0),
-            b: Operand::Input(1),
-        }],
-    }
-}
+use compiler_fuzzer::campaign::{CampaignConfig, run_campaign};
+use compiler_fuzzer::triage::Severity;
 
-fn main() {
-    let gadgets = vec![
-        Gadget {
-            id: 0,
-            kind: GadgetKind::EqBound,
-            comp: comp2(),
-        },
-        Gadget {
-            id: 1,
-            kind: GadgetKind::EqConst { c: 12345 },
-            comp: comp2(),
-        },
-        Gadget {
-            id: 2,
-            kind: GadgetKind::Ne,
-            comp: comp2(),
-        },
-        Gadget {
-            id: 3,
-            kind: GadgetKind::Bool,
-            comp: Computation::identity(1),
-        },
-        Gadget {
-            id: 4,
-            kind: GadgetKind::RangeLt { bound: 1000 },
-            comp: Computation::identity(1),
-        },
-        Gadget {
-            id: 5,
-            kind: GadgetKind::RangeLe { bound: 1000 },
-            comp: Computation::identity(1),
-        },
-    ];
-    let prog = CheckedProgram::new(gadgets);
-    let source = prog.emit_source();
-    println!("==== SOURCE ====\n{source}\n================");
-
-    let bc = match compile_source(&source) {
-        CompileOutcome::Ok(bc) => bc,
-        other => {
-            println!("COMPILE FAILED: {other:?}");
-            return;
-        }
+fn main() -> ExitCode {
+    let mut cfg = CampaignConfig {
+        verbose: true,
+        ..Default::default()
     };
 
-    let mut rng = Rng::new(42);
-    let honest = prog.honest_buffers(&mut rng);
-    let input = zero_public_input();
-
-    match run(&bc, &input, &CheckedProgram::witness(&honest)) {
-        RunOutcome::Ok(_) => println!("honest run: OK (expected)"),
-        other => println!("honest run: UNEXPECTED {other:?}"),
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--seed" => cfg.start_seed = args.next().and_then(|v| v.parse().ok()).unwrap_or(0),
+            "--iters" => cfg.iterations = args.next().and_then(|v| v.parse().ok()).unwrap_or(1000),
+            "--out" => cfg.out_dir = args.next().map(PathBuf::from),
+            "--quiet" => cfg.verbose = false,
+            "--stop-on-critical" => cfg.stop_on_critical = true,
+            other => {
+                eprintln!("unknown argument: {other}");
+                return ExitCode::from(2);
+            }
+        }
     }
 
-    for i in 0..prog.gadgets.len() {
-        let bufs = prog.violating_buffers(&honest, i);
-        let out = run(&bc, &input, &CheckedProgram::witness(&bufs));
-        let g = &prog.gadgets[i];
-        match out {
-            RunOutcome::Ok(_) => println!("  gadget {i} [{}] violation: ACCEPTED -> DROPPED CHECK?!", g.label()),
-            RunOutcome::Error(e) => {
-                let cls = compiler_fuzzer::harness::FailureClass::of(&e);
-                let ok = cls.consistent_with(g.check_kind());
-                println!(
-                    "  gadget {i} [{}] violation: rejected ({e:?}) consistent={ok}",
-                    g.label()
-                );
-            }
-            RunOutcome::Panicked(p) => println!("  gadget {i} [{}] violation: VM PANIC {}", g.label(), p.message),
+    println!(
+        "fuzzing: seeds [{}, {}), out={:?}",
+        cfg.start_seed,
+        cfg.start_seed.wrapping_add(cfg.iterations),
+        cfg.out_dir
+    );
+
+    let report = run_campaign(&cfg);
+
+    let crit = report.criticals();
+    let high = report.highs();
+    let info = report.count(Severity::Info);
+    println!(
+        "\ndone: {} iterations, {crit} critical, {high} high, {info} info findings",
+        report.iterations_run
+    );
+
+    if crit > 0 || high > 0 {
+        println!("\nactionable findings:");
+        for f in report.actionable() {
+            println!("  {}", f.summary());
         }
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
     }
 }

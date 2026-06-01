@@ -124,29 +124,42 @@ pub fn run(bytecode: &Bytecode, public_input: &[F; PUBLIC_INPUT_LEN], witness: &
 /// The fuzzer triggers errors by design (a violated check must be rejected), so without this
 /// a campaign would emit thousands of traces. fd-level redirection catches the C-style
 /// `eprintln!` writes that a Rust-level capture would miss.
+///
+/// Gags are **reference-counted under a global mutex**: nested gags (the campaign gags, then
+/// each `run` gags again) and concurrent gags from multiple test threads compose without racing
+/// on fd 2. Only the outermost gag performs the actual `dup2`, and only the last drop restores.
 pub struct StderrGag {
+    _private: (),
+}
+
+struct GagState {
+    depth: usize,
     saved_fd: i32,
 }
 
+static GAG: std::sync::Mutex<GagState> = std::sync::Mutex::new(GagState { depth: 0, saved_fd: -1 });
+
 impl StderrGag {
-    /// Begin gagging. If `/dev/null` can't be opened, this is a no-op guard.
+    /// Begin gagging (idempotent / nestable). If `/dev/null` can't be opened, this is a no-op.
     #[must_use]
     pub fn new() -> Self {
-        // SAFETY: standard fd plumbing; all fds are checked before use.
-        unsafe {
-            let devnull = libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY);
-            if devnull < 0 {
-                return Self { saved_fd: -1 };
+        let mut g = GAG.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if g.depth == 0 {
+            // SAFETY: standard fd plumbing; all fds are checked before use.
+            unsafe {
+                let devnull = libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY);
+                if devnull >= 0 {
+                    let saved = libc::dup(libc::STDERR_FILENO);
+                    if saved >= 0 {
+                        libc::dup2(devnull, libc::STDERR_FILENO);
+                        g.saved_fd = saved;
+                    }
+                    libc::close(devnull);
+                }
             }
-            let saved = libc::dup(libc::STDERR_FILENO);
-            if saved < 0 {
-                libc::close(devnull);
-                return Self { saved_fd: -1 };
-            }
-            libc::dup2(devnull, libc::STDERR_FILENO);
-            libc::close(devnull);
-            Self { saved_fd: saved }
         }
+        g.depth += 1;
+        Self { _private: () }
     }
 }
 
@@ -158,12 +171,15 @@ impl Default for StderrGag {
 
 impl Drop for StderrGag {
     fn drop(&mut self) {
-        if self.saved_fd >= 0 {
-            // SAFETY: `saved_fd` is a valid dup of the original stderr.
+        let mut g = GAG.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        g.depth -= 1;
+        if g.depth == 0 && g.saved_fd >= 0 {
+            // SAFETY: `saved_fd` is a valid dup of the original stderr taken by the outer gag.
             unsafe {
-                libc::dup2(self.saved_fd, libc::STDERR_FILENO);
-                libc::close(self.saved_fd);
+                libc::dup2(g.saved_fd, libc::STDERR_FILENO);
+                libc::close(g.saved_fd);
             }
+            g.saved_fd = -1;
         }
     }
 }
