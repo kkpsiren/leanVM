@@ -316,15 +316,7 @@ pub fn simplify_program(mut program: Program) -> Result<SimpleProgram, String> {
     program.functions.retain(|_, func| !func.inlined);
 
     // Remove all const functions - they should all have been specialized by now
-    let const_func_names: Vec<_> = program
-        .functions
-        .iter()
-        .filter(|(_, func)| func.has_const_arguments())
-        .map(|(name, _)| name.clone())
-        .collect();
-    for name in const_func_names {
-        program.functions.remove(&name);
-    }
+    program.functions.retain(|_, func| !func.has_const_arguments());
 
     let mut mutable_loop_counter = Counter::new();
     transform_mutable_in_loops_in_program(&mut program, &mut mutable_loop_counter)?;

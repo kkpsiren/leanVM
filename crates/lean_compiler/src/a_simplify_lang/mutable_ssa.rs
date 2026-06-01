@@ -61,7 +61,7 @@ impl Tracker {
     /// is not a mutable variable).
     fn current_name(&self, var: &Var) -> Var {
         match self.versions.get(var) {
-            Some(version) => format!("@mut_{var}_{version}"),
+            Some(&version) => versioned(var, version),
             None => var.clone(),
         }
     }
@@ -79,7 +79,7 @@ impl Tracker {
             .get_mut(var)
             .expect("next_version on a non-mutable variable");
         *version += 1;
-        format!("@mut_{var}_{version}")
+        versioned(var, *version)
     }
 
     /// Reject reassignment of an immutable variable. Compiler-generated names
@@ -419,6 +419,12 @@ fn copy_var(target: &str, source: &str) -> Line {
 fn ends_with_early_exit(block: &[Line]) -> bool {
     match block.last() {
         Some(Line::FunctionRet { .. } | Line::Panic { .. }) => true,
+        // A loop never *guarantees* an exit: `range` / `parallel_range` may run
+        // zero iterations, so control can fall through past it even if the body
+        // always diverges. Treating it as an early exit would wrongly drop the
+        // branch from the phi-merge in `unify_branch_versions`.
+        Some(Line::ForLoop { .. }) => false,
+        // An `if` / `match` exits early only if every branch does.
         Some(last) => {
             let nested = last.nested_blocks();
             !nested.is_empty() && nested.iter().all(|b| ends_with_early_exit(b))
