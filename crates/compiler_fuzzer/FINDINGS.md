@@ -1,14 +1,18 @@
 # Findings
 
 Compiler bugs surfaced by `compiler_fuzzer`. Each is a *parseable* program that the compiler
-must handle gracefully (compile, or reject with a clean `CompileError`) but does not. All three
-are in the **crash** class (goal #1); the `--probes` mode reproduces them:
+must handle gracefully (compile, or reject with a clean `CompileError`) but did not.
+
+> **Status: all crashes below are FIXED** (merged into `main` as
+> `zkDSL compiler: various consolidations`; this branch has the fix via the `main` merge).
+> `--probes` now reports `0 / N crashed`, and the regression cases live in
+> `crates/lean_compiler/tests/test_data/error_93..98.py`.
 
 ```bash
-cargo run --release -p compiler_fuzzer -- --probes
+cargo run --release -p compiler_fuzzer -- --probes   # 0 crashes after the fix
 ```
 
-The check-enforcement campaign (goal #2) has found **no dropped checks** across 70k+ generated
+The check-enforcement campaign (goal #2) has found **no dropped checks** across 90k+ generated
 programs spanning every gadget kind and the metamorphic variants.
 
 ---
@@ -28,6 +32,7 @@ iterations). Wall-clock hang / unbounded memory.
 **Suspected site:** the unroll expansion (`a_simplify_lang/mod.rs`, the `start..end` /
 `to_usize()` loop). A bound check (e.g. a cap on total unrolled iterations) would turn this into
 a clean error.
+**Fixed:** `MAX_UNROLL_ITERATIONS` cap in `a_simplify_lang/mod.rs` (reversed `start>end` stays a valid empty no-op).
 
 ## 2. `match_range` over an empty range panics
 
@@ -42,6 +47,7 @@ def main():
 **Symptom:** `called `Option::unwrap()` on a `None` value` at
 `crates/lean_compiler/src/c_compile_final.rs:87`.
 A degenerate/empty `match_range` should be a clean compile error.
+**Fixed:** `.max()` now `ok_or_else(...)?` in `c_compile_final.rs` → clean error.
 
 ## 3. Out-of-bounds compile-time array index panics
 
@@ -57,6 +63,7 @@ def main():
 `crates/lean_compiler/src/b_compile_intermediate.rs:62`. A constant index past the end of a
 constant array should be a clean compile error, with a message about the index, not a panic
 about the variable being out of scope.
+**Fixed:** the assignment arm now routes const-array reads to `simplify_expr` (bounds-checked), and a target guard rejects const-array *writes*.
 
 ---
 
