@@ -8,6 +8,7 @@ use crate::generators::{GenConfig, gen_program};
 use crate::harness::StderrGag;
 use crate::oracles;
 use crate::rng::Rng;
+use crate::transforms;
 use crate::triage::{Finding, Severity};
 
 /// Configuration for a fuzzing campaign.
@@ -25,6 +26,8 @@ pub struct CampaignConfig {
     pub verbose: bool,
     /// Stop the campaign as soon as a `Critical` finding appears.
     pub stop_on_critical: bool,
+    /// Also evaluate semantics-preserving transforms (reorder, duplicate) of each program.
+    pub metamorphic: bool,
 }
 
 impl Default for CampaignConfig {
@@ -36,6 +39,7 @@ impl Default for CampaignConfig {
             out_dir: None,
             verbose: false,
             stop_on_critical: false,
+            metamorphic: true,
         }
     }
 }
@@ -83,7 +87,16 @@ pub fn run_campaign(cfg: &CampaignConfig) -> CampaignReport {
 
         let mut rng = Rng::new(seed);
         let prog = gen_program(&mut rng, &cfg.gen_config);
-        let findings = oracles::evaluate(&prog, &mut rng, seed);
+        let mut findings = oracles::evaluate(&prog, &mut rng, seed);
+
+        if cfg.metamorphic {
+            // Distinct rng stream so variant witnesses don't shadow the base's.
+            let mut vrng = Rng::new(seed ^ 0x5EED_BEEF_5EED_BEEF);
+            let reordered = transforms::reorder(&prog, &mut vrng);
+            findings.extend(oracles::evaluate(&reordered, &mut vrng, seed));
+            let duplicated = transforms::duplicate(&prog);
+            findings.extend(oracles::evaluate(&duplicated, &mut vrng, seed));
+        }
 
         let mut hit_critical = false;
         for f in findings {

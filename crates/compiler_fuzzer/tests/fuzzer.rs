@@ -221,9 +221,11 @@ fn hard_kinds_isolate() {
 /// range. This is the regression guard that runs as part of the suite.
 #[test]
 fn baseline_campaign_is_clean() {
+    // A modest, fast regression guard (the real hunting is the CLI soak driver). Metamorphic
+    // variants are on by default, so this exercises reorder/duplicate transforms too.
     let cfg = CampaignConfig {
         start_seed: 0,
-        iterations: 256,
+        iterations: 128,
         ..Default::default()
     };
     let report = run_campaign(&cfg);

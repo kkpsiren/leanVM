@@ -47,4 +47,5 @@ pub mod oracles;
 pub mod probes;
 pub mod rng;
 pub mod subprocess;
+pub mod transforms;
 pub mod triage;
