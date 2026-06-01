@@ -39,6 +39,7 @@
 //! [`campaign`] for the driver and [`triage`] for finding serialization.
 
 pub mod campaign;
+pub mod corpus;
 pub mod field_util;
 pub mod generators;
 pub mod harness;

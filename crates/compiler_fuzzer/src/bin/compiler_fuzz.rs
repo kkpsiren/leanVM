@@ -30,6 +30,8 @@ fn main() -> ExitCode {
     };
 
     let mut run_probes = false;
+    let mut corpus_iters: Option<u64> = None;
+    let mut corpus_dir: Option<PathBuf> = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -37,8 +39,11 @@ fn main() -> ExitCode {
             "--iters" => cfg.iterations = args.next().and_then(|v| v.parse().ok()).unwrap_or(1000),
             "--out" => cfg.out_dir = args.next().map(PathBuf::from),
             "--quiet" => cfg.verbose = false,
+            "--no-metamorphic" => cfg.metamorphic = false,
             "--stop-on-critical" => cfg.stop_on_critical = true,
             "--probes" => run_probes = true,
+            "--corpus" => corpus_iters = Some(args.next().and_then(|v| v.parse().ok()).unwrap_or(10000)),
+            "--corpus-dir" => corpus_dir = args.next().map(PathBuf::from),
             other => {
                 eprintln!("unknown argument: {other}");
                 return ExitCode::from(2);
@@ -56,6 +61,32 @@ fn main() -> ExitCode {
         );
         for f in &findings {
             println!("  {}", f.summary());
+        }
+        return if findings.is_empty() {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::FAILURE
+        };
+    }
+
+    if let Some(iters) = corpus_iters {
+        let bin = std::env::current_exe().expect("current exe path");
+        let dir = corpus_dir.unwrap_or_else(compiler_fuzzer::corpus::default_corpus_dir);
+        println!("corpus mutation: {iters} mutants from {}", dir.display());
+        let findings = compiler_fuzzer::corpus::fuzz_corpus(
+            &bin,
+            &dir,
+            cfg.start_seed,
+            iters,
+            compiler_fuzzer::probes::PROBE_TIMEOUT,
+            compiler_fuzzer::probes::PROBE_MEM_LIMIT,
+        );
+        println!("corpus mutation: {} crashes", findings.len());
+        for f in &findings {
+            println!("  {}", f.summary());
+            if let Some(dir) = &cfg.out_dir {
+                let _ = f.write_to_dir(dir);
+            }
         }
         return if findings.is_empty() {
             ExitCode::SUCCESS
