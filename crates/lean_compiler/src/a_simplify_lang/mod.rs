@@ -1862,138 +1862,17 @@ fn simplify_lines(
                             continue;
                         }
 
-                        // Special handling for print builtin
-                        if function_name == "print" {
-                            if !targets.is_empty() {
-                                return Err(format!("print should not return values, at {location}"));
-                            }
-                            let simplified_content = args
-                                .iter()
-                                .map(|arg| simplify_expr(ctx, state, const_malloc, arg, &mut res))
-                                .collect::<Result<Vec<_>, _>>()?;
-                            res.push(SimpleLine::Print {
-                                line_info: format!("line {}", location.line_number),
-                                content: simplified_content,
-                            });
-                            continue;
-                        }
-
-                        // Special handling for extension_op precompile
-                        // Signature: func(ptr_a, ptr_b, ptr_res) or func(ptr_a, ptr_b, ptr_res, length)
-                        if let Some(mode) = ExtensionOpMode::from_name(function_name) {
-                            if !targets.is_empty() {
-                                return Err(format!(
-                                    "Precompile {function_name} should not return values, at {location}"
-                                ));
-                            }
-                            if args.len() != 3 && args.len() != 4 {
-                                return Err(format!(
-                                    "Precompile {function_name} expects 3 or 4 arguments (a, b, result[, length]), got {}, at {location}",
-                                    args.len()
-                                ));
-                            }
-                            let simplified_args = args[..3]
-                                .iter()
-                                .map(|arg| simplify_expr(ctx, state, const_malloc, arg, &mut res))
-                                .collect::<Result<Vec<_>, _>>()?;
-
-                            let size = if args.len() == 4 {
-                                simplify_expr(ctx, state, const_malloc, &args[3], &mut res)?
-                                    .as_constant()
-                                    .expect("extension op size must be a constant")
-                            } else {
-                                ConstExpression::one()
-                            };
-                            res.push(SimpleLine::Precompile(PrecompileArgs {
-                                arg_0: simplified_args[0].clone(),
-                                arg_1: simplified_args[1].clone(),
-                                res: simplified_args[2].clone(),
-                                data: PrecompileCompTimeArgs::ExtensionOp { size, mode },
-                            }));
-                            continue;
-                        }
-
-                        // Special handling for poseidon16 precompile (5 variants).
-                        if ALL_POSEIDON16_NAMES.contains(&function_name.as_str()) {
-                            if !targets.is_empty() {
-                                return Err(format!(
-                                    "Precompile {function_name} should not return values, at {location}"
-                                ));
-                            }
-                            let permute = [
-                                POSEIDON16_PERMUTE_NAME,
-                                POSEIDON16_PERMUTE_HALF_NAME,
-                                POSEIDON16_PERMUTE_HALF_HARDCODED_LEFT_NAME,
-                            ]
-                            .contains(&function_name.as_str());
-                            let half_output = [
-                                POSEIDON16_QUARTER_NAME,
-                                POSEIDON16_QUARTER_HARDCODED_LEFT_NAME,
-                                POSEIDON16_PERMUTE_HALF_NAME,
-                                POSEIDON16_PERMUTE_HALF_HARDCODED_LEFT_NAME,
-                            ]
-                            .contains(&function_name.as_str());
-                            let is_hardcoded_left = [
-                                POSEIDON16_HARDCODED_LEFT_NAME,
-                                POSEIDON16_QUARTER_HARDCODED_LEFT_NAME,
-                                POSEIDON16_PERMUTE_HALF_HARDCODED_LEFT_NAME,
-                            ]
-                            .contains(&function_name.as_str());
-                            let expected_args = if is_hardcoded_left { 4 } else { 3 };
-                            if args.len() != expected_args {
-                                let signature = if is_hardcoded_left {
-                                    "(ptr_a, ptr_b, ptr_res, offset)"
-                                } else {
-                                    "(ptr_a, ptr_b, ptr_res)"
-                                };
-                                return Err(format!(
-                                    "Precompile {function_name} expects {expected_args} arguments {signature}, got {}, at {location}",
-                                    args.len()
-                                ));
-                            }
-                            let simplified_args = args
-                                .iter()
-                                .map(|arg| simplify_expr(ctx, state, const_malloc, arg, &mut res))
-                                .collect::<Result<Vec<_>, _>>()?;
-                            let hardcoded_offset_left = if is_hardcoded_left {
-                                Some(simplified_args[3].as_constant().ok_or_else(|| {
-                                    format!(
-                                        "{function_name}: offset argument must be a compile-time constant, at {location}"
-                                    )
-                                })?)
-                            } else {
-                                None
-                            };
-                            res.push(SimpleLine::Precompile(PrecompileArgs {
-                                arg_0: simplified_args[0].clone(),
-                                arg_1: simplified_args[1].clone(),
-                                res: simplified_args[2].clone(),
-                                data: PrecompileCompTimeArgs::Poseidon16 {
-                                    half_output,
-                                    hardcoded_offset_left,
-                                    permute,
-                                },
-                            }));
-                            continue;
-                        }
-
-                        // Special handling for custom hints
-                        if let Some(hint) = CustomHint::find_by_name(function_name) {
-                            if !targets.is_empty() {
-                                return Err(format!(
-                                    "Custom hint {function_name} should not return values, at {location}"
-                                ));
-                            }
-                            if args.len() != hint.n_args() {
-                                return Err(format!(
-                                    "Custom hint {function_name}: invalid number of arguments, at {location}"
-                                ));
-                            }
-                            let simplified_args = args
-                                .iter()
-                                .map(|arg| simplify_expr(ctx, state, const_malloc, arg, &mut res))
-                                .collect::<Result<Vec<_>, _>>()?;
-                            res.push(SimpleLine::CustomHint(hint, simplified_args));
+                        // Precompile / hint / print builtins (these take no return targets).
+                        if try_lower_simple_builtin(
+                            ctx,
+                            state,
+                            const_malloc,
+                            function_name,
+                            args,
+                            targets,
+                            *location,
+                            &mut res,
+                        )? {
                             continue;
                         }
 
@@ -2209,111 +2088,7 @@ fn simplify_lines(
                 boolean,
                 debug,
                 location,
-            } => {
-                let left = simplify_expr(ctx, state, const_malloc, &boolean.left, &mut res)?;
-                let right = simplify_expr(ctx, state, const_malloc, &boolean.right, &mut res)?;
-                if *debug {
-                    res.push(SimpleLine::DebugAssert {
-                        expr: BooleanExpr {
-                            left,
-                            right,
-                            kind: boolean.kind,
-                        },
-                        location: *location,
-                        preceds_runtime_inequality: false,
-                    });
-                } else {
-                    match boolean.kind {
-                        Boolean::Different => {
-                            let diff_var = state.counters.aux_var();
-                            res.push(SimpleLine::Assignment {
-                                var: diff_var.clone().into(),
-                                op: MathOperation::Sub,
-                                arg0: left,
-                                arg1: right,
-                            });
-                            res.push(SimpleLine::IfNotZero {
-                                condition: diff_var.into(),
-                                then_branch: vec![],
-                                else_branch: vec![SimpleLine::Panic { message: None }],
-                                location: *location,
-                            });
-                        }
-                        Boolean::Equal => {
-                            // Both constants: evaluate at compile time.
-                            if let (SimpleExpr::Constant(left_const), SimpleExpr::Constant(right_const)) =
-                                (&left, &right)
-                                && let (Some(left_val), Some(right_val)) =
-                                    (left_const.naive_eval(), right_const.naive_eval())
-                            {
-                                if left_val == right_val {
-                                    continue;
-                                } else {
-                                    return Err(format!(
-                                        "Compile-time assertion failed: {} != {} ({})",
-                                        left_val.to_usize(),
-                                        right_val.to_usize(),
-                                        location
-                                    ));
-                                }
-                            }
-                            if !matches!(&left, SimpleExpr::Memory(_)) && !matches!(&right, SimpleExpr::Memory(_)) {
-                                return Err(format!("Unsupported equality assertion: {left:?}, {right:?}"));
-                            }
-                            res.push(SimpleLine::AssertEq {
-                                left,
-                                right,
-                                location: *location,
-                            });
-                        }
-                        Boolean::LessThan => {
-                            // assert left < right is equivalent to assert left <= right - 1
-                            let bound_minus_one = state.counters.aux_var();
-                            res.push(SimpleLine::Assignment {
-                                var: bound_minus_one.clone().into(),
-                                op: MathOperation::Sub,
-                                arg0: right,
-                                arg1: SimpleExpr::one(),
-                            });
-
-                            // We add a debug assert for sanity
-                            res.push(SimpleLine::DebugAssert {
-                                expr: BooleanExpr {
-                                    kind: Boolean::LessOrEqual,
-                                    left: left.clone(),
-                                    right: bound_minus_one.clone().into(),
-                                },
-                                location: *location,
-                                preceds_runtime_inequality: true,
-                            });
-
-                            res.push(SimpleLine::RangeCheck {
-                                val: left,
-                                bound: bound_minus_one.into(),
-                            });
-                        }
-                        Boolean::LessOrEqual => {
-                            // Range check: assert left <= right
-
-                            // we add a debug assert for sanity
-                            res.push(SimpleLine::DebugAssert {
-                                expr: BooleanExpr {
-                                    kind: Boolean::LessOrEqual,
-                                    left: left.clone(),
-                                    right: right.clone(),
-                                },
-                                location: *location,
-                                preceds_runtime_inequality: true,
-                            });
-
-                            res.push(SimpleLine::RangeCheck {
-                                val: left,
-                                bound: right,
-                            });
-                        }
-                    }
-                }
-            }
+            } => lower_assert(ctx, state, const_malloc, boolean, *debug, *location, &mut res)?,
             Line::IfCondition {
                 condition,
                 then_branch,
@@ -2532,6 +2307,261 @@ fn simplify_lines(
     }
 
     Ok(res)
+}
+
+/// Lower the precompile / hint / print builtins — every call that takes no return
+/// targets: `print`, the extension-op precompiles, the Poseidon16 precompiles, and
+/// custom hints. Returns `Ok(true)` if `function_name` named such a builtin (in which
+/// case the corresponding `SimpleLine` has been pushed), or `Ok(false)` for an
+/// ordinary function call (handled by the caller).
+#[allow(clippy::too_many_arguments)]
+fn try_lower_simple_builtin(
+    ctx: &SimplifyContext<'_>,
+    state: &mut SimplifyState<'_>,
+    const_malloc: &ConstMalloc,
+    function_name: &str,
+    args: &[Expression],
+    targets: &[AssignmentTarget],
+    location: SourceLocation,
+    res: &mut Vec<SimpleLine>,
+) -> Result<bool, String> {
+    let simplify_args = |state: &mut SimplifyState<'_>, res: &mut Vec<SimpleLine>| {
+        args.iter()
+            .map(|arg| simplify_expr(ctx, state, const_malloc, arg, res))
+            .collect::<Result<Vec<_>, _>>()
+    };
+
+    if function_name == "print" {
+        if !targets.is_empty() {
+            return Err(format!("print should not return values, at {location}"));
+        }
+        let content = simplify_args(state, res)?;
+        res.push(SimpleLine::Print {
+            line_info: format!("line {}", location.line_number),
+            content,
+        });
+        return Ok(true);
+    }
+
+    // Extension-op precompile: func(ptr_a, ptr_b, ptr_res) or func(..., length).
+    if let Some(mode) = ExtensionOpMode::from_name(function_name) {
+        if !targets.is_empty() {
+            return Err(format!(
+                "Precompile {function_name} should not return values, at {location}"
+            ));
+        }
+        if args.len() != 3 && args.len() != 4 {
+            return Err(format!(
+                "Precompile {function_name} expects 3 or 4 arguments (a, b, result[, length]), got {}, at {location}",
+                args.len()
+            ));
+        }
+        let simplified_args = args[..3]
+            .iter()
+            .map(|arg| simplify_expr(ctx, state, const_malloc, arg, res))
+            .collect::<Result<Vec<_>, _>>()?;
+        let size = if args.len() == 4 {
+            simplify_expr(ctx, state, const_malloc, &args[3], res)?
+                .as_constant()
+                .expect("extension op size must be a constant")
+        } else {
+            ConstExpression::one()
+        };
+        res.push(SimpleLine::Precompile(PrecompileArgs {
+            arg_0: simplified_args[0].clone(),
+            arg_1: simplified_args[1].clone(),
+            res: simplified_args[2].clone(),
+            data: PrecompileCompTimeArgs::ExtensionOp { size, mode },
+        }));
+        return Ok(true);
+    }
+
+    // Poseidon16 precompile (5 variants).
+    if ALL_POSEIDON16_NAMES.contains(&function_name) {
+        if !targets.is_empty() {
+            return Err(format!(
+                "Precompile {function_name} should not return values, at {location}"
+            ));
+        }
+        let permute = [
+            POSEIDON16_PERMUTE_NAME,
+            POSEIDON16_PERMUTE_HALF_NAME,
+            POSEIDON16_PERMUTE_HALF_HARDCODED_LEFT_NAME,
+        ]
+        .contains(&function_name);
+        let half_output = [
+            POSEIDON16_QUARTER_NAME,
+            POSEIDON16_QUARTER_HARDCODED_LEFT_NAME,
+            POSEIDON16_PERMUTE_HALF_NAME,
+            POSEIDON16_PERMUTE_HALF_HARDCODED_LEFT_NAME,
+        ]
+        .contains(&function_name);
+        let is_hardcoded_left = [
+            POSEIDON16_HARDCODED_LEFT_NAME,
+            POSEIDON16_QUARTER_HARDCODED_LEFT_NAME,
+            POSEIDON16_PERMUTE_HALF_HARDCODED_LEFT_NAME,
+        ]
+        .contains(&function_name);
+        let expected_args = if is_hardcoded_left { 4 } else { 3 };
+        if args.len() != expected_args {
+            let signature = if is_hardcoded_left {
+                "(ptr_a, ptr_b, ptr_res, offset)"
+            } else {
+                "(ptr_a, ptr_b, ptr_res)"
+            };
+            return Err(format!(
+                "Precompile {function_name} expects {expected_args} arguments {signature}, got {}, at {location}",
+                args.len()
+            ));
+        }
+        let simplified_args = simplify_args(state, res)?;
+        let hardcoded_offset_left = if is_hardcoded_left {
+            Some(simplified_args[3].as_constant().ok_or_else(|| {
+                format!("{function_name}: offset argument must be a compile-time constant, at {location}")
+            })?)
+        } else {
+            None
+        };
+        res.push(SimpleLine::Precompile(PrecompileArgs {
+            arg_0: simplified_args[0].clone(),
+            arg_1: simplified_args[1].clone(),
+            res: simplified_args[2].clone(),
+            data: PrecompileCompTimeArgs::Poseidon16 {
+                half_output,
+                hardcoded_offset_left,
+                permute,
+            },
+        }));
+        return Ok(true);
+    }
+
+    // Custom hints.
+    if let Some(hint) = CustomHint::find_by_name(function_name) {
+        if !targets.is_empty() {
+            return Err(format!(
+                "Custom hint {function_name} should not return values, at {location}"
+            ));
+        }
+        if args.len() != hint.n_args() {
+            return Err(format!(
+                "Custom hint {function_name}: invalid number of arguments, at {location}"
+            ));
+        }
+        let simplified_args = simplify_args(state, res)?;
+        res.push(SimpleLine::CustomHint(hint, simplified_args));
+        return Ok(true);
+    }
+
+    Ok(false)
+}
+
+/// Lower an `assert`/`debug_assert` into the appropriate runtime check.
+///
+/// - `debug_assert`           → `DebugAssert` (checked only when running, not proved)
+/// - `assert a != b`          → compute `a - b`, panic if it is zero
+/// - `assert a == b`          → `AssertEq` (or a compile-time check if both are constant)
+/// - `assert a < b` / `a <= b` → a `RangeCheck` (preceded by a sanity `DebugAssert`)
+fn lower_assert(
+    ctx: &SimplifyContext<'_>,
+    state: &mut SimplifyState<'_>,
+    const_malloc: &ConstMalloc,
+    boolean: &BooleanExpr<Expression>,
+    debug: bool,
+    location: SourceLocation,
+    res: &mut Vec<SimpleLine>,
+) -> Result<(), String> {
+    let left = simplify_expr(ctx, state, const_malloc, &boolean.left, res)?;
+    let right = simplify_expr(ctx, state, const_malloc, &boolean.right, res)?;
+
+    if debug {
+        res.push(SimpleLine::DebugAssert {
+            expr: BooleanExpr {
+                left,
+                right,
+                kind: boolean.kind,
+            },
+            location,
+            preceds_runtime_inequality: false,
+        });
+        return Ok(());
+    }
+
+    match boolean.kind {
+        Boolean::Different => {
+            let diff_var = state.counters.aux_var();
+            res.push(SimpleLine::Assignment {
+                var: diff_var.clone().into(),
+                op: MathOperation::Sub,
+                arg0: left,
+                arg1: right,
+            });
+            res.push(SimpleLine::IfNotZero {
+                condition: diff_var.into(),
+                then_branch: vec![],
+                else_branch: vec![SimpleLine::Panic { message: None }],
+                location,
+            });
+        }
+        Boolean::Equal => {
+            // Both constants: evaluate at compile time.
+            if let (SimpleExpr::Constant(left_const), SimpleExpr::Constant(right_const)) = (&left, &right)
+                && let (Some(left_val), Some(right_val)) = (left_const.naive_eval(), right_const.naive_eval())
+            {
+                if left_val == right_val {
+                    return Ok(());
+                }
+                return Err(format!(
+                    "Compile-time assertion failed: {} != {} ({})",
+                    left_val.to_usize(),
+                    right_val.to_usize(),
+                    location
+                ));
+            }
+            if !matches!(&left, SimpleExpr::Memory(_)) && !matches!(&right, SimpleExpr::Memory(_)) {
+                return Err(format!("Unsupported equality assertion: {left:?}, {right:?}"));
+            }
+            res.push(SimpleLine::AssertEq { left, right, location });
+        }
+        Boolean::LessThan => {
+            // assert left < right is equivalent to assert left <= right - 1
+            let bound_minus_one = state.counters.aux_var();
+            res.push(SimpleLine::Assignment {
+                var: bound_minus_one.clone().into(),
+                op: MathOperation::Sub,
+                arg0: right,
+                arg1: SimpleExpr::one(),
+            });
+            res.push(SimpleLine::DebugAssert {
+                expr: BooleanExpr {
+                    kind: Boolean::LessOrEqual,
+                    left: left.clone(),
+                    right: bound_minus_one.clone().into(),
+                },
+                location,
+                preceds_runtime_inequality: true,
+            });
+            res.push(SimpleLine::RangeCheck {
+                val: left,
+                bound: bound_minus_one.into(),
+            });
+        }
+        Boolean::LessOrEqual => {
+            res.push(SimpleLine::DebugAssert {
+                expr: BooleanExpr {
+                    kind: Boolean::LessOrEqual,
+                    left: left.clone(),
+                    right: right.clone(),
+                },
+                location,
+                preceds_runtime_inequality: true,
+            });
+            res.push(SimpleLine::RangeCheck {
+                val: left,
+                bound: right,
+            });
+        }
+    }
+    Ok(())
 }
 
 fn simplify_expr(
