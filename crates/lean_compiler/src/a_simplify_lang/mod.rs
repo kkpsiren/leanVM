@@ -285,6 +285,21 @@ fn check_no_dead_code(body: &[Line], function_name: &str) -> Result<(), String> 
     Ok(())
 }
 
+/// Lower a parsed `Program` into the `SimpleProgram` IR. This is a sequence of
+/// passes over the high-level AST, each doing one job:
+///
+/// 1. `check_program_scoping` / `check_no_dead_code` — static validation.
+/// 2. `compile_time_transform_in_program` — everything compile-time: match_range
+///    expansion, constant folding, `@inline` inlining, `Const`-arg specialization,
+///    constant-`if` folding, and `unroll` loop expansion.
+/// 3. drop the now-consumed inlined and const-arg function definitions.
+/// 4. `transform_mutable_in_loops_in_program` — turn mutable variables carried
+///    across loop iterations into explicit buffer arrays.
+/// 5. `mutable_ssa::resolve_mutable_vars` — rewrite the remaining mutable
+///    variables into single-assignment versions.
+/// 6. `simplify_lines` (per function) — lower expressions/statements to the flat
+///    `SimpleLine` IR (now dealing only with immutable, single-assignment vars).
+/// 7. `propagate_copies` — peephole cleanups on the lowered IR.
 pub fn simplify_program(mut program: Program) -> Result<SimpleProgram, String> {
     check_program_scoping(&program)?;
     for (name, func) in &program.functions {
@@ -2939,10 +2954,8 @@ fn replace_vars_by_const_in_expr(expr: &mut Expression, map: &BTreeMap<Var, F>) 
 fn replace_vars_by_const_in_lines(lines: &mut [Line], map: &BTreeMap<Var, F>) -> Result<(), String> {
     for line in lines {
         match line {
-            Line::ForwardDeclaration { var, .. } => {
-                if map.contains_key(var) {
-                    return Err(format!("Variable {var} is a constant"));
-                }
+            Line::ForwardDeclaration { var, .. } if map.contains_key(var) => {
+                return Err(format!("Variable {var} is a constant"));
             }
             Line::Statement { targets, .. } => {
                 for target in targets.iter() {
