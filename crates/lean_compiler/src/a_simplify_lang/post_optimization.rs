@@ -24,11 +24,16 @@ pub fn propagate_copies(program: &mut SimpleProgram) {
         let refs = get_var_refs(&func.instructions);
         dedup_arithmetic_operations(&mut func.instructions, &refs);
 
-        // Pass 4: Fuse `v = m[ptr+s]; assert v == x` ⇒ `x = m[ptr+s]`.
+        // Pass 4: Dedup repeated reads of the same address (sound: memory is write-once).
+        // Runs after pass 3, which has unified equal index pointers.
+        let refs = get_var_refs(&func.instructions);
+        dedup_array_reads(&mut func.instructions, &refs);
+
+        // Pass 5: Fuse `v = m[ptr+s]; assert v == x` ⇒ `x = m[ptr+s]`.
         let refs = get_var_refs(&func.instructions);
         fuse_raw_asserts(&mut func.instructions, &refs);
 
-        // Pass 5: fuse `Assignment + AssertEq`('c = 0`and 'c = a * b` => `0 = a * b`).
+        // Pass 6: fuse `Assignment + AssertEq`('c = 0`and 'c = a * b` => `0 = a * b`).
         let refs = get_var_refs(&func.instructions);
         fuse_assign_asserts(&mut func.instructions, &refs);
     }
@@ -422,4 +427,65 @@ fn dedup_arithmetic_operations(lines: &mut Vec<SimpleLine>, refs: &BTreeMap<Var,
     if !subst.is_empty() {
         apply_substitutions(lines, &subst);
     }
+}
+
+/// CSE for memory reads: `v = memory[index + shift]` with `v` uniquely-defined.
+/// Because memory is write-once, two reads of the same address yield the same
+/// value, so a later duplicate can be replaced by the first. Mirrors
+/// [`dedup_arithmetic_operations`] but keys on the `(index, shift)` pair.
+///
+/// Runs after `dedup_arithmetic_operations`, which has already unified equal
+/// index pointers (e.g. two `arr + i` computations), so equal reads share an
+/// identical `index` operand here. Dominance is implicit: deduping happens per
+/// block, and a read in an enclosing block dominates the blocks nested after it.
+fn dedup_array_reads(lines: &mut Vec<SimpleLine>, refs: &BTreeMap<Var, VarRefs>) {
+    for line in lines.iter_mut() {
+        for block in line.nested_blocks_mut() {
+            dedup_array_reads(block, refs);
+        }
+    }
+
+    let mut first_def: BTreeMap<(SimpleExpr, ConstExpression), Var> = BTreeMap::new();
+    let mut subst: BTreeMap<Var, SimpleExpr> = BTreeMap::new();
+
+    for line in lines.iter() {
+        let SimpleLine::RawAccess {
+            res: SimpleExpr::Memory(VarOrConstMallocAccess::Var(v)),
+            index,
+            shift,
+        } = line
+        else {
+            continue;
+        };
+        if !is_uniquely_defined(v, refs) {
+            continue;
+        }
+        let key = (chase(index.clone(), &subst), shift.clone());
+        match first_def.entry(key) {
+            Entry::Occupied(e) => {
+                subst.insert(
+                    v.clone(),
+                    SimpleExpr::Memory(VarOrConstMallocAccess::Var(e.get().clone())),
+                );
+            }
+            Entry::Vacant(e) => {
+                e.insert(v.clone());
+            }
+        }
+    }
+
+    if subst.is_empty() {
+        return;
+    }
+
+    // Drop the duplicate reads at this level (their result var is in `subst`);
+    // `apply_substitutions` then rewrites every use and drops their forward-decls.
+    lines.retain(|line| {
+        !matches!(
+            line,
+            SimpleLine::RawAccess { res: SimpleExpr::Memory(VarOrConstMallocAccess::Var(v)), .. }
+                if subst.contains_key(v)
+        )
+    });
+    apply_substitutions(lines, &subst);
 }

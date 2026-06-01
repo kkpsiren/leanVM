@@ -330,7 +330,6 @@ pub fn simplify_program(mut program: Program) -> Result<SimpleProgram, String> {
         const_arrays: &program.const_arrays,
     };
     for (name, func) in &program.functions {
-        let mut array_manager = ArrayManager::default();
         let mut mut_tracker = MutableVarTracker::default();
 
         // All arguments are immutable; record them as assigned to detect illegal reassignment.
@@ -346,7 +345,6 @@ pub fn simplify_program(mut program: Program) -> Result<SimpleProgram, String> {
 
         let mut state = SimplifyState {
             counters: &mut counters,
-            array_manager: &mut array_manager,
             mut_tracker: &mut mut_tracker,
         };
         let simplified_instructions = simplify_lines(
@@ -1540,15 +1538,7 @@ struct SimplifyContext<'a> {
 
 struct SimplifyState<'a> {
     counters: &'a mut Counters,
-    array_manager: &'a mut ArrayManager,
     mut_tracker: &'a mut MutableVarTracker,
-}
-
-#[derive(Debug, Clone, Default)]
-struct ArrayManager {
-    counter: usize,
-    aux_vars: BTreeMap<(SimpleExpr, Expression), Var>, // (array, index) -> aux_var
-    valid: BTreeSet<Var>,                              // currently valid aux vars
 }
 
 /// Tracks the current "version" of each mutable variable for SSA-like transformation
@@ -1711,18 +1701,6 @@ pub struct ConstMalloc {
     map: BTreeMap<Var, ConstMallocLabel>,
 }
 
-impl ArrayManager {
-    fn get_aux_var(&mut self, array: &SimpleExpr, index: &Expression) -> Var {
-        if let Some(var) = self.aux_vars.get(&(array.clone(), index.clone())) {
-            return var.clone();
-        }
-        let new_var = format!("@arr_aux_{}", self.counter);
-        self.counter += 1;
-        self.aux_vars.insert((array.clone(), index.clone()), new_var.clone());
-        new_var
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 fn simplify_lines(
     ctx: &SimplifyContext<'_>,
@@ -1762,9 +1740,8 @@ fn simplify_lines(
 
                 let simple_value = simplify_expr(ctx, state, const_malloc, value, &mut res)?;
 
-                // Snapshot state before processing arms
+                // Snapshot mutable-var versions before processing arms
                 let mut_tracker_snapshot = state.mut_tracker.clone();
-                let array_manager_snapshot = state.array_manager.clone();
 
                 let mut simple_arms = vec![];
                 let mut arm_versions = vec![];
@@ -1772,7 +1749,6 @@ fn simplify_lines(
                 for (_, statements) in arms.iter() {
                     // Restore snapshot for each arm
                     *state.mut_tracker = mut_tracker_snapshot.clone();
-                    *state.array_manager = array_manager_snapshot.clone();
 
                     let arm_simplified = simplify_lines(
                         ctx,
@@ -1794,9 +1770,6 @@ fn simplify_lines(
                     &mut simple_arms,
                 );
                 res.extend(forward_decls);
-
-                // Restore array manager to snapshot state
-                *state.array_manager = array_manager_snapshot;
 
                 res.push(SimpleLine::Match {
                     value: simple_value,
@@ -2366,14 +2339,12 @@ fn simplify_lines(
                 });
                 let condition_simplified: SimpleExpr = diff_var.into();
 
-                // Snapshot state before processing branches
+                // Snapshot mutable-var versions before processing branches
                 let mut_tracker_snapshot = state.mut_tracker.clone();
 
-                let mut array_manager_then = state.array_manager.clone();
                 let mut mut_tracker_then = state.mut_tracker.clone();
                 let mut state_then = SimplifyState {
                     counters: state.counters,
-                    array_manager: &mut array_manager_then,
                     mut_tracker: &mut mut_tracker_then,
                 };
                 let then_branch_simplified = simplify_lines(
@@ -2387,15 +2358,9 @@ fn simplify_lines(
                 )?;
                 let then_versions = mut_tracker_then.versions.clone();
 
-                let mut array_manager_else = array_manager_then.clone();
-                array_manager_else.valid = state.array_manager.valid.clone(); // Crucial: remove the access added in the IF branch
-
-                // Restore state for else branch
                 let mut mut_tracker_else = mut_tracker_snapshot.clone();
-
                 let mut state_else = SimplifyState {
                     counters: state.counters,
-                    array_manager: &mut array_manager_else,
                     mut_tracker: &mut mut_tracker_else,
                 };
                 let else_branch_simplified = simplify_lines(
@@ -2419,15 +2384,6 @@ fn simplify_lines(
                 );
                 res.extend(forward_decls);
                 let [then_branch_simplified, else_branch_simplified] = <[_; 2]>::try_from(branches).unwrap();
-
-                *state.array_manager = array_manager_else.clone();
-                // keep the intersection both branches
-                state.array_manager.valid = state
-                    .array_manager
-                    .valid
-                    .intersection(&array_manager_then.valid)
-                    .cloned()
-                    .collect();
 
                 res.push(SimpleLine::IfNotZero {
                     condition: condition_simplified,
@@ -2455,8 +2411,6 @@ fn simplify_lines(
                     counter: const_malloc.counter,
                     ..ConstMalloc::default()
                 };
-                let valid_aux_vars_in_array_manager_before = state.array_manager.valid.clone();
-                state.array_manager.valid.clear();
 
                 // Loop body becomes a separate function, so immutable assignments inside
                 // shouldn't affect outer scope (but mutable variable versions persist)
@@ -2465,7 +2419,6 @@ fn simplify_lines(
                 state.mut_tracker.assigned = assigned_before;
 
                 const_malloc.counter = loop_const_malloc.counter;
-                state.array_manager.valid = valid_aux_vars_in_array_manager_before; // restore the valid aux vars
 
                 let loop_prefix = if is_parallel { "@parallel_loop" } else { "@loop" };
                 let func_name = format!("{}_{}_{}", loop_prefix, state.counters.loops.get_next(), location);
@@ -2622,8 +2575,6 @@ fn simplify_expr(
                 )));
             }
 
-            let versioned_array = array_var_name.map(|n| state.mut_tracker.current_name(n));
-
             if index.len() != 1 {
                 return Err(format!(
                     "Multidimensional indexing is only supported on compile-time const arrays; \
@@ -2645,18 +2596,10 @@ fn simplify_expr(
                 .into());
             }
 
-            // Key the aux-var cache by the versioned base (for Var bases) or by the
-            // original non-Var SimpleExpr (for constants / ConstMallocAccess bases).
-            let aux_key: SimpleExpr = match versioned_array {
-                Some(versioned) => versioned.into(),
-                None => array.clone(),
-            };
-            let aux_arr = state.array_manager.get_aux_var(&aux_key, &index);
-
-            if !state.array_manager.valid.insert(aux_arr.clone()) {
-                return Ok(VarOrConstMallocAccess::Var(aux_arr).into());
-            }
-
+            // Emit a fresh read into a new aux var. Repeated reads of the same
+            // address are coalesced afterwards by the `dedup_array_reads`
+            // post-pass (sound because memory is write-once).
+            let aux_arr = state.counters.aux_var();
             let simplified_index = simplify_expr(ctx, state, const_malloc, &index, lines)?;
             handle_array_assignment(
                 state,
