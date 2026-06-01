@@ -5,12 +5,16 @@
 //! oracle actually fires when a check is missing. Without it, "0 findings" could just mean the
 //! oracle is blind.
 
+use std::path::Path;
+use std::time::Duration;
+
 use compiler_fuzzer::campaign::{CampaignConfig, run_campaign};
 use compiler_fuzzer::field_util::zero_public_input;
 use compiler_fuzzer::generators::{GenConfig, gen_program};
 use compiler_fuzzer::harness::{CompileOutcome, RunOutcome, compile_source, run};
 use compiler_fuzzer::model::{CheckedProgram, Computation, Gadget, GadgetKind, Op, Operand, Step};
 use compiler_fuzzer::rng::Rng;
+use compiler_fuzzer::subprocess::{SubprocessOutcome, compile_in_subprocess};
 
 fn one_eq_gadget_program() -> CheckedProgram {
     // value = in0 + in1 ; assert value == buf[2]
@@ -111,6 +115,27 @@ fn detects_dropped_check() {
             RunOutcome::Ok(_)
         ),
         "violating witness must be accepted when the check is dropped — the oracle's signal"
+    );
+}
+
+/// The out-of-process compiler runner correctly classifies a clean compile and a clean
+/// rejection. This proves the crash-probe machinery works without depending on any compiler
+/// bug being present (so it is stable across compiler fixes).
+#[test]
+fn subprocess_classifies_clean_outcomes() {
+    let bin = Path::new(env!("CARGO_BIN_EXE_compiler_fuzz"));
+    let good = "from snark_lib import *\ndef main():\n    x = 1\n    assert x == 1\n    return\n";
+    let bad = "@@@ this is not valid zkDSL @@@\n";
+    let lim = 2 << 30;
+    let timeout = Duration::from_secs(60);
+
+    assert_eq!(
+        compile_in_subprocess(bin, good, timeout, lim).unwrap(),
+        SubprocessOutcome::Compiled
+    );
+    assert_eq!(
+        compile_in_subprocess(bin, bad, timeout, lim).unwrap(),
+        SubprocessOutcome::Rejected
     );
 }
 

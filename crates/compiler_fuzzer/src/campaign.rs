@@ -64,7 +64,6 @@ impl CampaignReport {
     }
 
     /// Findings worth failing a CI run on (Critical or High).
-    #[must_use]
     pub fn actionable(&self) -> impl Iterator<Item = &Finding> {
         self.findings.iter().filter(|f| f.severity >= Severity::High)
     }

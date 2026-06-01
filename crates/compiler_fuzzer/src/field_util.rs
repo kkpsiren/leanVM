@@ -12,7 +12,6 @@ use crate::rng::Rng;
 
 /// The all-zero public input. Generated programs feed their data through hint buffers, not the
 /// public input, so this is the default.
-#[must_use]
 pub fn zero_public_input() -> [F; PUBLIC_INPUT_LEN] {
     [F::ZERO; PUBLIC_INPUT_LEN]
 }
@@ -21,7 +20,6 @@ pub fn zero_public_input() -> [F; PUBLIC_INPUT_LEN] {
 pub const P: u64 = (1 << 31) - (1 << 24) + 1;
 
 /// Build an `F` from an arbitrary integer (reduced mod `p`).
-#[must_use]
 pub fn f(v: u64) -> F {
     F::new((v % P) as u32)
 }
@@ -51,13 +49,11 @@ pub fn mul_mod(a: u64, b: u64) -> u64 {
 }
 
 /// Build an extension element from its 5 base coordinates.
-#[must_use]
 pub fn ef_from_coeffs(coeffs: [F; DIMENSION]) -> EF {
     EF::from_basis_coefficients_slice(&coeffs).expect("DIMENSION basis coefficients")
 }
 
 /// The 5 base coordinates of an extension element, in basis order.
-#[must_use]
 pub fn ef_coeffs(x: EF) -> [F; DIMENSION] {
     let s = x.as_basis_coefficients_slice();
     std::array::from_fn(|i| s[i])

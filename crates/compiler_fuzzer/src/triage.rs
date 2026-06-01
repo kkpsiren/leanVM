@@ -23,6 +23,10 @@ pub enum Severity {
 pub enum FindingKind {
     /// The compiler unwound (panicked) — always a bug.
     CompilerPanic,
+    /// The compiler exceeded the timeout (hang / pathological blowup) — a bug.
+    CompilerHang,
+    /// The compiler died by a fatal signal or unexpected exit (abort, SIGSEGV, OOM) — a bug.
+    CompilerCrash,
     /// A witness that violates a check was accepted by the VM — the check was dropped.
     DroppedCheck,
     /// The honest witness was rejected (over-zealous check, miscompilation, or generator bug).
@@ -46,9 +50,12 @@ impl FindingKind {
     #[must_use]
     pub const fn default_severity(self) -> Severity {
         match self {
-            Self::CompilerPanic | Self::DroppedCheck | Self::MissingLowering | Self::MetamorphicDivergence => {
-                Severity::Critical
-            }
+            Self::CompilerPanic
+            | Self::CompilerHang
+            | Self::CompilerCrash
+            | Self::DroppedCheck
+            | Self::MissingLowering
+            | Self::MetamorphicDivergence => Severity::Critical,
             Self::HonestRunFailed | Self::HonestRunPanicked | Self::ViolationPanicked | Self::CompileRejected => {
                 Severity::High
             }
@@ -60,6 +67,8 @@ impl FindingKind {
     pub const fn slug(self) -> &'static str {
         match self {
             Self::CompilerPanic => "compiler_panic",
+            Self::CompilerHang => "compiler_hang",
+            Self::CompilerCrash => "compiler_crash",
             Self::DroppedCheck => "dropped_check",
             Self::HonestRunFailed => "honest_failed",
             Self::HonestRunPanicked => "honest_panicked",

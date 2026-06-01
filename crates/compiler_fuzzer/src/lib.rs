@@ -44,5 +44,7 @@ pub mod generators;
 pub mod harness;
 pub mod model;
 pub mod oracles;
+pub mod probes;
 pub mod rng;
+pub mod subprocess;
 pub mod triage;
