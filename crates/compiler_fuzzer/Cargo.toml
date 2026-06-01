@@ -9,6 +9,7 @@ workspace = true
 [dependencies]
 lean_compiler.workspace = true
 lean_vm.workspace = true
+utils.workspace = true
 backend.workspace = true
 rand.workspace = true
 serde = { workspace = true }

@@ -30,6 +30,18 @@ pub fn f_canonical(x: F) -> u64 {
     u64::from(x.as_canonical_u32())
 }
 
+/// Reference Poseidon2 compression (`(Poseidon(x) + x)[0..8]`), the exact semantics of the zkDSL
+/// `poseidon16_compress_half` builtin, in the canonical-integer view. `input` is the 16-element
+/// concatenation `left || right`; returns the 8-element output.
+#[must_use]
+pub fn poseidon16_compress_half(input: &[u64]) -> Vec<u64> {
+    let arr: [F; 16] = std::array::from_fn(|i| f(input[i]));
+    utils::poseidon16_compress(arr)
+        .iter()
+        .map(|&x| f_canonical(x))
+        .collect()
+}
+
 /// Modular addition in the canonical-integer view.
 #[must_use]
 pub fn add_mod(a: u64, b: u64) -> u64 {

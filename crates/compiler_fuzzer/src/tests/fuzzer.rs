@@ -248,33 +248,34 @@ fn generator_covers_hard_constructs() {
         all.push_str(&gen_program(&mut Rng::new(seed), &cfg).emit_source());
     }
     for needle in [
-        "match_range(",      // match expansion
-        "for g",             // range loop
-        "fz_id(",            // @inline expansion
-        "hint_div_floor(",   // custom hint + constrain
-        "!=",                // inequality
-        " < ",               // range check
-        "if g",              // control flow
-        " + 0",              // copy-propagation pattern (CopyPropEq / inline)
-        "_t2 = ",            // CSE pair (CseEq)
-        "_b0 = ",            // running chain
-        "dot_product_ee(",   // extension-field precompile (ExtOp Dot/Ee)
-        "poly_eq_",          // ext-op poly_eq family
-        "_be(",              // ext-op base-field-operand mode (add_be/dot_product_be/poly_eq_be)
-        "_sel = ",           // nested if-in-loop / IfThen / IfElse
-        "* 2 + ",            // bit-decomposition reconstruction (BitDecomp)
-        "assert False",      // conditional panic (Panic)
-        "debug_assert(",     // prover-side debug_assert (DebugAssertLt)
-        "else:",             // if/else (IfElse)
-        " += ",              // compound assignment (CompoundAssign)
-        " / ",               // runtime division (Div)
-        "fz_pair(",          // multi-value return + unpack (MultiReturn)
-        "Array(8)",          // pointer-offset filler array (PointerOffset)
-        "parallel_range(",   // parallel loop (ParallelLoop)
-        "saturating_sub(",   // const-fold built-in
-        "next_multiple_of(", // const-fold built-in
-        "log2_ceil(",        // const-fold built-in
-        " ** ",              // const-fold exponent
+        "match_range(",              // match expansion
+        "for g",                     // range loop
+        "fz_id(",                    // @inline expansion
+        "hint_div_floor(",           // custom hint + constrain
+        "!=",                        // inequality
+        " < ",                       // range check
+        "if g",                      // control flow
+        " + 0",                      // copy-propagation pattern (CopyPropEq / inline)
+        "_t2 = ",                    // CSE pair (CseEq)
+        "_b0 = ",                    // running chain
+        "poseidon16_compress_half(", // Poseidon2 compression precompile (Poseidon gadget)
+        "dot_product_ee(",           // extension-field precompile (ExtOp Dot/Ee)
+        "poly_eq_",                  // ext-op poly_eq family
+        "_be(",                      // ext-op base-field-operand mode (add_be/dot_product_be/poly_eq_be)
+        "_sel = ",                   // nested if-in-loop / IfThen / IfElse
+        "* 2 + ",                    // bit-decomposition reconstruction (BitDecomp)
+        "assert False",              // conditional panic (Panic)
+        "debug_assert(",             // prover-side debug_assert (DebugAssertLt)
+        "else:",                     // if/else (IfElse)
+        " += ",                      // compound assignment (CompoundAssign)
+        " / ",                       // runtime division (Div)
+        "fz_pair(",                  // multi-value return + unpack (MultiReturn)
+        "Array(8)",                  // pointer-offset filler array (PointerOffset)
+        "parallel_range(",           // parallel loop (ParallelLoop)
+        "saturating_sub(",           // const-fold built-in
+        "next_multiple_of(",         // const-fold built-in
+        "log2_ceil(",                // const-fold built-in
+        " ** ",                      // const-fold exponent
     ] {
         assert!(all.contains(needle), "generator never emitted `{needle}`");
     }
@@ -319,6 +320,7 @@ fn all_gadget_kinds() -> Vec<GadgetKind> {
         GadgetKind::MultiReturn,
         GadgetKind::PointerOffset,
         GadgetKind::PointerOffsetSub,
+        GadgetKind::Poseidon,
         GadgetKind::ParallelLoop { n: 3 },
         GadgetKind::ForwardDeclEq,
     ];

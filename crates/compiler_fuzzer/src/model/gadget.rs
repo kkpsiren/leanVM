@@ -17,8 +17,8 @@
 use lean_vm::DIMENSION;
 
 use crate::field_util::{
-    ExtMode, ExtOp, P, add_mod, div_canonical, ext_a_len, ext_op_eval, mul_mod, rand_canonical, rand_canonical_nonzero,
-    sub_mod,
+    ExtMode, ExtOp, P, add_mod, div_canonical, ext_a_len, ext_op_eval, mul_mod, poseidon16_compress_half,
+    rand_canonical, rand_canonical_nonzero, sub_mod,
 };
 use crate::harness::CheckKind;
 use crate::rng::Rng;
@@ -92,6 +92,11 @@ pub enum GadgetKind {
     /// assert the 5-coordinate result equals an independent buffer value (precompile lowering +
     /// multi-cell equality). `DIMENSION` independent violations.
     ExtOp { op: ExtOp, mode: ExtMode, n: usize },
+    /// The Poseidon2 compression precompile: `poseidon16_compress_half(left, right, out)` over a
+    /// 16-element input, then assert the 8-element output equals an independent buffer region. The
+    /// fuzzer never exercised any Poseidon precompile before; the reference output is computed by
+    /// `field_util::poseidon16_compress_half`. `DIGEST_LEN` (8) independent violations.
+    Poseidon,
     /// An equality check nested inside an `if` inside a runtime `range` loop, over `n` independent
     /// (value, expected) pairs. Stresses assert survival through if-in-loop nesting and
     /// loop→recursion. `n` independent violations.
@@ -181,6 +186,7 @@ impl Gadget {
             GadgetKind::CseEq => 4,
             GadgetKind::RunningChain { len } => 2 * len,
             GadgetKind::ExtOp { mode, n, .. } => ext_a_len(mode, n) + n * DIMENSION + DIMENSION,
+            GadgetKind::Poseidon => 24, // left(8) | right(8) | expected output(8)
             GadgetKind::NestedIfLoop { n } => 2 * n + 1,
             GadgetKind::NestedMutLoop { .. } => 6, // a0, b0, da, db, exp_a, exp_b
             GadgetKind::BitDecomp { n } => n + 1,
@@ -208,6 +214,7 @@ impl Gadget {
             // RunningChain: one break per checkpoint + one input-side break of the base value.
             GadgetKind::RunningChain { len } => len + 1,
             GadgetKind::ExtOp { .. } => DIMENSION,
+            GadgetKind::Poseidon => 8, // one per output coordinate
             GadgetKind::NestedIfLoop { n } | GadgetKind::ParallelLoop { n } => n,
             GadgetKind::NestedMutLoop { .. } => 2, // one per carried mutable
             GadgetKind::UnrolledRangeLt { n, .. } => n,
@@ -261,6 +268,7 @@ impl Gadget {
             GadgetKind::TwoReadsEq => "TwoReadsEq (buf[0] == buf[1])".to_string(),
             GadgetKind::RunningChain { len } => format!("RunningChain (len {len}, per-step checkpoints)"),
             GadgetKind::ExtOp { op, mode, n } => format!("ExtOp ({}, n {n}, result == buf[])", op.fn_name(*mode)),
+            GadgetKind::Poseidon => "Poseidon (poseidon16_compress_half, 8-cell output)".to_string(),
             GadgetKind::NestedIfLoop { n } => format!("NestedIfLoop (n {n}, assert in if-in-loop)"),
             GadgetKind::NestedMutLoop { outer, inner } => {
                 format!("NestedMutLoop ({outer}x{inner} nested loop, 2 carried mutables)")
@@ -442,6 +450,15 @@ impl Gadget {
                         "assert {p}res[{p}i] == {p}buf[{} + {p}i]",
                         a_len + n * DIMENSION
                     ));
+                });
+            }
+            GadgetKind::Poseidon => {
+                // buf = [left(8) | right(8) | expected(8)]; out = (Poseidon(left|right)+ (left|right))[0..8].
+                e.line(&format!("{p}out = Array(8)"));
+                e.line(&format!("poseidon16_compress_half({p}buf, {p}buf + 8, {p}out)"));
+                e.line(&format!("for {p}i in unroll(0, 8):"));
+                e.indented(|e| {
+                    e.line(&format!("assert {p}out[{p}i] == {p}buf[16 + {p}i]"));
                 });
             }
             GadgetKind::NestedIfLoop { n } => {
@@ -690,6 +707,13 @@ impl Gadget {
                 buf.extend(r);
                 buf
             }
+            GadgetKind::Poseidon => {
+                let input: Vec<u64> = (0..16).map(|_| rand_canonical(rng)).collect();
+                let out = poseidon16_compress_half(&input);
+                let mut buf = input;
+                buf.extend(out); // expected output region
+                buf
+            }
             GadgetKind::NestedIfLoop { n } => {
                 let v: Vec<u64> = (0..*n).map(|_| rand_canonical(rng)).collect();
                 let mut buf = v.clone();
@@ -825,6 +849,9 @@ impl Gadget {
             GadgetKind::ExtOp { mode, n, .. } => {
                 let off = ext_a_len(*mode, *n) + n * DIMENSION;
                 buf[off + k] = add_mod(buf[off + k], 1); // perturb expected coord k
+            }
+            GadgetKind::Poseidon => {
+                buf[16 + k] = add_mod(buf[16 + k], 1); // perturb expected output coord k
             }
             GadgetKind::NestedIfLoop { n } | GadgetKind::ParallelLoop { n } => {
                 buf[n + k] = add_mod(buf[n + k], 1); // perturb expected of pair k
