@@ -323,6 +323,8 @@ fn all_gadget_kinds() -> Vec<GadgetKind> {
         GadgetKind::Poseidon,
         GadgetKind::ParallelLoop { n: 3 },
         GadgetKind::ForwardDeclEq,
+        GadgetKind::IfElseBoth,
+        GadgetKind::LoopFormsAgree { n: 4 },
     ];
     // Every extension-op (operation × mode) at lengths 1, 2, and the odd length 3 — validates the
     // reference math and the backward-accumulation/stride at an odd n.

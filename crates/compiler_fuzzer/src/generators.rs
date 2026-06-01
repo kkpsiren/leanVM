@@ -83,7 +83,7 @@ pub fn gen_gadget(rng: &mut Rng, cfg: &GenConfig, id: usize) -> Gadget {
         }
     };
 
-    let (kind, comp) = match rng.below(33) {
+    let (kind, comp) = match rng.below(35) {
         0 => (GadgetKind::EqBound, gen_computation(rng, cfg)),
         1 => (
             GadgetKind::EqConst {
@@ -171,6 +171,11 @@ pub fn gen_gadget(rng: &mut Rng, cfg: &GenConfig, id: usize) -> Gadget {
         29 => (GadgetKind::PointerOffsetSub, Computation::identity(1)),
         30 => (GadgetKind::MatchChained, Computation::identity(1)),
         31 => (GadgetKind::Poseidon, Computation::identity(1)),
+        32 => (GadgetKind::IfElseBoth, Computation::identity(1)),
+        33 => (
+            GadgetKind::LoopFormsAgree { n: rng.range(2, 6) },
+            Computation::identity(1),
+        ),
         _ => {
             let (src, value) = gen_const_fold(rng);
             (GadgetKind::ConstFold { src, value }, Computation::identity(1))

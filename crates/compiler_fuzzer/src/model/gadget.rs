@@ -107,6 +107,12 @@ pub enum GadgetKind {
     /// buffer-based replacement for loop-carried mutables, which the compiler now forbids. Two
     /// independent violations (one per chain).
     NestedMutLoop { outer: usize, inner: usize },
+    /// Metamorphic equivalence: the SAME sum of `n` inputs computed two ways — an `unroll`-carried
+    /// mutable AND a `range` array-chain — then `assert unroll_sum == range_sum` (forms must agree)
+    /// **and** `assert unroll_sum == exp`. A compiler that miscompiles one form but not the other
+    /// makes the two diverge, so the honest witness fails — catching form-dependent miscompiles no
+    /// single-form gadget can. One violation (perturb `exp`).
+    LoopFormsAgree { n: usize },
     /// `n` prover-supplied bits, each constrained boolean (`b*(b-1)==0`) and reconstructed
     /// (`acc = acc*2 + b`), with a final `assert acc == expected`. This is the canonical
     /// hint-then-constrain decomposition pattern (XMSS / range proofs); every boolean **and** the
@@ -120,6 +126,11 @@ pub enum GadgetKind {
     DebugAssertLt { bound: u64 },
     /// The target equality lives in the `else` branch of an `if`/`else` (else-branch lowering).
     IfElse,
+    /// An *independent* equality check in **each** branch of an `if`/`else` (`if sel==1: assert
+    /// a==ea  else: assert b==eb`). The two violations force the two selectors, so a compiler that
+    /// drops the check in the branch the honest witness doesn't take is caught — the single-branch
+    /// gadgets never reach the not-taken branch's check. Two violations (one per branch).
+    IfElseBoth,
     /// `x: Mut = a; x += b; x *= c; assert x == exp` — compound-assignment (`+=`, `*=`) lowering.
     CompoundAssign,
     /// `q = a / b; assert q == exp` — runtime field division (`/`) lowering. `b` is non-zero.
@@ -193,6 +204,8 @@ impl Gadget {
             GadgetKind::BitDecomp { n } => n + 1,
             GadgetKind::Panic | GadgetKind::DebugAssertLt { .. } | GadgetKind::ConstFold { .. } => 1,
             GadgetKind::IfElse => self.comp.n_inputs + 2,
+            GadgetKind::IfElseBoth => 5,               // a, expA, b, expB, sel
+            GadgetKind::LoopFormsAgree { n } => n + 1, // n inputs + exp
             GadgetKind::CompoundAssign => 4,
             GadgetKind::Div | GadgetKind::MultiReturn => 3,
             GadgetKind::PointerOffset | GadgetKind::PointerOffsetSub => 10,
@@ -218,6 +231,7 @@ impl Gadget {
             GadgetKind::Poseidon => 8, // one per output coordinate
             GadgetKind::NestedIfLoop { n } | GadgetKind::ParallelLoop { n } => n,
             GadgetKind::NestedMutLoop { .. } => 2, // one per carried mutable
+            GadgetKind::IfElseBoth => 2,           // one per branch (forces each selector)
             GadgetKind::UnrolledRangeLt { n, .. } => n,
             GadgetKind::BitDecomp { n } => n + 1,
             _ => 1,
@@ -269,6 +283,14 @@ impl Gadget {
                 let x = if buf[2] == 1 { buf[0] } else { buf[1] };
                 x == buf[3]
             }
+            GadgetKind::IfElseBoth => {
+                if buf[4] == 1 {
+                    buf[0] == buf[1]
+                } else {
+                    buf[2] == buf[3]
+                }
+            }
+            GadgetKind::LoopFormsAgree { n: cnt } => sum(&buf[..*cnt]) == buf[*cnt],
             GadgetKind::RunningChain { len } => {
                 let mut acc = buf[0];
                 let mut ok = acc == buf[*len];
@@ -364,6 +386,8 @@ impl Gadget {
             GadgetKind::Panic => "Panic (assert False in taken if)".to_string(),
             GadgetKind::DebugAssertLt { bound } => format!("DebugAssertLt (debug_assert value < {bound})"),
             GadgetKind::IfElse => "IfElse (assert in else-branch)".to_string(),
+            GadgetKind::IfElseBoth => "IfElseBoth (independent check in each branch)".to_string(),
+            GadgetKind::LoopFormsAgree { n } => format!("LoopFormsAgree (unroll vs range sum of {n} agree)"),
             GadgetKind::CompoundAssign => "CompoundAssign (x += b; x *= c; x == buf[])".to_string(),
             GadgetKind::Div => "Div (a / b == buf[])".to_string(),
             GadgetKind::MultiReturn => "MultiReturn (p, q = fz_pair(in))".to_string(),
@@ -627,6 +651,40 @@ impl Gadget {
                     e.line(&format!("assert {value} == {p}exp"));
                 });
             }
+            GadgetKind::IfElseBoth => {
+                // buf = [a, expA, b, expB, sel]; an independent equality in EACH branch.
+                e.line(&format!("{p}sel = {p}buf[4]"));
+                e.line(&format!("if {p}sel == 1:"));
+                e.indented(|e| {
+                    e.line(&format!("{p}va = {p}buf[0]"));
+                    e.line(&format!("{p}ea = {p}buf[1]"));
+                    e.line(&format!("assert {p}va == {p}ea"));
+                });
+                e.line("else:");
+                e.indented(|e| {
+                    e.line(&format!("{p}vb = {p}buf[2]"));
+                    e.line(&format!("{p}eb = {p}buf[3]"));
+                    e.line(&format!("assert {p}vb == {p}eb"));
+                });
+            }
+            GadgetKind::LoopFormsAgree { n: cnt } => {
+                // Same sum two ways: unroll-carried mutable AND range array-chain; they must agree,
+                // and equal the independent exp. buf = [inputs(cnt) | exp].
+                e.line(&format!("{p}u: Mut = 0"));
+                e.line(&format!("for {p}i in unroll(0, {cnt}):"));
+                e.indented(|e| {
+                    e.line(&format!("{p}u = {p}u + {p}buf[{p}i]"));
+                });
+                e.line(&format!("{p}r = Array({})", cnt + 1));
+                e.line(&format!("{p}r[0] = 0"));
+                e.line(&format!("for {p}j in range(0, {cnt}):"));
+                e.indented(|e| {
+                    e.line(&format!("{p}r[{p}j + 1] = {p}r[{p}j] + {p}buf[{p}j]"));
+                });
+                e.line(&format!("{p}exp = {p}buf[{cnt}]"));
+                e.line(&format!("assert {p}u == {p}r[{cnt}]"));
+                e.line(&format!("assert {p}u == {p}exp"));
+            }
             GadgetKind::CompoundAssign => {
                 e.line(&format!("{p}x: Mut = {p}buf[0]"));
                 e.line(&format!("{p}x += {p}buf[1]"));
@@ -850,6 +908,18 @@ impl Gadget {
                 buf.push(0); // sel: else branch runs
                 buf
             }
+            GadgetKind::IfElseBoth => {
+                // sel=1 (take branch A) with a == expA; branch B's cells are arbitrary.
+                let a = rand_canonical(rng);
+                vec![a, a, rand_canonical(rng), rand_canonical(rng), 1]
+            }
+            GadgetKind::LoopFormsAgree { n: cnt } => {
+                let inputs: Vec<u64> = (0..*cnt).map(|_| rand_canonical(rng)).collect();
+                let s = inputs.iter().fold(0u64, |a, &b| add_mod(a, b));
+                let mut buf = inputs;
+                buf.push(s);
+                buf
+            }
             GadgetKind::CompoundAssign => {
                 let (a, b, c) = (rand_canonical(rng), rand_canonical(rng), rand_canonical(rng));
                 let exp = mul_mod(add_mod(a, b), c);
@@ -923,6 +993,18 @@ impl Gadget {
             }
             GadgetKind::Div => buf[2] = add_mod(buf[2], 1), // exp no longer equals a / b
             GadgetKind::CompoundAssign => buf[3] = add_mod(buf[3], 1),
+            GadgetKind::IfElseBoth => {
+                // k=0: take branch A (sel=1, as honest) and violate its check (expA != a).
+                // k=1: FORCE branch B (sel=0) and violate its check (expB != b) — this reaches the
+                // branch the honest witness never takes, catching a dropped else-branch check.
+                if k == 0 {
+                    buf[1] = add_mod(buf[1], 1);
+                } else {
+                    buf[4] = 0;
+                    buf[3] = add_mod(buf[2], 1);
+                }
+            }
+            GadgetKind::LoopFormsAgree { n: cnt } => buf[*cnt] = add_mod(buf[*cnt], 1),
             GadgetKind::ConstFold { .. } => buf[0] = add_mod(buf[0], 1),
             GadgetKind::PointerOffset | GadgetKind::PointerOffsetSub => buf[9] = add_mod(buf[9], 1),
             GadgetKind::MultiReturn => buf[1 + k] = add_mod(buf[1 + k], 1), // k=0 → e1, k=1 → e2
