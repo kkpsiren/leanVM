@@ -59,7 +59,7 @@ pub fn gen_gadget(rng: &mut Rng, cfg: &GenConfig, id: usize) -> Gadget {
     // A loop length kept small so range→recursion stays cheap.
     let loop_len = |rng: &mut Rng| Computation::identity(rng.range(1, 4));
 
-    let (kind, comp) = match rng.below(16) {
+    let (kind, comp) = match rng.below(18) {
         0 => (GadgetKind::EqBound, gen_computation(rng, cfg)),
         1 => (
             GadgetKind::EqConst {
@@ -100,8 +100,13 @@ pub fn gen_gadget(rng: &mut Rng, cfg: &GenConfig, id: usize) -> Gadget {
         11 => (GadgetKind::CopyPropEq, Computation::identity(1)),
         12 => (GadgetKind::CseEq, Computation::identity(1)),
         13 => (GadgetKind::TwoReadsEq, Computation::identity(1)),
-        _ => (
+        14 => (
             GadgetKind::RunningChain { len: rng.range(2, 6) },
+            Computation::identity(1),
+        ),
+        15 => (GadgetKind::ExtMulEq, Computation::identity(1)),
+        _ => (
+            GadgetKind::NestedIfLoop { n: rng.range(2, 5) },
             Computation::identity(1),
         ),
     };

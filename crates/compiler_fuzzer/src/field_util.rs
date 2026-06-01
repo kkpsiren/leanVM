@@ -64,6 +64,15 @@ pub fn push_ef(buf: &mut Vec<F>, x: EF) {
     buf.extend_from_slice(x.as_basis_coefficients_slice());
 }
 
+/// Multiply two extension elements given as canonical base coordinates; returns the product's
+/// canonical coordinates. The reference for `dot_product_ee(a, b, _)` with length 1.
+#[must_use]
+pub fn ef_mul_canonical(a: [u64; DIMENSION], b: [u64; DIMENSION]) -> [u64; DIMENSION] {
+    let ea = ef_from_coeffs(a.map(f));
+    let eb = ef_from_coeffs(b.map(f));
+    ef_coeffs(ea * eb).map(f_canonical)
+}
+
 /// Uniform base-field element in `[0, P)`.
 pub fn rand_f(rng: &mut Rng) -> F {
     f(rng.next_u64() % P)

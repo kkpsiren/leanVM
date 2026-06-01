@@ -159,6 +159,8 @@ fn generator_covers_hard_constructs() {
         " + 0",            // copy-propagation pattern (CopyPropEq / inline)
         "_t2 = ",          // CSE pair (CseEq)
         "_b0 = ",          // running chain
+        "dot_product_ee(", // extension-field precompile (ExtMulEq)
+        "_sel = ",         // nested if-in-loop (NestedIfLoop) / IfThen
     ] {
         assert!(all.contains(needle), "generator never emitted `{needle}`");
     }
@@ -213,6 +215,16 @@ fn hard_kinds_isolate() {
         Gadget {
             id: 8,
             kind: GadgetKind::RunningChain { len: 4 },
+            comp: Computation::identity(1),
+        },
+        Gadget {
+            id: 9,
+            kind: GadgetKind::ExtMulEq,
+            comp: Computation::identity(1),
+        },
+        Gadget {
+            id: 10,
+            kind: GadgetKind::NestedIfLoop { n: 3 },
             comp: Computation::identity(1),
         },
     ];

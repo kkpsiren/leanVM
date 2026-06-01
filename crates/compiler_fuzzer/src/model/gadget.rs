@@ -14,7 +14,9 @@
 //! - produce an honest buffer that makes its check pass ([`Gadget::honest_buffer`]),
 //! - produce a buffer that makes *only* its check fail ([`Gadget::violating_buffer`]).
 
-use crate::field_util::{P, add_mod, mul_mod, rand_canonical, rand_canonical_nonzero, sub_mod};
+use lean_vm::DIMENSION;
+
+use crate::field_util::{P, add_mod, ef_mul_canonical, mul_mod, rand_canonical, rand_canonical_nonzero, sub_mod};
 use crate::harness::CheckKind;
 use crate::rng::Rng;
 
@@ -71,6 +73,13 @@ pub enum GadgetKind {
     /// every step. Stresses repeated assert-fusion / copy-propagation along a dependency chain;
     /// each of the `len` checkpoints is an independent violation.
     RunningChain { len: usize },
+    /// Extension-field multiply via the `dot_product_ee` precompile, then assert the 5-coordinate
+    /// result equals an independent buffer value (precompile + multi-cell equality). 5 violations.
+    ExtMulEq,
+    /// An equality check nested inside an `if` inside a runtime `range` loop, over `n` independent
+    /// (value, expected) pairs. Stresses assert survival through if-in-loop nesting and
+    /// loop→recursion. `n` independent violations.
+    NestedIfLoop { n: usize },
 }
 
 /// A gadget instance: a kind plus the computation feeding its check.
@@ -108,6 +117,8 @@ impl Gadget {
             GadgetKind::CopyPropEq | GadgetKind::TwoReadsEq => 2,
             GadgetKind::CseEq => 4,
             GadgetKind::RunningChain { len } => 2 * len,
+            GadgetKind::ExtMulEq => 3 * DIMENSION,
+            GadgetKind::NestedIfLoop { n } => 2 * n + 1,
         }
     }
 
@@ -118,6 +129,8 @@ impl Gadget {
         match self.kind {
             GadgetKind::CseEq => 2,
             GadgetKind::RunningChain { len } => len,
+            GadgetKind::ExtMulEq => DIMENSION,
+            GadgetKind::NestedIfLoop { n } => n,
             _ => 1,
         }
     }
@@ -161,6 +174,8 @@ impl Gadget {
             GadgetKind::CseEq => "CseEq (shared in0*in1, two asserts)".to_string(),
             GadgetKind::TwoReadsEq => "TwoReadsEq (buf[0] == buf[1])".to_string(),
             GadgetKind::RunningChain { len } => format!("RunningChain (len {len}, per-step checkpoints)"),
+            GadgetKind::ExtMulEq => "ExtMulEq (dot_product_ee result == buf[])".to_string(),
+            GadgetKind::NestedIfLoop { n } => format!("NestedIfLoop (n {n}, assert in if-in-loop)"),
         };
         format!("g{}: {k}", self.id)
     }
@@ -292,6 +307,28 @@ impl Gadget {
                     e.line(&format!("assert {p}b{k} == {p}c{k}"));
                 }
             }
+            GadgetKind::ExtMulEq => {
+                // buf = [a(5) | b(5) | expected(5)]; res = a * b (extension field).
+                e.line(&format!("{p}res = Array({DIMENSION})"));
+                e.line(&format!("dot_product_ee({p}buf, {p}buf + {DIMENSION}, {p}res)"));
+                e.line(&format!("for {p}i in unroll(0, {DIMENSION}):"));
+                e.indented(|e| {
+                    e.line(&format!("assert {p}res[{p}i] == {p}buf[{} + {p}i]", 2 * DIMENSION));
+                });
+            }
+            GadgetKind::NestedIfLoop { n } => {
+                // buf = [v(n) | expected(n) | sel]; sel == 1 (taken).
+                e.line(&format!("{p}sel = {p}buf[{}]", 2 * n));
+                e.line(&format!("for {p}i in range(0, {n}):"));
+                e.indented(|e| {
+                    e.line(&format!("if {p}sel == 1:"));
+                    e.indented(|e| {
+                        e.line(&format!("{p}v = {p}buf[{p}i]"));
+                        e.line(&format!("{p}exp = {p}buf[{n} + {p}i]"));
+                        e.line(&format!("assert {p}v == {p}exp"));
+                    });
+                });
+            }
         }
     }
 
@@ -375,6 +412,22 @@ impl Gadget {
                 buf.extend(checkpoints);
                 buf
             }
+            GadgetKind::ExtMulEq => {
+                let a: [u64; DIMENSION] = std::array::from_fn(|_| rand_canonical(rng));
+                let b: [u64; DIMENSION] = std::array::from_fn(|_| rand_canonical(rng));
+                let e = ef_mul_canonical(a, b);
+                let mut buf = a.to_vec();
+                buf.extend(b);
+                buf.extend(e);
+                buf
+            }
+            GadgetKind::NestedIfLoop { n } => {
+                let v: Vec<u64> = (0..*n).map(|_| rand_canonical(rng)).collect();
+                let mut buf = v.clone();
+                buf.extend(v); // expected == value
+                buf.push(1); // sel: take the branch
+                buf
+            }
         }
     }
 
@@ -405,6 +458,12 @@ impl Gadget {
             }
             GadgetKind::RunningChain { len } => {
                 buf[len + k] = add_mod(buf[len + k], 1); // break only checkpoint k
+            }
+            GadgetKind::ExtMulEq => {
+                buf[2 * DIMENSION + k] = add_mod(buf[2 * DIMENSION + k], 1); // perturb expected coord k
+            }
+            GadgetKind::NestedIfLoop { n } => {
+                buf[n + k] = add_mod(buf[n + k], 1); // perturb expected of pair k
             }
             GadgetKind::Ne => {
                 buf[n] = self.comp.eval(&honest[..n]); // other := value ⇒ `!=` fails
