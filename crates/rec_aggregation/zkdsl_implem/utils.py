@@ -524,13 +524,14 @@ def checked_decompose_bits(a):
     partial_sums_24[0] = bits[F_BITS - 1]
     for i in unroll(1, 24):
         partial_sums_24[i] = partial_sums_24[i - 1] + bits[F_BITS - 1 - i] * 2**i
-    sum_7: Mut = bits[F_BITS - 1 - 24]
+    sum_7_buf = Array(7)
+    sum_7_buf[0] = bits[F_BITS - 1 - 24]
     for i in unroll(1, 7):
-        sum_7 += bits[F_BITS - 1 - (24 + i)] * 2**i
-    if sum_7 == 127:
+        sum_7_buf[i] = sum_7_buf[i - 1] + bits[F_BITS - 1 - (24 + i)] * 2**i
+    if sum_7_buf[6] == 127:
         assert partial_sums_24[23] == 0
 
-    assert a == partial_sums_24[23] + sum_7 * 2**24
+    assert a == partial_sums_24[23] + sum_7_buf[6] * 2**24
     return bits, partial_sums_24
 
 
@@ -566,17 +567,18 @@ def decompose_and_verify_merkle_query(a, domain_size, prev_root, num_chunks, lea
     for i in unroll(0, 6):
         assert nibbles[i] < 16
 
-    partial_sum: Mut = nibbles[0]
+    partial_sum_buf = Array(6)
+    partial_sum_buf[0] = nibbles[0]
     for i in unroll(1, 6):
-        partial_sum += nibbles[i] * 16**i
+        partial_sum_buf[i] = partial_sum_buf[i - 1] + nibbles[i] * 16**i
 
     # p = 2^31 - 2^24 + 1, so 2^24 * 127 = p - 1 ≡ -1 (mod p), hence inv(2^24) = -127.
     # Deduce top7 from the identity partial_sum + top7 * 2^24 == a:
     # top7 = (a - partial_sum) * inv(2^24) = (partial_sum - a) * 127
-    top7 = (partial_sum - a) * 127
+    top7 = (partial_sum_buf[5] - a) * 127
     assert top7 < 2**7
     if top7 == 2**7 - 1:
-        assert partial_sum == 0
+        assert partial_sum_buf[5] == 0
 
     leaf_data = Array(num_chunks * DIGEST_LEN)
     hint_witness("merkle_leaf", leaf_data)
@@ -588,18 +590,16 @@ def decompose_and_verify_merkle_query(a, domain_size, prev_root, num_chunks, lea
     n_nibbles = div_ceil(domain_size, 4)
     states = Array((n_nibbles - 1) * DIGEST_LEN)
 
-    prod: Mut = 1
-    nib_pow: Mut
-
     # First nibble: leaf_hash -> states[0]
-    nib_pow = match_range(
+    nib_pow_first = match_range(
         nibbles[0],
         range(0, 16),
         lambda v: whir_4_merkle_step_and_pow(v, leaf_hash, merkle_path, states, 2 ** (TWO_ADICITY - domain_size)),
     )
-    prod *= nib_pow
 
     # Middle nibbles: states[k-1] -> states[k]
+    prod_buf = Array(n_nibbles - 1)
+    prod_buf[0] = nib_pow_first
     for k in unroll(1, n_nibbles - 1):
         nib_pow = match_range(
             nibbles[k],
@@ -612,41 +612,40 @@ def decompose_and_verify_merkle_query(a, domain_size, prev_root, num_chunks, lea
                 2 ** (TWO_ADICITY - domain_size + 4 * k),
             ),
         )
-        prod *= nib_pow
+        prod_buf[k] = prod_buf[k - 1] * nib_pow
+    prod_middle = prod_buf[n_nibbles - 2]
 
     # Last nibble: states[-1] -> prev_root
     last_k = n_nibbles - 1
     last_state_in = states + (last_k - 1) * DIGEST_LEN
     last_path = merkle_path + 4 * last_k * DIGEST_LEN
     last_power_shift = 2 ** (TWO_ADICITY - domain_size + 4 * last_k)
+    nib_pow_last: Imm
     if domain_size % 4 == 0:
-        nib_pow = match_range(
+        nib_pow_last = match_range(
             nibbles[last_k],
             range(0, 16),
             lambda v: whir_4_merkle_step_and_pow(v, last_state_in, last_path, prev_root, last_power_shift),
         )
-        prod *= nib_pow
     elif domain_size % 4 == 1:
-        nib_pow = match_range(
+        nib_pow_last = match_range(
             nibbles[last_k],
             range(0, 16),
             lambda v: whir_1_merkle_step_and_pow(v, last_state_in, last_path, prev_root, last_power_shift),
         )
-        prod *= nib_pow
     elif domain_size % 4 == 2:
-        nib_pow = match_range(
+        nib_pow_last = match_range(
             nibbles[last_k],
             range(0, 16),
             lambda v: whir_2_merkle_step_and_pow(v, last_state_in, last_path, prev_root, last_power_shift),
         )
-        prod *= nib_pow
     elif domain_size % 4 == 3:
-        nib_pow = match_range(
+        nib_pow_last = match_range(
             nibbles[last_k],
             range(0, 16),
             lambda v: whir_3_merkle_step_and_pow(v, last_state_in, last_path, prev_root, last_power_shift),
         )
-        prod *= nib_pow
+    prod = prod_middle * nib_pow_last
 
     return leaf_data, prod
 
@@ -654,13 +653,14 @@ def decompose_and_verify_merkle_query(a, domain_size, prev_root, num_chunks, lea
 def checked_decompose_bits_small_value_const(to_decompose, n_bits: Const):
     bits = Array(n_bits)
     hint_decompose_bits(to_decompose, bits, n_bits)
-    sum: Mut = bits[n_bits - 1]
-    assert sum * (1 - sum) == 0
+    sum_buf = Array(n_bits)
+    sum_buf[0] = bits[n_bits - 1]
+    assert sum_buf[0] * (1 - sum_buf[0]) == 0
     for i in unroll(1, n_bits):
         b = bits[n_bits - 1 - i]
         assert b * (1 - b) == 0
-        sum += b * 2**i
-    assert to_decompose == sum
+        sum_buf[i] = sum_buf[i - 1] + b * 2**i
+    assert to_decompose == sum_buf[n_bits - 1]
     return bits
 
 
@@ -714,15 +714,16 @@ def mle_of_zeros_then_ones(point, n_zeros, n_vars):
     res_buf = Array(n_vars + 1)
     res_buf[0] = res_0
     for i in range(0, n_vars):
-        res: Mut = res_buf[i]
+        res0 = res_buf[i]
         p = point + (n_vars - 1 - i) * DIM
+        res1: Imm
         if bits[F_BITS - 1 - i] == 0:
             one_minus_p = one_minus_self_extension_ret(p)
-            tmp = mul_extension_ret(one_minus_p, res)
-            res = add_extension_ret(tmp, p)
+            tmp = mul_extension_ret(one_minus_p, res0)
+            res1 = add_extension_ret(tmp, p)
         else:
-            res = mul_extension_ret(p, res)
-        res_buf[i + 1] = res
+            res1 = mul_extension_ret(p, res0)
+        res_buf[i + 1] = res1
     return res_buf[n_vars]
 
 
@@ -780,7 +781,8 @@ def next_mle_const(x, y, n: Const):
         mul_extension(low_suffix + (idx + 1) * DIM, x_one_minus_y, low_suffix + idx * DIM)
 
     # Compute sum = Σ_{arr=0..n} (eq_prefix[arr] * (1-x[arr]) * y[arr] * low_suffix[arr+1])
-    sum: Mut = ZERO_VEC_PTR
+    sum_buf = Array(n + 1)
+    sum_buf[0] = ZERO_VEC_PTR
     for arr in unroll(0, n):
         x_arr = x + arr * DIM
         y_arr = y + arr * DIM
@@ -788,12 +790,12 @@ def next_mle_const(x, y, n: Const):
         carry = mul_extension_ret(one_minus_x, y_arr)
         eq_carry = mul_extension_ret(eq_prefix + arr * DIM, carry)
         term = mul_extension_ret(eq_carry, low_suffix + (arr + 1) * DIM)
-        sum = add_extension_ret(sum, term)
+        sum_buf[arr + 1] = add_extension_ret(sum_buf[arr], term)
 
     # Compute prod = product of all x[i] * product of all y[i]
     prod = mul_extension_ret(product_first_n_const(x, n), product_first_n_const(y, n))
 
-    result = add_extension_ret(sum, prod)
+    result = add_extension_ret(sum_buf[n], prod)
     return result
 
 

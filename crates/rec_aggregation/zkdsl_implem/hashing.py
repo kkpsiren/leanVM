@@ -144,14 +144,16 @@ def euclidian_div_runtime(a, b):
 
 
 def absorb_n_hashes_const(n: Const, sp_in, dp_in):
-    sp: Mut = sp_in
-    dp: Mut = dp_in
-    for _ in unroll(0, n):
-        new_state = sp + DIGEST_LEN
-        poseidon16_permute_half(sp, dp, new_state)
-        sp = new_state
-        dp += DIGEST_LEN
-    return sp
+    sp_buf = Array(n + 1)
+    dp_buf = Array(n + 1)
+    sp_buf[0] = sp_in
+    dp_buf[0] = dp_in
+    for u in unroll(0, n):
+        new_state = sp_buf[u] + DIGEST_LEN
+        poseidon16_permute_half(sp_buf[u], dp_buf[u], new_state)
+        sp_buf[u + 1] = new_state
+        dp_buf[u + 1] = dp_buf[u] + DIGEST_LEN
+    return sp_buf[n]
 
 
 def slice_hash_runtime(data, num_chunks):
@@ -172,15 +174,17 @@ def slice_hash_runtime(data, num_chunks):
     carry[1] = data + DIGEST_LEN
     for c in range(0, n_chunks_outer):
         base = c * 2
-        state_ptr: Mut = carry[base]
-        data_ptr: Mut = carry[base + 1]
-        for _ in unroll(0, PARTIAL_UNROLL_BATCH):
-            new_state = state_ptr + DIGEST_LEN
-            poseidon16_permute_half(state_ptr, data_ptr, new_state)
-            state_ptr = new_state
-            data_ptr += DIGEST_LEN
-        carry[base + 2] = state_ptr
-        carry[base + 3] = data_ptr
+        sp_buf = Array(PARTIAL_UNROLL_BATCH + 1)
+        dp_buf = Array(PARTIAL_UNROLL_BATCH + 1)
+        sp_buf[0] = carry[base]
+        dp_buf[0] = carry[base + 1]
+        for u in unroll(0, PARTIAL_UNROLL_BATCH):
+            new_state = sp_buf[u] + DIGEST_LEN
+            poseidon16_permute_half(sp_buf[u], dp_buf[u], new_state)
+            sp_buf[u + 1] = new_state
+            dp_buf[u + 1] = dp_buf[u] + DIGEST_LEN
+        carry[base + 2] = sp_buf[PARTIAL_UNROLL_BATCH]
+        carry[base + 3] = dp_buf[PARTIAL_UNROLL_BATCH]
     state_ptr = carry[n_chunks_outer * 2]
     data_ptr = carry[n_chunks_outer * 2 + 1]
 

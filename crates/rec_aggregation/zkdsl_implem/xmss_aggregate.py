@@ -68,19 +68,21 @@ def xmss_verify(pub_key, message, merkle_chunks):
         for j in unroll(0, 24 / (2 * W)):
             assert encoding[i * (24 / (2 * W)) + j] < CHAIN_LENGTH**2
 
-        partial_sum: Mut = encoding[i * (24 / (2 * W))]
+        partial_sum_buf = Array(24 / (2 * W))
+        partial_sum_buf[0] = encoding[i * (24 / (2 * W))]
         for j in unroll(1, 24 / (2 * W)):
-            partial_sum += encoding[i * (24 / (2 * W)) + j] * (CHAIN_LENGTH**2) ** j
+            partial_sum_buf[j] = partial_sum_buf[j - 1] + encoding[i * (24 / (2 * W)) + j] * (CHAIN_LENGTH**2) ** j
 
         # p = 2^31 - 2^24 + 1 = 127.2^24 + 1, so inv(2^24) = -127 (mod p).
         # Deduce remaining_i from partial_sum + remaining_i * 2^24 == encoding_fe[i]:
         # remaining_i = (encoding_fe[i] - partial_sum) * inv(2^24) = (partial_sum - encoding_fe[i]) * 127
-        remaining_i = (partial_sum - encoding_fe[i]) * 127
+        remaining_i = (partial_sum_buf[24 / (2 * W) - 1] - encoding_fe[i]) * 127
         assert remaining_i < 127  # ensures uniformity + prevent overflow
 
     debug_assert(V % 2 == 0)
     wots_public_key = Array((V / 2) * WOTS_PK_PAIR_STRIDE)
-    target_sum: Mut = 0
+    target_sum_buf = Array(V / 2 + 1)
+    target_sum_buf[0] = 0
     for i in unroll(0, V / 2):
         chain_start_a = chain_starts + (2 * i) * XMSS_DIGEST_LEN
         chain_start_b = chain_starts + (2 * i + 1) * XMSS_DIGEST_LEN
@@ -105,9 +107,9 @@ def xmss_verify(pub_key, message, merkle_chunks):
                 pair_sum_ptr,
             ),
         )
-        target_sum += pair_sum_ptr[0]
+        target_sum_buf[i + 1] = target_sum_buf[i] + pair_sum_ptr[0]
 
-    assert target_sum == TARGET_SUM
+    assert target_sum_buf[V / 2] == TARGET_SUM
 
     merkle_leaf = wots_pk_hash(wots_public_key, public_param)
 

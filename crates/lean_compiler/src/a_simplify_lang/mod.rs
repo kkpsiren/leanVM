@@ -267,17 +267,6 @@ impl SimpleLine {
     }
 }
 
-fn ends_with_early_exit(block: &[SimpleLine]) -> bool {
-    match block.last() {
-        Some(SimpleLine::Panic { .. }) | Some(SimpleLine::FunctionRet { .. }) => true,
-        Some(last) => {
-            let nested = last.nested_blocks();
-            !nested.is_empty() && nested.iter().all(|b| ends_with_early_exit(b))
-        }
-        None => false,
-    }
-}
-
 fn check_no_dead_code(body: &[Line], function_name: &str) -> Result<(), String> {
     for (i, line) in body.iter().enumerate() {
         let exit_kind = match line {
@@ -320,8 +309,6 @@ pub fn simplify_program(mut program: Program) -> Result<SimpleProgram, String> {
     for name in const_func_names {
         program.functions.remove(&name);
     }
-
-    check_no_loop_carried_mutables(&program)?;
 
     let mut new_functions = BTreeMap::new();
     let mut counters = Counters::default();
@@ -543,7 +530,7 @@ fn compile_time_transform_in_lines(
                     }
                 }
                 if targets.len() == 1
-                    && let AssignmentTarget::Var { var, is_mutable: false } = &targets[0]
+                    && let AssignmentTarget::Var { var } = &targets[0]
                     && let Some(value_const) = value.as_scalar()
                 {
                     const_var_exprs.insert(var.clone(), value_const);
@@ -654,29 +641,14 @@ fn try_expand_match_range(
         return Err("match_range expects: value, range, lambda, range, lambda, ...".to_string());
     }
 
-    // Check that user didn't explicitly request mutable results
-    for t in targets {
-        if let AssignmentTarget::Var { var, is_mutable: true } = t {
-            return Err(format!(
-                "match_range results are always immutable, cannot use ': Mut' for '{var}'"
-            ));
-        }
-    }
-
     // Generate forward declarations for variable targets (always immutable)
     let mut result = vec![];
     let arm_targets: Vec<_> = targets
         .iter()
         .map(|t| match t {
-            AssignmentTarget::Var { var, .. } => {
-                result.push(Line::ForwardDeclaration {
-                    var: var.clone(),
-                    is_mutable: false,
-                });
-                AssignmentTarget::Var {
-                    var: var.clone(),
-                    is_mutable: false,
-                }
+            AssignmentTarget::Var { var } => {
+                result.push(Line::ForwardDeclaration { var: var.clone() });
+                AssignmentTarget::Var { var: var.clone() }
             }
             other => other.clone(),
         })
@@ -785,15 +757,9 @@ fn try_inline_call(
                 new_args.push(Expression::Value(v.clone()));
             } else {
                 let tmp = format!("@inline_arg_{}", inline_counter.get_next());
-                new_lines.push(Line::ForwardDeclaration {
-                    var: tmp.clone(),
-                    is_mutable: false,
-                });
+                new_lines.push(Line::ForwardDeclaration { var: tmp.clone() });
                 new_lines.push(Line::Statement {
-                    targets: vec![AssignmentTarget::Var {
-                        var: tmp.clone(),
-                        is_mutable: false,
-                    }],
+                    targets: vec![AssignmentTarget::Var { var: tmp.clone() }],
                     value: arg.clone(),
                     location: *location,
                 });
@@ -867,15 +833,9 @@ fn extract_preprocessed_calls(
                 ));
             }
             let tmp = format!("@extract_tmp_{}", counter.get_next());
-            out.push(Line::ForwardDeclaration {
-                var: tmp.clone(),
-                is_mutable: false,
-            });
+            out.push(Line::ForwardDeclaration { var: tmp.clone() });
             out.push(Line::Statement {
-                targets: vec![AssignmentTarget::Var {
-                    var: tmp.clone(),
-                    is_mutable: false,
-                }],
+                targets: vec![AssignmentTarget::Var { var: tmp.clone() }],
                 value: Expression::FunctionCall {
                     function_name: function_name.clone(),
                     args: args.clone(),
@@ -953,133 +913,6 @@ fn substitute_const_vars_in_expr(expr: &mut Expression, const_var_exprs: &BTreeM
         changed |= substitute_const_vars_in_expr(inner, const_var_exprs);
     }
     changed
-}
-
-/// Finds mutable variables that are:
-/// 1. Defined OUTSIDE this block (external)
-/// 2. Re-assigned INSIDE this block
-fn find_modified_external_vars(
-    lines: &[Line],
-    const_arrays: &BTreeMap<String, ConstArrayValue>,
-    outer_mut_vars: &BTreeSet<Var>,
-) -> BTreeSet<Var> {
-    // Use the existing find_variable_usage to get external variables
-    // (variables that are read but not defined in this block)
-    let (mut internal_vars, mut external_vars) = find_variable_usage(lines, const_arrays);
-
-    // Mut vars declared in an enclosing scope are always external, even if only
-    // written (never read) inside this block.
-    for v in outer_mut_vars {
-        if !const_arrays.contains_key(v) {
-            internal_vars.remove(v);
-            external_vars.insert(v.clone());
-        }
-    }
-
-    // Now find which external variables are assigned to (modified)
-    let mut modified_external_vars = BTreeSet::new();
-    find_assigned_external_vars_helper(
-        lines,
-        const_arrays,
-        &internal_vars,
-        &external_vars,
-        &mut modified_external_vars,
-    );
-
-    modified_external_vars
-}
-
-/// Helper to find external variables that are assigned to inside a block.
-fn find_assigned_external_vars_helper(
-    lines: &[Line],
-    const_arrays: &BTreeMap<String, ConstArrayValue>,
-    internal_vars: &BTreeSet<Var>,
-    external_vars: &BTreeSet<Var>,
-    modified_external_vars: &mut BTreeSet<Var>,
-) {
-    for line in lines {
-        match line {
-            Line::Statement { targets, .. } => {
-                for target in targets {
-                    if let AssignmentTarget::Var { var, is_mutable } = target {
-                        // Only non-mutable assignments can be modifications
-                        // (is_mutable: true means it's the initial declaration)
-                        if !*is_mutable
-                            && external_vars.contains(var)
-                            && !internal_vars.contains(var)
-                            && !const_arrays.contains_key(var)
-                        {
-                            modified_external_vars.insert(var.clone());
-                        }
-                    }
-                }
-            }
-            _ => {
-                for block in line.nested_blocks() {
-                    find_assigned_external_vars_helper(
-                        block,
-                        const_arrays,
-                        internal_vars,
-                        external_vars,
-                        modified_external_vars,
-                    );
-                }
-            }
-        }
-    }
-}
-
-/// Reject any `range` / `parallel_range` loop that reassigns a mutable variable
-/// defined in an enclosing scope ("loop-carried mutable").
-fn check_no_loop_carried_mutables(program: &Program) -> Result<(), String> {
-    for func in program.functions.values() {
-        check_loop_carried_mutables_in_lines(&func.body, &program.const_arrays, &BTreeSet::new())?;
-    }
-    Ok(())
-}
-
-fn check_loop_carried_mutables_in_lines(
-    lines: &[Line],
-    const_arrays: &BTreeMap<String, ConstArrayValue>,
-    outer_mut_vars: &BTreeSet<Var>,
-) -> Result<(), String> {
-    let mut local_mut_vars = outer_mut_vars.clone();
-    for line in lines {
-        match line {
-            Line::ForLoop {
-                body,
-                loop_kind: LoopKind::Range | LoopKind::ParallelRange,
-                location,
-                ..
-            } => {
-                check_loop_carried_mutables_in_lines(body, const_arrays, &local_mut_vars)?;
-                let modified_vars = find_modified_external_vars(body, const_arrays, &local_mut_vars);
-                if !modified_vars.is_empty() {
-                    return Err(format!(
-                        "loop at {location} reassigns enclosing-scope mutable(s) {modified_vars:?}; \
-                         loop-carried mutables are unsupported: use an explicit buffer (see zkDSL.md, \"For loops\")"
-                    ));
-                }
-            }
-            Line::ForLoop { body, .. } => {
-                check_loop_carried_mutables_in_lines(body, const_arrays, &local_mut_vars)?;
-            }
-            Line::IfCondition { .. } | Line::Match { .. } => {
-                for block in line.nested_blocks() {
-                    check_loop_carried_mutables_in_lines(block, const_arrays, &local_mut_vars)?;
-                }
-            }
-            Line::Statement { targets, .. } => {
-                for target in targets {
-                    if let AssignmentTarget::Var { var, is_mutable: true } = target {
-                        local_mut_vars.insert(var.clone());
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    Ok(())
 }
 
 fn check_function_always_returns(func: &SimpleFunction) -> Result<(), String> {
@@ -1276,157 +1109,27 @@ struct ArrayManager {
     valid: BTreeSet<Var>,                              // currently valid aux vars
 }
 
-/// Tracks the current "version" of each mutable variable for SSA-like transformation
+/// Tracks assigned variables to reject a second write to the same name.
+///
+/// Every source variable is single-assignment (manual SSA in source): each name
+/// maps to exactly one memory cell. Branches are mutually exclusive, so the
+/// memory cell itself is the phi node — no version reconciliation is needed.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct MutableVarTracker {
-    /// For mutable variables: maps original variable name -> current version number (0 = original)
-    versions: BTreeMap<Var, usize>,
-    /// Tracks assigned immutable variables to detect illegal reassignment
+    /// Tracks assigned variables to detect illegal reassignment.
     assigned: BTreeSet<Var>,
 }
 
 impl MutableVarTracker {
-    fn is_mutable(&self, var: &Var) -> bool {
-        self.versions.contains_key(var)
-    }
-
-    fn register_mutable(&mut self, var: &Var) {
-        self.versions.insert(var.clone(), 0);
-    }
-
-    fn current_name(&self, var: &Var) -> Var {
-        if self.is_mutable(var) {
-            format!("@mut_{var}_{}", self.versions.get(var).copied().unwrap_or(0))
-        } else {
-            var.clone()
-        }
-    }
-
-    fn current_version(&self, var: &Var) -> usize {
-        self.versions.get(var).copied().unwrap_or(0)
-    }
-
-    fn increment_version(&mut self, var: &Var) -> Var {
-        let version = self.versions.entry(var.clone()).or_insert(0);
-        *version += 1;
-        format!("@mut_{var}_{version}")
-    }
-
-    fn is_ssa_reassignment(&self, var: &Var) -> bool {
-        self.is_mutable(var) && self.current_version(var) > 0
-    }
-
     fn check_immutable_assignment(&mut self, var: &Var) -> Result<(), String> {
+        // Generated SSA temps (prefixed '@') are unique by construction and skip the check.
         if var.starts_with('@') || self.assigned.insert(var.clone()) {
             Ok(())
         } else {
             Err(format!(
-                "Cannot reassign immutable variable '{var}'. Use '{var}: Mut' for mutable variables, or 'assert {var} == <value>;' to check equality"
+                "Cannot reassign variable '{var}'. Variables are single-assignment; use a fresh name, or 'assert {var} == <value>;' to check equality"
             ))
         }
-    }
-
-    /// Unifies mutable variable versions across multiple branches.
-    /// Returns forward declarations to add before the branching construct.
-    fn unify_branch_versions(
-        &mut self,
-        snapshot_versions: &BTreeMap<Var, usize>,
-        branch_versions: &[BTreeMap<Var, usize>],
-        branches: &mut [Vec<SimpleLine>],
-    ) -> Vec<SimpleLine> {
-        let mut forward_decls = Vec::new();
-
-        let branch_exits_early: Vec<bool> = branches.iter().map(|b| ends_with_early_exit(b)).collect();
-
-        // Collect variables that were newly introduced in branches (not in snapshot)
-        let mut branch_local_vars = Vec::new();
-
-        for var in self.versions.clone().keys() {
-            let was_in_snapshot = snapshot_versions.contains_key(var);
-            let snapshot_v = snapshot_versions.get(var).copied().unwrap_or(0);
-
-            // Check which continuing branches have this variable
-            let branch_has_var: Vec<bool> = branch_versions.iter().map(|v| v.contains_key(var)).collect();
-            let versions: Vec<usize> = branch_versions
-                .iter()
-                .map(|v| v.get(var).copied().unwrap_or(0))
-                .collect();
-
-            // Only consider versions from branches that don't exit early for unification
-            let continuing_branches: Vec<(usize, bool, usize)> = versions
-                .iter()
-                .zip(branch_exits_early.iter())
-                .zip(branch_has_var.iter())
-                .enumerate()
-                .filter(|(_, ((_, exits), _))| !*exits)
-                .map(|(idx, ((v, _), has))| (idx, *has, *v))
-                .collect();
-
-            // If all branches exit early, no unification needed - just keep the snapshot version
-            if continuing_branches.is_empty() {
-                self.versions.insert(var.clone(), snapshot_v);
-                continue;
-            }
-
-            // If variable wasn't in snapshot, check if it exists in all continuing branches
-            if !was_in_snapshot {
-                let exists_in_all = continuing_branches.iter().all(|(_, has, _)| *has);
-                if !exists_in_all {
-                    // Variable was introduced in some branches but not all - it's branch-local
-                    // Don't unify; remove from tracker after processing
-                    branch_local_vars.push(var.clone());
-                    continue;
-                }
-            }
-
-            let continuing_versions: Vec<usize> = continuing_branches.iter().map(|(_, _, v)| *v).collect();
-
-            // Check if all continuing branches have the same version
-            if continuing_versions.iter().all(|&v| v == continuing_versions[0]) {
-                // All continuing branches have the same version
-                let branch_v = continuing_versions[0];
-                if branch_v > snapshot_v {
-                    // A new versioned variable was created in all continuing branches
-                    let versioned_var = format!("@mut_{var}_{branch_v}");
-                    forward_decls.push(SimpleLine::ForwardDeclaration {
-                        var: versioned_var.clone(),
-                    });
-                    // Remove forward declarations from inside the branches to avoid shadowing
-                    for branch in branches.iter_mut() {
-                        remove_forward_declarations(branch, &versioned_var);
-                    }
-                }
-                self.versions.insert(var.clone(), branch_v);
-            } else {
-                // Versions differ among continuing branches - need to unify
-                let max_version = continuing_versions.iter().copied().max().unwrap();
-                let unified_version = max_version + 1;
-                let unified_var = format!("@mut_{var}_{unified_version}");
-
-                forward_decls.push(SimpleLine::ForwardDeclaration {
-                    var: unified_var.clone(),
-                });
-
-                // Add equality assignment at the end of each branch that doesn't exit early
-                for (branch_idx, branch_v) in versions.iter().enumerate() {
-                    if branch_exits_early[branch_idx] {
-                        // Skip branches that exit early - they never reach code after the if/match
-                        continue;
-                    }
-                    let branch_var_name: Var = format!("@mut_{var}_{branch_v}");
-                    branches[branch_idx].push(SimpleLine::equality(unified_var.clone(), branch_var_name));
-                }
-
-                self.versions.insert(var.clone(), unified_version);
-            }
-        }
-
-        // Remove branch-local variables from tracker - they're out of scope
-        for var in branch_local_vars {
-            self.versions.remove(&var);
-        }
-
-        forward_decls
     }
 }
 
@@ -1461,16 +1164,8 @@ fn simplify_lines(
     let mut res = Vec::new();
     for line in lines {
         match line {
-            Line::ForwardDeclaration { var, is_mutable } => {
-                if *is_mutable {
-                    state.mut_tracker.register_mutable(var);
-                }
-                let versioned_var = if *is_mutable {
-                    state.mut_tracker.current_name(var)
-                } else {
-                    var.clone()
-                };
-                res.push(SimpleLine::ForwardDeclaration { var: versioned_var });
+            Line::ForwardDeclaration { var } => {
+                res.push(SimpleLine::ForwardDeclaration { var: var.clone() });
             }
             Line::Match { value, arms, .. } => {
                 // Validate patterns are consecutive
@@ -1487,16 +1182,19 @@ fn simplify_lines(
 
                 let simple_value = simplify_expr(ctx, state, const_malloc, value, &mut res)?;
 
-                // Snapshot state before processing arms
-                let mut_tracker_snapshot = state.mut_tracker.clone();
+                // Snapshot state before processing arms. Arms are mutually exclusive and
+                // each variable maps to exactly one memory cell, so the memory cell is the
+                // phi node — no version reconciliation is needed across arms.
+                let assigned_snapshot = state.mut_tracker.assigned.clone();
                 let array_manager_snapshot = state.array_manager.clone();
 
                 let mut simple_arms = vec![];
-                let mut arm_versions = vec![];
+                let mut assigned_after = assigned_snapshot.clone();
 
                 for (_, statements) in arms.iter() {
-                    // Restore snapshot for each arm
-                    *state.mut_tracker = mut_tracker_snapshot.clone();
+                    // Restore snapshot for each arm: a name assigned in a sibling arm must
+                    // not be seen as a conflicting reassignment in this (exclusive) arm.
+                    state.mut_tracker.assigned = assigned_snapshot.clone();
                     *state.array_manager = array_manager_snapshot.clone();
 
                     let arm_simplified = simplify_lines(
@@ -1509,16 +1207,12 @@ fn simplify_lines(
                         in_a_loop,
                     )?;
                     simple_arms.push(arm_simplified);
-                    arm_versions.push(state.mut_tracker.versions.clone());
+                    // A name assigned in any arm is assigned after the match (reassigning it
+                    // post-match would be a genuine double-write).
+                    assigned_after.extend(state.mut_tracker.assigned.iter().cloned());
                 }
 
-                // Unify mutable variable versions across all arms
-                let forward_decls = state.mut_tracker.unify_branch_versions(
-                    &mut_tracker_snapshot.versions,
-                    &arm_versions,
-                    &mut simple_arms,
-                );
-                res.extend(forward_decls);
+                state.mut_tracker.assigned = assigned_after;
 
                 // Restore array manager to snapshot state
                 *state.array_manager = array_manager_snapshot;
@@ -1534,23 +1228,12 @@ fn simplify_lines(
                 value,
                 location,
             } => {
-                // Helper function to get the target variable name, handling mutable variable versioning
-                let get_target_var_name =
-                    |state: &mut SimplifyState<'_>, var: &Var, is_mutable: bool| -> Result<Var, String> {
-                        if is_mutable {
-                            // First assignment with `mut` - register as mutable
-                            state.mut_tracker.register_mutable(var);
-                            // Return versioned name so subsequent reads can find it
-                            Ok(state.mut_tracker.current_name(var))
-                        } else if state.mut_tracker.is_mutable(var) {
-                            // Increment version and get new variable name
-                            Ok(state.mut_tracker.increment_version(var))
-                        } else {
-                            // Check for reassignment of immutable variable
-                            state.mut_tracker.check_immutable_assignment(var)?;
-                            Ok(var.clone())
-                        }
-                    };
+                // Resolve an assignment target: variables are single-assignment, so just
+                // reject a second write to the same name and return the name unchanged.
+                let get_target_var_name = |state: &mut SimplifyState<'_>, var: &Var| -> Result<Var, String> {
+                    state.mut_tracker.check_immutable_assignment(var)?;
+                    Ok(var.clone())
+                };
 
                 for target in targets {
                     if let AssignmentTarget::ArrayAccess { array, .. } = target
@@ -1592,8 +1275,8 @@ fn simplify_lines(
                             }
                             let target = &targets[0];
                             match target {
-                                AssignmentTarget::Var { var, is_mutable } => {
-                                    let target_var = get_target_var_name(state, var, *is_mutable)?;
+                                AssignmentTarget::Var { var } => {
+                                    let target_var = get_target_var_name(state, var)?;
                                     let simplified_size = simplify_expr(ctx, state, const_malloc, &args[0], &mut res)?;
                                     match simplified_size {
                                         SimpleExpr::Constant(const_size) => {
@@ -1788,14 +1471,8 @@ fn simplify_lines(
 
                         for (i, target) in targets.iter().enumerate() {
                             match target {
-                                AssignmentTarget::Var { var, is_mutable } => {
-                                    let target_var = get_target_var_name(state, var, *is_mutable)?;
-                                    // Add forward declaration for new versioned variable
-                                    if *is_mutable || state.mut_tracker.current_version(var) > 0 {
-                                        res.push(SimpleLine::ForwardDeclaration {
-                                            var: target_var.clone(),
-                                        });
-                                    }
+                                AssignmentTarget::Var { var } => {
+                                    let target_var = get_target_var_name(state, var)?;
                                     temp_vars.push(target_var);
                                 }
                                 AssignmentTarget::ArrayAccess { array, index } => {
@@ -1831,9 +1508,7 @@ fn simplify_lines(
                         let target = &targets[0];
 
                         match target {
-                            AssignmentTarget::Var { var, is_mutable } => {
-                                // IMPORTANT: Simplify RHS BEFORE updating version tracker
-                                // This ensures the RHS uses the current (old) version of any mutable variables
+                            AssignmentTarget::Var { var, .. } => {
                                 match value {
                                     Expression::Value(val) => {
                                         let simplified_val = simplify_expr(
@@ -1843,37 +1518,22 @@ fn simplify_lines(
                                             &Expression::Value(val.clone()),
                                             &mut res,
                                         )?;
-                                        let target_var = get_target_var_name(state, var, *is_mutable)?;
-                                        if state.mut_tracker.is_ssa_reassignment(var) {
-                                            res.push(SimpleLine::ForwardDeclaration {
-                                                var: target_var.clone(),
-                                            });
-                                        }
+                                        let target_var = get_target_var_name(state, var)?;
                                         res.push(SimpleLine::equality(target_var, simplified_val));
                                     }
                                     Expression::ArrayAccess { array, index } => {
                                         if array.as_var().is_some_and(|n| ctx.const_arrays.contains_key(n)) {
                                             let simplified_val =
                                                 simplify_expr(ctx, state, const_malloc, value, &mut res)?;
-                                            let target_var = get_target_var_name(state, var, *is_mutable)?;
-                                            if state.mut_tracker.is_ssa_reassignment(var) {
-                                                res.push(SimpleLine::ForwardDeclaration {
-                                                    var: target_var.clone(),
-                                                });
-                                            }
+                                            let target_var = get_target_var_name(state, var)?;
                                             res.push(SimpleLine::equality(target_var, simplified_val));
                                         } else {
-                                            // Pre-simplify indices before version update
+                                            // Pre-simplify indices
                                             let simplified_index = index
                                                 .iter()
                                                 .map(|idx| simplify_expr(ctx, state, const_malloc, idx, &mut res))
                                                 .collect::<Result<Vec<_>, _>>()?;
-                                            let target_var = get_target_var_name(state, var, *is_mutable)?;
-                                            if state.mut_tracker.is_ssa_reassignment(var) {
-                                                res.push(SimpleLine::ForwardDeclaration {
-                                                    var: target_var.clone(),
-                                                });
-                                            }
+                                            let target_var = get_target_var_name(state, var)?;
                                             handle_array_assignment(
                                                 state,
                                                 const_malloc,
@@ -1889,12 +1549,7 @@ fn simplify_lines(
                                             .iter()
                                             .map(|arg| simplify_expr(ctx, state, const_malloc, arg, &mut res))
                                             .collect::<Result<Vec<_>, _>>()?;
-                                        let target_var = get_target_var_name(state, var, *is_mutable)?;
-                                        if state.mut_tracker.is_ssa_reassignment(var) {
-                                            res.push(SimpleLine::ForwardDeclaration {
-                                                var: target_var.clone(),
-                                            });
-                                        }
+                                        let target_var = get_target_var_name(state, var)?;
                                         // If all operands are constants, evaluate at compile time
                                         if let Some(const_args) = SimpleExpr::try_vec_as_constant(&args_simplified) {
                                             let result = ConstExpression::MathExpr(*operation, const_args);
@@ -2131,8 +1786,6 @@ fn simplify_lines(
                     then_branch,
                     in_a_loop,
                 )?;
-                let then_versions = mut_tracker_then.versions.clone();
-
                 let mut array_manager_else = array_manager_then.clone();
                 array_manager_else.valid = state.array_manager.valid.clone(); // Crucial: remove the access added in the IF branch
 
@@ -2153,18 +1806,8 @@ fn simplify_lines(
                     else_branch,
                     in_a_loop,
                 )?;
-                let else_versions = mut_tracker_else.versions.clone();
-
-                // Unify mutable variable versions across both branches
-                let branch_versions = vec![then_versions, else_versions];
-                let mut branches = vec![then_branch_simplified, else_branch_simplified];
-                let forward_decls = state.mut_tracker.unify_branch_versions(
-                    &mut_tracker_snapshot.versions,
-                    &branch_versions,
-                    &mut branches,
-                );
-                res.extend(forward_decls);
-                let [then_branch_simplified, else_branch_simplified] = <[_; 2]>::try_from(branches).unwrap();
+                // Branches are mutually exclusive and variables are single-assignment, so no version
+                // reconciliation is needed — the memory cell a name maps to is itself the merge point.
 
                 *state.array_manager = array_manager_else.clone();
                 // keep the intersection both branches
@@ -2227,10 +1870,7 @@ fn simplify_lines(
                 }
                 external_vars.remove(iterator); // Iterator is internal to loop
 
-                let mut external_vars: Vec<_> = external_vars
-                    .into_iter()
-                    .map(|var| state.mut_tracker.current_name(&var))
-                    .collect();
+                let mut external_vars: Vec<_> = external_vars.into_iter().collect();
 
                 let start_simplified = simplify_expr(ctx, state, const_malloc, start, &mut res)?;
                 let mut end_simplified = simplify_expr(ctx, state, const_malloc, end, &mut res)?;
@@ -2335,15 +1975,7 @@ fn simplify_expr(
     lines: &mut Vec<SimpleLine>,
 ) -> Result<SimpleExpr, String> {
     match expr {
-        Expression::Value(value) => {
-            // Translate mutable variable references to their current versioned name
-            if let SimpleExpr::Memory(VarOrConstMallocAccess::Var(var)) = value {
-                let versioned_var = state.mut_tracker.current_name(var);
-                Ok(versioned_var.into())
-            } else {
-                Ok(value.clone())
-            }
-        }
+        Expression::Value(value) => Ok(value.clone()),
         Expression::ArrayAccess { array, index } => {
             let array_var_name = array.as_var();
 
@@ -2368,7 +2000,7 @@ fn simplify_expr(
                 )));
             }
 
-            let versioned_array = array_var_name.map(|n| state.mut_tracker.current_name(n));
+            let versioned_array = array_var_name.cloned();
 
             if index.len() != 1 {
                 return Err(format!(
@@ -2814,7 +2446,7 @@ fn handle_array_assignment(
     // constant address directly.
     let base_addr: SimpleExpr = match array.as_var() {
         Some(name) => {
-            let versioned = state.mut_tracker.current_name(name);
+            let versioned = name.clone();
 
             // Use ConstMallocAccess when the array is a const_malloc and the index is a constant.
             // This compiles to a direct ADD (fp + offset) instead of a DEREF

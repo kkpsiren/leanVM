@@ -44,62 +44,63 @@ def whir_open(
     carry[3] = n_vars + initial_log_inv_rate
     for r in range(0, n_rounds):
         base = r * 4
-        fs: Mut = carry[base]
-        root: Mut = carry[base + 1]
-        claimed_sum: Mut = carry[base + 2]
-        domain_sz: Mut = carry[base + 3]
+        fs0 = carry[base]
+        root0 = carry[base + 1]
+        claimed_sum0 = carry[base + 2]
+        domain_sz0 = carry[base + 3]
         is_first_round: Imm
         if r == 0:
             is_first_round = 1
         else:
             is_first_round = 0
         (
-            fs,
+            fs1,
             all_folding_randomness[r],
             all_ood_points[r],
-            root,
+            root1,
             all_circle_values[r],
             all_combination_randomness_powers[r],
-            claimed_sum,
+            claimed_sum1,
         ) = whir_round(
-            fs,
-            root,
+            fs0,
+            root0,
             folding_factors[r],
             two_exp(folding_factors[r]),
             is_first_round,
             num_queries[r],
-            domain_sz,
-            claimed_sum,
+            domain_sz0,
+            claimed_sum0,
             query_grinding_bits[r],
             num_oods[r + 1],
             folding_grinding[r],
         )
+        domain_sz1: Imm
         if r == 0:
-            domain_sz -= WHIR_FIRST_RS_REDUCTION_FACTOR
+            domain_sz1 = domain_sz0 - WHIR_FIRST_RS_REDUCTION_FACTOR
         else:
-            domain_sz -= 1
-        carry[base + 4] = fs
-        carry[base + 5] = root
-        carry[base + 6] = claimed_sum
-        carry[base + 7] = domain_sz
-    fs: Mut = carry[n_rounds * 4]
+            domain_sz1 = domain_sz0 - 1
+        carry[base + 4] = fs1
+        carry[base + 5] = root1
+        carry[base + 6] = claimed_sum1
+        carry[base + 7] = domain_sz1
+    fs1 = carry[n_rounds * 4]
     root = carry[n_rounds * 4 + 1]
-    claimed_sum: Mut = carry[n_rounds * 4 + 2]
+    claimed_sum1 = carry[n_rounds * 4 + 2]
     domain_sz = carry[n_rounds * 4 + 3]
 
-    fs, all_folding_randomness[n_rounds], claimed_sum = sumcheck_verify_with_grinding(
-        fs, WHIR_SUBSEQUENT_FOLDING_FACTOR, claimed_sum, 2, folding_grinding[n_rounds]
+    fs2, all_folding_randomness[n_rounds], claimed_sum2 = sumcheck_verify_with_grinding(
+        fs1, WHIR_SUBSEQUENT_FOLDING_FACTOR, claimed_sum1, 2, folding_grinding[n_rounds]
     )
 
-    fs, final_coeffcients = fs_receive_ef_by_log_dynamic(
-        fs,
+    fs3, final_coeffcients = fs_receive_ef_by_log_dynamic(
+        fs2,
         n_final_vars,
         MAX_NUM_VARIABLES_TO_SEND_COEFFS - WHIR_SUBSEQUENT_FOLDING_FACTOR,
         MAX_NUM_VARIABLES_TO_SEND_COEFFS + 1,
     )
 
-    fs, all_circle_values[n_rounds], final_folds = sample_stir_indexes_and_fold(
-        fs,
+    fs4, all_circle_values[n_rounds], final_folds = sample_stir_indexes_and_fold(
+        fs3,
         num_queries[n_rounds],
         0,
         WHIR_SUBSEQUENT_FOLDING_FACTOR,
@@ -122,18 +123,18 @@ def whir_open(
         )
         copy_5(final_pol_evaluated_on_circle, final_folds + i * DIM)
 
-    fs, all_folding_randomness[n_rounds + 1], end_sum = sumcheck_verify(fs, n_final_vars, claimed_sum, 2)
+    fs5, all_folding_randomness[n_rounds + 1], end_sum = sumcheck_verify(fs4, n_final_vars, claimed_sum2, 2)
 
     folding_randomness_global = Array(n_vars * DIM)
 
     start_buf = Array(n_rounds + 2)
     start_buf[0] = folding_randomness_global
     for i in range(0, n_rounds + 1):
-        start: Mut = start_buf[i]
+        start0 = start_buf[i]
         for j in range(0, folding_factors[i]):
-            copy_5(all_folding_randomness[i] + j * DIM, start + j * DIM)
-        start += folding_factors[i] * DIM
-        start_buf[i + 1] = start
+            copy_5(all_folding_randomness[i] + j * DIM, start0 + j * DIM)
+        start1 = start0 + folding_factors[i] * DIM
+        start_buf[i + 1] = start1
     start = start_buf[n_rounds + 1]
     for j in range(0, n_final_vars):
         copy_5(all_folding_randomness[n_rounds + 1] + j * DIM, start + j * DIM)
@@ -158,17 +159,17 @@ def whir_open(
     eval_carry[2] = s_init
     for i in range(0, n_rounds):
         base = i * 3
-        n_vars_remaining: Mut = eval_carry[base]
-        my_folding_randomness: Mut = eval_carry[base + 1]
-        s: Mut = eval_carry[base + 2]
-        n_vars_remaining -= folding_factors[i]
+        n_vars_remaining0 = eval_carry[base]
+        my_folding_randomness0 = eval_carry[base + 1]
+        s0 = eval_carry[base + 2]
+        n_vars_remaining1 = n_vars_remaining0 - folding_factors[i]
         my_ood_recovered_evals = Array(num_oods[i + 1] * DIM)
         combination_randomness_powers = all_combination_randomness_powers[i]
-        my_folding_randomness += folding_factors[i] * DIM
+        my_folding_randomness1 = my_folding_randomness0 + folding_factors[i] * DIM
         for j in range(0, num_oods[i + 1]):
-            expanded_from_univariate = expand_from_univariate_ext(all_ood_points[i] + j * DIM, n_vars_remaining)
+            expanded_from_univariate = expand_from_univariate_ext(all_ood_points[i] + j * DIM, n_vars_remaining1)
             poly_eq_extension_dynamic_to(
-                expanded_from_univariate, my_folding_randomness, my_ood_recovered_evals + j * DIM, n_vars_remaining
+                expanded_from_univariate, my_folding_randomness1, my_ood_recovered_evals + j * DIM, n_vars_remaining1
             )
         summed_ood = Array(DIM)
         dot_product_ee_dynamic(
@@ -181,8 +182,8 @@ def whir_open(
         s6s = Array((num_queries[i]) * DIM)
         circle_value_i = all_circle_values[i]
         for j in range(0, num_queries[i]):  # unroll ?
-            expanded_from_univariate = expand_from_univariate_base(circle_value_i[j], n_vars_remaining)
-            poly_eq_base_extension_to(expanded_from_univariate, my_folding_randomness, s6s + j * DIM, n_vars_remaining)
+            expanded_from_univariate = expand_from_univariate_base(circle_value_i[j], n_vars_remaining1)
+            poly_eq_base_extension_to(expanded_from_univariate, my_folding_randomness1, s6s + j * DIM, n_vars_remaining1)
         s7 = Array(DIM)
         dot_product_ee_dynamic(
             s6s,
@@ -190,11 +191,11 @@ def whir_open(
             s7,
             num_queries[i],
         )
-        s = add_extension_ret(s, s7)
-        s = add_extension_ret(summed_ood, s)
-        eval_carry[base + 3] = n_vars_remaining
-        eval_carry[base + 4] = my_folding_randomness
-        eval_carry[base + 5] = s
+        s1 = add_extension_ret(s0, s7)
+        s2 = add_extension_ret(summed_ood, s1)
+        eval_carry[base + 3] = n_vars_remaining1
+        eval_carry[base + 4] = my_folding_randomness1
+        eval_carry[base + 5] = s2
     s = eval_carry[n_rounds * 3 + 2]
     final_value = match_range(
         n_final_vars,
@@ -203,7 +204,7 @@ def whir_open(
     )
     # copy_5(mul_extension_ret(s, final_value), end_sum);
 
-    return fs, folding_randomness_global, s, final_value, end_sum
+    return fs5, folding_randomness_global, s, final_value, end_sum
 
 
 def sumcheck_verify(fs, n_steps, claimed_sum, degree: Const):
@@ -218,15 +219,15 @@ def sumcheck_verify_helper(prev_fs, n_steps, prev_claimed_sum, degree: Const, ch
     carry[1] = prev_claimed_sum
     for sc_round in range(0, n_steps):
         base = sc_round * 2
-        fs: Mut = carry[base]
-        claimed_sum: Mut = carry[base + 1]
-        fs, poly = fs_receive_ef_inlined(fs, degree + 1)
-        polynomial_sum_at_0_and_1(poly, degree, claimed_sum)
-        fs, rand = fs_sample_ef(fs)
-        claimed_sum = univariate_polynomial_eval(poly, rand, degree)
+        fs0 = carry[base]
+        claimed_sum0 = carry[base + 1]
+        fs1, poly = fs_receive_ef_inlined(fs0, degree + 1)
+        polynomial_sum_at_0_and_1(poly, degree, claimed_sum0)
+        fs2, rand = fs_sample_ef(fs1)
+        claimed_sum1 = univariate_polynomial_eval(poly, rand, degree)
         copy_5(rand, challenges + sc_round * DIM)
-        carry[base + 2] = fs
-        carry[base + 3] = claimed_sum
+        carry[base + 2] = fs2
+        carry[base + 3] = claimed_sum1
 
     final_fs = carry[n_steps * 2]
     final_claimed_sum = carry[n_steps * 2 + 1]
@@ -250,16 +251,18 @@ def sumcheck_verify_reversed_helper(fs, n_steps, claimed_sum, degree: Const, cha
 
 
 def sumcheck_verify_reversed_helper_const(prev_fs, n_steps: Const, prev_claimed_sum, degree: Const, challenges):
-    fs: Mut = prev_fs
-    claimed_sum: Mut = prev_claimed_sum
+    fs_buf = Array(n_steps + 1)
+    claimed_sum_buf = Array(n_steps + 1)
+    fs_buf[0] = prev_fs
+    claimed_sum_buf[0] = prev_claimed_sum
     for sc_round in unroll(0, n_steps):
-        fs, poly = fs_receive_ef_inlined(fs, degree + 1)
-        polynomial_sum_at_0_and_1(poly, degree, claimed_sum)
-        fs, rand = fs_sample_ef(fs)
-        claimed_sum = univariate_polynomial_eval(poly, rand, degree)
+        fs_recv, poly = fs_receive_ef_inlined(fs_buf[sc_round], degree + 1)
+        polynomial_sum_at_0_and_1(poly, degree, claimed_sum_buf[sc_round])
+        fs_buf[sc_round + 1], rand = fs_sample_ef(fs_recv)
+        claimed_sum_buf[sc_round + 1] = univariate_polynomial_eval(poly, rand, degree)
         copy_5(rand, challenges + (n_steps - 1 - sc_round) * DIM)
 
-    return fs, claimed_sum
+    return fs_buf[n_steps], claimed_sum_buf[n_steps]
 
 
 def sumcheck_verify_with_grinding(prev_fs, n_steps, prev_claimed_sum, degree: Const, folding_grinding_bits):
@@ -269,16 +272,16 @@ def sumcheck_verify_with_grinding(prev_fs, n_steps, prev_claimed_sum, degree: Co
     carry[1] = prev_claimed_sum
     for sc_round in range(0, n_steps):
         base = sc_round * 2
-        fs: Mut = carry[base]
-        claimed_sum: Mut = carry[base + 1]
-        fs, poly = fs_receive_ef_inlined(fs, degree + 1)
-        polynomial_sum_at_0_and_1(poly, degree, claimed_sum)
-        fs = fs_grinding(fs, folding_grinding_bits)
-        fs, rand = fs_sample_ef(fs)
-        claimed_sum = univariate_polynomial_eval(poly, rand, degree)
+        fs0 = carry[base]
+        claimed_sum0 = carry[base + 1]
+        fs1, poly = fs_receive_ef_inlined(fs0, degree + 1)
+        polynomial_sum_at_0_and_1(poly, degree, claimed_sum0)
+        fs2 = fs_grinding(fs1, folding_grinding_bits)
+        fs3, rand = fs_sample_ef(fs2)
+        claimed_sum1 = univariate_polynomial_eval(poly, rand, degree)
         copy_5(rand, challenges + sc_round * DIM)
-        carry[base + 2] = fs
-        carry[base + 3] = claimed_sum
+        carry[base + 2] = fs3
+        carry[base + 3] = claimed_sum1
 
     final_fs = carry[n_steps * 2]
     final_claimed_sum = carry[n_steps * 2 + 1]
@@ -348,11 +351,10 @@ def sample_stir_indexes_and_fold(
     folding_randomness,
     query_grinding_bits,
 ):
-    fs: Mut = prev_fs
     folded_domain_size = domain_size - folding_factor
 
-    fs = fs_grinding(fs, query_grinding_bits)
-    sampled, fs = fs_sample_queries(fs, num_queries)
+    fs1 = fs_grinding(prev_fs, query_grinding_bits)
+    sampled, fs2 = fs_sample_queries(fs1, num_queries)
 
     merkle_leaves = Array(num_queries)
     circle_values = Array(num_queries)
@@ -385,7 +387,7 @@ def sample_stir_indexes_and_fold(
         for i in range(0, num_queries):
             dot_product_ee_dynamic(merkle_leaves[i], poly_eq, folds + i * DIM, two_pow_folding_factor)
 
-    return fs, circle_values, folds
+    return fs2, circle_values, folds
 
 
 def whir_round(
@@ -401,15 +403,14 @@ def whir_round(
     num_ood,
     folding_grinding_bits,
 ):
-    fs: Mut = prev_fs
-    fs, folding_randomness, new_claimed_sum_a = sumcheck_verify_with_grinding(
-        fs, folding_factor, claimed_sum, 2, folding_grinding_bits
+    fs1, folding_randomness, new_claimed_sum_a = sumcheck_verify_with_grinding(
+        prev_fs, folding_factor, claimed_sum, 2, folding_grinding_bits
     )
 
-    fs, root, ood_points, ood_evals = parse_commitment(fs, num_ood)
+    fs2, root, ood_points, ood_evals = parse_commitment(fs1, num_ood)
 
-    fs, circle_values, folds = sample_stir_indexes_and_fold(
-        fs,
+    fs3, circle_values, folds = sample_stir_indexes_and_fold(
+        fs2,
         num_queries,
         merkle_leaves_in_basefield,
         folding_factor,
@@ -420,8 +421,8 @@ def whir_round(
         query_grinding_bits,
     )
 
-    fs = fs_duplex(fs)
-    fs, combination_randomness_gen = fs_sample_ef(fs)
+    fs4 = fs_duplex(fs3)
+    fs5, combination_randomness_gen = fs_sample_ef(fs4)
 
     combination_randomness_powers = powers(combination_randomness_gen, num_queries + num_ood)
 
@@ -436,7 +437,7 @@ def whir_round(
     final_sum = add_extension_ret(new_claimed_sum_a, new_claimed_sum_b)
 
     return (
-        fs,
+        fs5,
         folding_randomness,
         ood_points,
         root,
@@ -466,11 +467,10 @@ def parse_commitment(fs, num_ood):
 
 
 def parse_whir_commitment_const(fs, num_ood: Const):
-    new_fs: Mut
-    new_fs, root = fs_receive_chunks(fs, 1)
-    new_fs, ood_points = fs_sample_many_ef(new_fs, num_ood)
-    new_fs, ood_evals = fs_receive_ef_inlined(new_fs, num_ood)
-    return new_fs, root, ood_points, ood_evals
+    new_fs1, root = fs_receive_chunks(fs, 1)
+    new_fs2, ood_points = fs_sample_many_ef(new_fs1, num_ood)
+    new_fs3, ood_evals = fs_receive_ef_inlined(new_fs2, num_ood)
+    return new_fs3, root, ood_points, ood_evals
 
 
 @inline

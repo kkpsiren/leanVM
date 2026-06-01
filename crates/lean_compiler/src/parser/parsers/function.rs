@@ -158,17 +158,10 @@ impl Parse<FunctionArg> for ParameterParser {
             .into());
         }
 
-        // Check for optional type annotation (: Const). ': Mut' parameters are forbidden.
+        // Check for optional type annotation (: Const). Variables are single-assignment; there is no `Mut`.
         let is_const = if let Some(annotation) = inner.next() {
             match annotation.as_str().trim() {
                 ": Const" => true,
-                ": Mut" => {
-                    return Err(SemanticError::new(format!(
-                        "Parameter '{name}' cannot be declared ': Mut'. Mutable parameters are not allowed; \
-                         introduce a local '{name}_mut: Mut = {name}' instead."
-                    ))
-                    .into());
-                }
                 other => return Err(SemanticError::new(format!("Invalid parameter annotation: {other}")).into()),
             }
         } else {
@@ -200,15 +193,7 @@ impl Parse<AssignmentTarget> for AssignmentTargetParser {
             }
             Rule::identifier => {
                 let var = first_pair.as_str().to_string();
-                // Check for mut_annotation (: Mut) following the identifier
-                let is_mutable = inner
-                    .peek()
-                    .map(|p| p.as_rule() == Rule::mut_annotation)
-                    .unwrap_or(false);
-                if is_mutable {
-                    inner.next(); // consume the mut_annotation
-                }
-                Ok(AssignmentTarget::Var { var, is_mutable })
+                Ok(AssignmentTarget::Var { var })
             }
             _ => Err(SemanticError::new("Expected identifier or array access").into()),
         }
@@ -338,15 +323,6 @@ impl AssignmentParser {
 
         let target_inner = next_inner_pair(&mut inner, "assignment target")?;
 
-        // Check for mut annotation (: Mut) - not allowed in compound assignment
-        if inner
-            .peek()
-            .map(|p| p.as_rule() == Rule::mut_annotation)
-            .unwrap_or(false)
-        {
-            return Err(SemanticError::new("Cannot use ': Mut' with compound assignment operators").into());
-        }
-
         match target_inner.as_rule() {
             Rule::array_access_expr => {
                 let mut arr_inner = target_inner.into_inner();
@@ -368,10 +344,7 @@ impl AssignmentParser {
             }
             Rule::identifier => {
                 let var = target_inner.as_str().to_string();
-                let target = AssignmentTarget::Var {
-                    var: var.clone(),
-                    is_mutable: false,
-                };
+                let target = AssignmentTarget::Var { var: var.clone() };
                 let lhs_expr = Expression::Value(SimpleExpr::Memory(VarOrConstMallocAccess::Var(var)));
                 Ok((target, lhs_expr))
             }

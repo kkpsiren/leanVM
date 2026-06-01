@@ -630,19 +630,37 @@ fn compile_lines(
                 instructions.push(IntermediateInstruction::CustomHint(*hint, simplified_args));
             }
             SimpleLine::HintWitness { destination, name } => {
-                let SimpleExpr::Memory(VarOrConstMallocAccess::Var(ptr_var)) = destination else {
-                    return Err(format!(
-                        "hint_witness: destination must be a plain variable, got {destination}"
-                    ));
-                };
-                check_non_negative_fp_rel_sink(destination, compiler)?;
-                let hint_destination = if let Some(IntermediateValue::FpRelative { offset }) =
-                    try_precompile_fp_relative(destination, compiler)
-                {
-                    HintWitnessDestination::Inline { offset }
-                } else {
-                    HintWitnessDestination::Indirect {
-                        ptr_offset: compiler.get_offset(&ptr_var.clone().into()),
+                let hint_destination = match destination {
+                    SimpleExpr::Memory(VarOrConstMallocAccess::Var(ptr_var)) => {
+                        check_non_negative_fp_rel_sink(destination, compiler)?;
+                        if let Some(IntermediateValue::FpRelative { offset }) =
+                            try_precompile_fp_relative(destination, compiler)
+                        {
+                            HintWitnessDestination::Inline { offset }
+                        } else {
+                            HintWitnessDestination::Indirect {
+                                ptr_offset: compiler.get_offset(&ptr_var.clone().into()),
+                            }
+                        }
+                    }
+                    // A compile-time-constant destination address: materialize it into a fresh
+                    // cell and write the witness through that pointer. (Single-assignment programs
+                    // can't otherwise force a constant into a variable, which the indirect hint needs.)
+                    SimpleExpr::Constant(c) => {
+                        let ptr_offset: ConstExpression = compiler.stack_pos.into();
+                        compiler.stack_pos += 1;
+                        instructions.push(IntermediateInstruction::Computation {
+                            operation: Operation::Add,
+                            arg_a: c.clone().into(),
+                            arg_b: ConstExpression::from(0usize).into(),
+                            res: IntermediateValue::MemoryAfterFp {
+                                offset: ptr_offset.clone(),
+                            },
+                        });
+                        HintWitnessDestination::Indirect { ptr_offset }
+                    }
+                    _ => {
+                        return Err(format!("hint_witness: unsupported destination {destination}"));
                     }
                 };
                 instructions.push(IntermediateInstruction::HintWitness {

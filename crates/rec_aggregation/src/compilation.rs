@@ -560,27 +560,27 @@ where
         bus_real_data.len()
     );
     res += &format!(
-        "\n    bus_res: Mut = add_extension_ret(mul_extension_ret({}, logup_alphas_eq_poly + {} * DIM), bus_res_init)",
+        "\n    bus_res_0 = add_extension_ret(mul_extension_ret({}, logup_alphas_eq_poly + {} * DIM), bus_res_init)",
         domainsep_str,
         (1 << LOG_MAX_BUS_WIDTH) - 1
     );
     // `air_alpha_powers` is the slice [alpha^offset, alpha^{offset+1}, …] for this table.
     // Multiplicity → slot 0, bus fingerprint → slot 1, remaining AIR constraints → slot 2+.
-    res += "\n    bus_res = mul_extension_ret(bus_res, air_alpha_powers + DIM)";
+    res += "\n    bus_res_1 = mul_extension_ret(bus_res_0, air_alpha_powers + DIM)";
     res += &format!(
         "\n    weighted_multiplicity = mul_extension_ret(air_alpha_powers, {})",
         multiplicity
     );
-    res += "\n    sum: Mut = add_extension_ret(bus_res, weighted_multiplicity)";
+    res += "\n    sum_0 = add_extension_ret(bus_res_1, weighted_multiplicity)";
 
     res += "\n    weighted_constraints = Array(DIM)";
     res += &format!(
         "\n    dot_product_ee(air_alpha_powers + 2 * DIM, constraints_buf, weighted_constraints, {})",
         n_constraints
     );
-    res += "\n    sum = add_extension_ret(sum, weighted_constraints)";
+    res += "\n    sum_1 = add_extension_ret(sum_0, weighted_constraints)";
 
-    res += "\n    return sum";
+    res += "\n    return sum_1";
     res += "\n";
     res
 }

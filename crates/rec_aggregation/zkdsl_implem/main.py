@@ -113,7 +113,7 @@ def main():
     assert n_sigs != 0
     assert n_sigs <= MAX_N_SIGS
 
-    tweak_table: Mut = TWEAK_TABLE_ADDR
+    tweak_table = TWEAK_TABLE_ADDR
     hint_witness("tweak_table", tweak_table)
 
     pubkeys_hash_expected = data_buf + SINGLE_MESSAGE_PUBKEYS_HASH_OFFSET
@@ -181,50 +181,50 @@ def main():
     counter_outer_buf = Array(n_recursions + 1)
     counter_outer_buf[0] = n_raw_xmss
     for rec_idx in range(0, n_recursions):
-        counter: Mut = counter_outer_buf[rec_idx]
+        counter0 = counter_outer_buf[rec_idx]
         n_sub = aggregate_sizes[rec_idx]
         assert n_sub != 0
         assert n_sub <= MAX_N_SIGS
         sub_indices_arr = Array(n_sub)
         hint_witness("sub_indices", sub_indices_arr)
 
-        running_hash: Mut = build_iv(n_sub * PUB_KEY_SIZE)
+        running_hash0 = build_iv(n_sub * PUB_KEY_SIZE)
         n_first = n_sub - 1
         n_chunks, remainder = euclidian_div_runtime(n_first, PARTIAL_UNROLL_BATCH)
-        pubkey_idx: Mut = 0
         inner_carry = Array((n_chunks + 1) * 3)
-        inner_carry[0] = counter
-        inner_carry[1] = running_hash
-        inner_carry[2] = pubkey_idx
+        inner_carry[0] = counter0
+        inner_carry[1] = running_hash0
+        inner_carry[2] = 0
         for c in range(0, n_chunks):
             base = c * 3
-            cur_counter: Mut = inner_carry[base]
-            cur_running_hash: Mut = inner_carry[base + 1]
-            cur_pubkey_idx: Mut = inner_carry[base + 2]
+            cur_counter0 = inner_carry[base]
+            cur_running_hash0 = inner_carry[base + 1]
+            cur_pubkey_idx0 = inner_carry[base + 2]
+            cc_buf = Array(PARTIAL_UNROLL_BATCH + 1)
+            crh_buf = Array(PARTIAL_UNROLL_BATCH + 1)
+            cc_buf[0] = cur_counter0
+            crh_buf[0] = cur_running_hash0
             for u in unroll(0, PARTIAL_UNROLL_BATCH):
-                cur_counter, cur_running_hash = absorb_recursive_pubkey(
-                    cur_pubkey_idx + u, sub_indices_arr, n_total, all_pubkeys, buffer, cur_counter, cur_running_hash
+                cc_buf[u + 1], crh_buf[u + 1] = absorb_recursive_pubkey(
+                    cur_pubkey_idx0 + u, sub_indices_arr, n_total, all_pubkeys, buffer, cc_buf[u], crh_buf[u]
                 )
-            cur_pubkey_idx += PARTIAL_UNROLL_BATCH
-            inner_carry[base + 3] = cur_counter
-            inner_carry[base + 4] = cur_running_hash
-            inner_carry[base + 5] = cur_pubkey_idx
-        counter = inner_carry[n_chunks * 3]
-        running_hash = inner_carry[n_chunks * 3 + 1]
-        pubkey_idx = inner_carry[n_chunks * 3 + 2]
+            inner_carry[base + 3] = cc_buf[PARTIAL_UNROLL_BATCH]
+            inner_carry[base + 4] = crh_buf[PARTIAL_UNROLL_BATCH]
+            inner_carry[base + 5] = cur_pubkey_idx0 + PARTIAL_UNROLL_BATCH
+        counter1 = inner_carry[n_chunks * 3]
+        running_hash1 = inner_carry[n_chunks * 3 + 1]
+        pubkey_idx1 = inner_carry[n_chunks * 3 + 2]
         # Tail iterations
-        tail_counter, tail_running_hash = match_range(
+        counter2, running_hash2 = match_range(
             remainder,
             range(0, PARTIAL_UNROLL_BATCH),
             lambda r: absorb_n_pubkeys_const(
-                r, pubkey_idx, sub_indices_arr, n_total, all_pubkeys, buffer, counter, running_hash
+                r, pubkey_idx1, sub_indices_arr, n_total, all_pubkeys, buffer, counter1, running_hash1
             ),
         )
-        counter = tail_counter
-        running_hash = tail_running_hash
         # Final pubkey (index n_sub - 1)
-        counter, running_hash = absorb_recursive_pubkey_final(
-            n_sub - 1, sub_indices_arr, n_total, all_pubkeys, buffer, counter, running_hash
+        counter3, running_hash3 = absorb_recursive_pubkey_final(
+            n_sub - 1, sub_indices_arr, n_total, all_pubkeys, buffer, counter2, running_hash2
         )
 
         single_message_data_buf = Array(SINGLE_MESSAGE_INPUT_DATA_SIZE_PADDED)
@@ -233,7 +233,7 @@ def main():
         for k in unroll(2, DIGEST_LEN):
             single_message_data_buf[k] = 0
 
-        copy_8(running_hash, single_message_data_buf + SINGLE_MESSAGE_PUBKEYS_HASH_OFFSET)
+        copy_8(running_hash3, single_message_data_buf + SINGLE_MESSAGE_PUBKEYS_HASH_OFFSET)
         copy_8(message, single_message_data_buf + SINGLE_MESSAGE_PUBKEYS_HASH_OFFSET + DIGEST_LEN)
         copy_8(merkle_chunks_for_slot, single_message_data_buf + SINGLE_MESSAGE_PUBKEYS_HASH_OFFSET + DIGEST_LEN + MESSAGE_LEN)
         copy_8(tweaks_hash_expected, single_message_data_buf + SINGLE_MESSAGE_TWEAKS_HASH_OFFSET)
@@ -244,7 +244,7 @@ def main():
 
         bytecode_claims[2 * rec_idx] = single_message_data_buf + BYTECODE_CLAIM_OFFSET
         bytecode_claims[2 * rec_idx + 1] = recursion(inner_pub_mem, initial_fiat_shamir_cap)
-        counter_outer_buf[rec_idx + 1] = counter
+        counter_outer_buf[rec_idx + 1] = counter3
 
     counter = counter_outer_buf[n_recursions]
     assert counter == n_total
@@ -279,21 +279,21 @@ def reduce_bytecode_claims(bytecode_claims, n_bytecode_claims, bytecode_claim_ou
     rc_buf[0] = slice_hash_continue(reduction_capacity, count_block, 1)
 
     for i in range(0, n_bytecode_claims - 1):
-        running_capacity: Mut = rc_buf[i]
+        running_capacity0 = rc_buf[i]
         claim_ptr = bytecode_claims[i]
         for k in unroll(BYTECODE_CLAIM_SIZE, BYTECODE_CLAIM_SIZE_PADDED):
             assert claim_ptr[k] == 0
-        running_capacity = slice_hash_continue(running_capacity, claim_ptr, BYTECODE_CLAIM_NUM_CHUNKS)
-        rc_buf[i + 1] = running_capacity
+        running_capacity1 = slice_hash_continue(running_capacity0, claim_ptr, BYTECODE_CLAIM_NUM_CHUNKS)
+        rc_buf[i + 1] = running_capacity1
 
-    running_capacity: Mut = rc_buf[n_bytecode_claims - 1]
+    running_capacity_last0 = rc_buf[n_bytecode_claims - 1]
     last_claim = bytecode_claims[n_bytecode_claims - 1]
     for k in unroll(BYTECODE_CLAIM_SIZE, BYTECODE_CLAIM_SIZE_PADDED):
         assert last_claim[k] == 0
-    running_capacity = slice_hash_continue(running_capacity, last_claim, BYTECODE_CLAIM_NUM_CHUNKS - 1)
-    reduction_fs: Mut = fs_new(bytecode_sumcheck_proof, running_capacity)
-    reduction_fs = fs_observe_chunks(reduction_fs, last_claim + (BYTECODE_CLAIM_NUM_CHUNKS - 1) * DIGEST_LEN, 1)
-    reduction_fs, alpha = fs_sample_ef(reduction_fs)
+    running_capacity_last1 = slice_hash_continue(running_capacity_last0, last_claim, BYTECODE_CLAIM_NUM_CHUNKS - 1)
+    reduction_fs0 = fs_new(bytecode_sumcheck_proof, running_capacity_last1)
+    reduction_fs1 = fs_observe_chunks(reduction_fs0, last_claim + (BYTECODE_CLAIM_NUM_CHUNKS - 1) * DIGEST_LEN, 1)
+    reduction_fs2, alpha = fs_sample_ef(reduction_fs1)
     alpha_powers = powers(alpha, n_bytecode_claims)
 
     all_values = Array(n_bytecode_claims * DIM)
@@ -304,7 +304,7 @@ def reduce_bytecode_claims(bytecode_claims, n_bytecode_claims, bytecode_claim_ou
     claimed_sum = Array(DIM)
     dot_product_ee_dynamic(all_values, alpha_powers, claimed_sum, n_bytecode_claims)
 
-    reduction_fs, challenges, final_eval = sumcheck_verify(reduction_fs, BYTECODE_POINT_N_VARS, claimed_sum, 2)
+    reduction_fs3, challenges, final_eval = sumcheck_verify(reduction_fs2, BYTECODE_POINT_N_VARS, claimed_sum, 2)
 
     eq_evals = Array(n_bytecode_claims * DIM)
     for i in range(0, n_bytecode_claims):
@@ -356,10 +356,12 @@ def absorb_recursive_pubkey_final(j, sub_indices_arr, n_total, all_pubkeys, buff
 def absorb_n_pubkeys_const(
     n: Const, j_start, sub_indices_arr, n_total, all_pubkeys, buffer, counter_in, running_hash_in
 ):
-    counter: Mut = counter_in
-    running_hash: Mut = running_hash_in
+    counter_buf = Array(n + 1)
+    running_hash_buf = Array(n + 1)
+    counter_buf[0] = counter_in
+    running_hash_buf[0] = running_hash_in
     for u in unroll(0, n):
-        counter, running_hash = absorb_recursive_pubkey(
-            j_start + u, sub_indices_arr, n_total, all_pubkeys, buffer, counter, running_hash
+        counter_buf[u + 1], running_hash_buf[u + 1] = absorb_recursive_pubkey(
+            j_start + u, sub_indices_arr, n_total, all_pubkeys, buffer, counter_buf[u], running_hash_buf[u]
         )
-    return counter, running_hash
+    return counter_buf[n], running_hash_buf[n]

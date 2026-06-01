@@ -466,20 +466,14 @@ impl Expression {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum AssignmentTarget {
-    Var { var: Var, is_mutable: bool },
-    ArrayAccess { array: SimpleExpr, index: Box<Expression> }, // always immutable
+    Var { var: Var },
+    ArrayAccess { array: SimpleExpr, index: Box<Expression> },
 }
 
 impl Display for AssignmentTarget {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Var { var, is_mutable } => {
-                if *is_mutable {
-                    write!(f, "{var}: Mut")
-                } else {
-                    write!(f, "{var}")
-                }
-            }
+            Self::Var { var } => write!(f, "{var}"),
             Self::ArrayAccess { array, index } => write!(f, "{array}[{index}]"),
         }
     }
@@ -520,7 +514,6 @@ pub enum Line {
     },
     ForwardDeclaration {
         var: Var,
-        is_mutable: bool,
     },
     Statement {
         targets: Vec<AssignmentTarget>, // LHS - can be empty for standalone calls
@@ -657,13 +650,7 @@ impl Line {
                     .join("\n");
                 format!("match {value}: {{\n{arms_str}\n{spaces}}}")
             }
-            Self::ForwardDeclaration { var, is_mutable } => {
-                if *is_mutable {
-                    format!("{var}: Mut")
-                } else {
-                    format!("{var}: Imm")
-                }
-            }
+            Self::ForwardDeclaration { var } => format!("{var}: Imm"),
             Self::Statement { targets, value, .. } => {
                 if targets.is_empty() {
                     format!("{value}")

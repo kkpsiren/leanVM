@@ -22,7 +22,7 @@ decorator = { "@" ~ identifier ~ newline }
 function = { decorator? ~ "def" ~ identifier ~ "(" ~ parameter_list? ~ ")" ~ ":" ~ newline ~ statement* ~ end_block }
 parameter_list = { parameter ~ ("," ~ parameter)* ~ ","? }
 parameter = { identifier ~ param_annotation? }
-param_annotation = { ":" ~ ("Const" | "Mut") }
+param_annotation = { ":" ~ "Const" }
 end_block = { "<END>" ~ newline }
 
 // Statements - explicitly exclude end_block from being matched as a statement
@@ -47,20 +47,17 @@ simple_statement = {
 return_statement = { "return" ~ (("(" ~ tuple_expression ~ ")") | tuple_expression)? }
 
 
-mut_keyword = @{ "mut" ~ !(ASCII_ALPHANUMERIC | "_") }
-mut_annotation = { ":" ~ "Mut" }
 im_annotation = { ":" ~ "Imm" }
 
-// Forward declaration: x: Imm or x: Mut (not followed by =)
-forward_declaration = { identifier ~ (im_annotation | mut_annotation) ~ !("=") }
+// Forward declaration: x: Imm (not followed by =). Variables are single-assignment; there is no `Mut`.
+forward_declaration = { identifier ~ im_annotation ~ !("=") }
 
 // General assignment: LHS is optional, RHS is any expression
-// Compound operators (+=, -=, *=, /=) only allow single target without mut (enforced in parser)
 assignment = { (assignment_target_list ~ assign_op)? ~ expression }
 assign_op = { "+=" | "-=" | "*=" | "/=" | "=" }
 assignment_target_list = { ("(" ~ simple_target_list ~ ")") | simple_target_list }
 simple_target_list = { assignment_target ~ ("," ~ assignment_target)* ~ ","? }
-assignment_target = { (identifier ~ mut_annotation) | array_access_expr | identifier }
+assignment_target = { array_access_expr | identifier }
 
 if_statement = { "if" ~ condition ~ ":" ~ newline ~ statement* ~ end_block ~ elif_clause* ~ else_clause? }
 

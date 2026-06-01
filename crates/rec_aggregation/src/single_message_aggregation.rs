@@ -489,5 +489,7 @@ mod tests {
 
         let outer = aggregate_single_msg_signatures(&[inner], raws_outer, message, slot, log_inv_rate).unwrap();
         verify_single_message_aggregate(&outer).unwrap();
+        let outer_metadata = outer.proof.metadata.as_ref().expect("outer metadata available");
+        dbg!(outer_metadata.cycles);
     }
 }
