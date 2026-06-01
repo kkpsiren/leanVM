@@ -49,7 +49,7 @@ src/
   subprocess.rs   out-of-process compile with timeout + memory rlimit (catches abort/OOM/hang)
   model/          the program model = reference interpreter
     comp.rs         straight-line field computation (emit + eval)
-    gadget.rs       ~28 gadget kinds; each emits zkDSL + builds honest/violating buffers
+    gadget.rs       ~32 gadget kinds; each emits zkDSL + builds honest/violating buffers
     program.rs      compose gadgets into main() + helpers; build ExecutionWitness
     emit.rs         indentation-aware zkDSL source builder
   generators.rs   random, seed-deterministic CheckedProgram + const-expression generation
@@ -159,3 +159,16 @@ recursion/size stressors go in `probes::dynamic_stressors`. A gadget that reprod
 
 See `FINDINGS.md` for the bugs this harness has surfaced (all fixed in `main`) and the by-design
 behaviours it considered and rejected. There are currently no open findings.
+
+### Coverage roadmap
+
+The current oracles detect a *dropped* check (runtime), a *missing* lowering (structural deref/panic
+count), and *crashes* (subprocess). The biggest detection gap is a check that is **emitted on the
+wrong operand or with inverted polarity** while the honest witness still satisfies the miscompiled
+form. The input-side violations (perturbing a shared *operand* of `CseEq`/`TwoReadsEq`/`RunningChain`,
+not just the dedicated expected cell) cover much of this; the gold-standard complement — an
+**operand-decoding oracle** that walks the emitted `Instruction`s and checks each assert lowers to
+the right `(operand_a, operand_b, polarity)` — is not yet built (it needs the compiler's fp-offset
+symbol map, which the fuzzer does not currently expose). Lower-priority follow-ups, best as static
+fixtures rather than the random generator: precompile input/output **pointer aliasing** (Poseidon
+output overlapping its input) and `b_compile` **return-coalescing-after-mutation**.

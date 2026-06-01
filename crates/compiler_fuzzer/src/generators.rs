@@ -58,7 +58,16 @@ pub fn gen_program(rng: &mut Rng, cfg: &GenConfig) -> CheckedProgram {
 /// harder lowering paths).
 #[must_use]
 pub fn gen_gadget(rng: &mut Rng, cfg: &GenConfig, id: usize) -> Gadget {
-    let range_bound = |rng: &mut Rng| 2 + rng.next_u64() % (crate::model::RANGE_MAX - 1);
+    let range_bound = |rng: &mut Rng| {
+        // The deref-based range check is sound for bound <= 2^16. Occasionally probe exactly that
+        // boundary (2^16 and 2^16-1) — where an off-by-one in the `bound-1-value` deref would bite —
+        // since the generic path below never reaches it (RANGE_MAX = 2^16 - 2).
+        if rng.chance(1, 12) {
+            *rng.choice(&[(1u64 << 16) - 1, 1u64 << 16])
+        } else {
+            2 + rng.next_u64() % (crate::model::RANGE_MAX - 1)
+        }
+    };
     // A loop length kept small so range→recursion stays cheap.
     let loop_len = |rng: &mut Rng| Computation::identity(rng.range(1, 4));
     let ext_op = |rng: &mut Rng| {
@@ -67,11 +76,14 @@ pub fn gen_gadget(rng: &mut Rng, cfg: &GenConfig, id: usize) -> Gadget {
         GadgetKind::ExtOp {
             op,
             mode,
-            n: rng.range(1, 3),
+            // Cover odd lengths (3, 5, 7) and larger n, where the extension-op AIR's *backward*
+            // accumulation and BE/EE stride are most likely to surface an off-by-one — not just the
+            // n ∈ {1, 2} the suite previously generated.
+            n: rng.range(1, 8),
         }
     };
 
-    let (kind, comp) = match rng.below(28) {
+    let (kind, comp) = match rng.below(32) {
         0 => (GadgetKind::EqBound, gen_computation(rng, cfg)),
         1 => (
             GadgetKind::EqConst {
@@ -89,7 +101,9 @@ pub fn gen_gadget(rng: &mut Rng, cfg: &GenConfig, id: usize) -> Gadget {
         ),
         5 => (
             GadgetKind::RangeLe {
-                bound: range_bound(rng),
+                // `x <= B` lowers to `x < B + 1`, so the max *sound* bound for `<=` is 2^16 - 1
+                // (not 2^16, which the `<` checks may use). Clamp so the boundary case stays valid.
+                bound: range_bound(rng).min((1 << 16) - 1),
             },
             Computation::identity(1),
         ),
@@ -140,6 +154,22 @@ pub fn gen_gadget(rng: &mut Rng, cfg: &GenConfig, id: usize) -> Gadget {
             Computation::identity(1),
         ),
         26 => (GadgetKind::ForwardDeclEq, Computation::identity(1)),
+        27 => (
+            GadgetKind::NestedMutLoop {
+                outer: rng.range(1, 4),
+                inner: rng.range(1, 3),
+            },
+            Computation::identity(1),
+        ),
+        28 => (
+            GadgetKind::UnrolledRangeLt {
+                n: rng.range(2, 6),
+                bound: range_bound(rng),
+            },
+            Computation::identity(1),
+        ),
+        29 => (GadgetKind::PointerOffsetSub, Computation::identity(1)),
+        30 => (GadgetKind::MatchChained, Computation::identity(1)),
         _ => {
             let (src, value) = gen_const_fold(rng);
             (GadgetKind::ConstFold { src, value }, Computation::identity(1))

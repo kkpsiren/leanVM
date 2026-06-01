@@ -54,12 +54,21 @@ pub enum GadgetKind {
     RangeLt { bound: u64 },
     /// `assert value <= bound`.
     RangeLe { bound: u64 },
+    /// `n` distinct `assert buf[i] < bound` checks inside an `unroll` loop. Each iteration must
+    /// leave behind its own range-check lowering (2 `DerefHint`s); the structural oracle requires
+    /// the full `2*n`, so an over-aggressive CSE/fusion that collapses iterations is caught even
+    /// though a runtime witness (rejected by the surviving companion) would mask it. `n` violations.
+    UnrolledRangeLt { n: usize, bound: u64 },
     /// The equality check lives inside a taken `if` branch (control-flow coverage).
     IfThen,
     /// `value` is accumulated by a `range` loop (loop→recursion + mutable-buffer coverage).
     Loop,
     /// `value` comes from a `match_range` dispatch to a const helper (match-expansion coverage).
     MatchDispatch { m: u64 },
+    /// `value` comes from a *chained* `match_range` with two contiguous ranges and distinct arm
+    /// bodies (`0..2 ↦ i*10`, `2..5 ↦ i*100`). Exercises the multi-(range, lambda) expansion path
+    /// that the single-range `MatchDispatch` never reaches; the selector picks which arm runs.
+    MatchChained,
     /// `value` is routed through an `@inline` function before the check (inlining coverage).
     InlineWrapped,
     /// `hint_div_floor` + correctness asserts; the target compares the quotient to an
@@ -87,6 +96,11 @@ pub enum GadgetKind {
     /// (value, expected) pairs. Stresses assert survival through if-in-loop nesting and
     /// loop→recursion. `n` independent violations.
     NestedIfLoop { n: usize },
+    /// Two independent mutables carried across an `outer`×`inner` nested `range` loop, each
+    /// accumulating a per-iteration buffer value, with a post-loop checkpoint per mutable. Stresses
+    /// the simplifier's loop-carried-mutable buffer rewriting under *nesting* (the single-level
+    /// `Loop` gadget never reaches this). Two independent violations (one per mutable).
+    NestedMutLoop { outer: usize, inner: usize },
     /// `n` prover-supplied bits, each constrained boolean (`b*(b-1)==0`) and reconstructed
     /// (`acc = acc*2 + b`), with a final `assert acc == expected`. This is the canonical
     /// hint-then-constrain decomposition pattern (XMSS / range proofs); every boolean **and** the
@@ -111,6 +125,10 @@ pub enum GadgetKind {
     /// `fold_const_offset_into_deref` simplifier pass; the read value must still equal the cell it
     /// addresses.
     PointerOffset,
+    /// `arr[base - K]` with a *non-zero* runtime `base` and compile-time `K` — the subtraction
+    /// offset takes a different `fold_const_offset_into_deref` path than `PointerOffset`'s addition;
+    /// the read must still address `base - K`.
+    PointerOffsetSub,
     /// A `parallel_range` loop whose body asserts `value == expected` over `n` independent pairs
     /// (parallel-loop lowering; exercises the `ParallelSegmentFailed` path). `n` violations.
     ParallelLoop { n: usize },
@@ -157,18 +175,20 @@ impl Gadget {
             GadgetKind::Loop => self.comp.n_inputs + 1,
             GadgetKind::Bool => 1,
             GadgetKind::RangeLt { .. } | GadgetKind::RangeLe { .. } => 1,
-            GadgetKind::MatchDispatch { .. } | GadgetKind::HintDiv { .. } => 2,
+            GadgetKind::UnrolledRangeLt { n, .. } => n,
+            GadgetKind::MatchDispatch { .. } | GadgetKind::HintDiv { .. } | GadgetKind::MatchChained => 2,
             GadgetKind::CopyPropEq | GadgetKind::TwoReadsEq => 2,
             GadgetKind::CseEq => 4,
             GadgetKind::RunningChain { len } => 2 * len,
             GadgetKind::ExtOp { mode, n, .. } => ext_a_len(mode, n) + n * DIMENSION + DIMENSION,
             GadgetKind::NestedIfLoop { n } => 2 * n + 1,
+            GadgetKind::NestedMutLoop { .. } => 6, // a0, b0, da, db, exp_a, exp_b
             GadgetKind::BitDecomp { n } => n + 1,
             GadgetKind::Panic | GadgetKind::DebugAssertLt { .. } | GadgetKind::ConstFold { .. } => 1,
             GadgetKind::IfElse => self.comp.n_inputs + 2,
             GadgetKind::CompoundAssign => 4,
             GadgetKind::Div | GadgetKind::MultiReturn => 3,
-            GadgetKind::PointerOffset => 10,
+            GadgetKind::PointerOffset | GadgetKind::PointerOffsetSub => 10,
             GadgetKind::ParallelLoop { n } => 2 * n,
             GadgetKind::ForwardDeclEq => 4,
         }
@@ -179,10 +199,18 @@ impl Gadget {
     #[must_use]
     pub fn n_violations(&self) -> usize {
         match self.kind {
-            GadgetKind::CseEq | GadgetKind::MultiReturn => 2,
-            GadgetKind::RunningChain { len } => len,
+            // CseEq: 2 expected-cell breaks + 2 input-side breaks (perturb a shared operand, not
+            // the dedicated `exp` cell — catches a check silently bound to the wrong operand).
+            GadgetKind::CseEq => 4,
+            GadgetKind::MultiReturn => 2,
+            // TwoReadsEq: break each side of `v == w` independently (wrong-operand detection).
+            GadgetKind::TwoReadsEq => 2,
+            // RunningChain: one break per checkpoint + one input-side break of the base value.
+            GadgetKind::RunningChain { len } => len + 1,
             GadgetKind::ExtOp { .. } => DIMENSION,
             GadgetKind::NestedIfLoop { n } | GadgetKind::ParallelLoop { n } => n,
+            GadgetKind::NestedMutLoop { .. } => 2, // one per carried mutable
+            GadgetKind::UnrolledRangeLt { n, .. } => n,
             GadgetKind::BitDecomp { n } => n + 1,
             _ => 1,
         }
@@ -192,7 +220,7 @@ impl Gadget {
     pub fn check_kind(&self) -> CheckKind {
         match self.kind {
             GadgetKind::Ne => CheckKind::Ne,
-            GadgetKind::RangeLt { .. } => CheckKind::Lt,
+            GadgetKind::RangeLt { .. } | GadgetKind::UnrolledRangeLt { .. } => CheckKind::Lt,
             GadgetKind::RangeLe { .. } => CheckKind::Le,
             GadgetKind::Panic => CheckKind::Panic,
             GadgetKind::DebugAssertLt { .. } => CheckKind::Debug,
@@ -221,9 +249,11 @@ impl Gadget {
             GadgetKind::Bool => "Bool (b*(b-1) == 0)".to_string(),
             GadgetKind::RangeLt { bound } => format!("RangeLt (value < {bound})"),
             GadgetKind::RangeLe { bound } => format!("RangeLe (value <= {bound})"),
+            GadgetKind::UnrolledRangeLt { n, bound } => format!("UnrolledRangeLt ({n}x value < {bound})"),
             GadgetKind::IfThen => "IfThen (assert in if-branch)".to_string(),
             GadgetKind::Loop => "Loop (range-loop sum == buf[])".to_string(),
             GadgetKind::MatchDispatch { m } => format!("MatchDispatch (match_range 0..{m})"),
+            GadgetKind::MatchChained => "MatchChained (two contiguous match_range arms)".to_string(),
             GadgetKind::InlineWrapped => "InlineWrapped (value via @inline)".to_string(),
             GadgetKind::HintDiv { d } => format!("HintDiv (q of a/{d} == buf[])"),
             GadgetKind::CopyPropEq => "CopyPropEq (v = x + 0; v == buf[])".to_string(),
@@ -232,6 +262,9 @@ impl Gadget {
             GadgetKind::RunningChain { len } => format!("RunningChain (len {len}, per-step checkpoints)"),
             GadgetKind::ExtOp { op, mode, n } => format!("ExtOp ({}, n {n}, result == buf[])", op.fn_name(*mode)),
             GadgetKind::NestedIfLoop { n } => format!("NestedIfLoop (n {n}, assert in if-in-loop)"),
+            GadgetKind::NestedMutLoop { outer, inner } => {
+                format!("NestedMutLoop ({outer}x{inner} nested loop, 2 carried mutables)")
+            }
             GadgetKind::BitDecomp { n } => format!("BitDecomp (n {n}, bits + reconstruction)"),
             GadgetKind::Panic => "Panic (assert False in taken if)".to_string(),
             GadgetKind::DebugAssertLt { bound } => format!("DebugAssertLt (debug_assert value < {bound})"),
@@ -240,6 +273,7 @@ impl Gadget {
             GadgetKind::Div => "Div (a / b == buf[])".to_string(),
             GadgetKind::MultiReturn => "MultiReturn (p, q = fz_pair(in))".to_string(),
             GadgetKind::PointerOffset => "PointerOffset (arr[base + K] == buf[])".to_string(),
+            GadgetKind::PointerOffsetSub => "PointerOffsetSub (arr[base - K], base != 0)".to_string(),
             GadgetKind::ParallelLoop { n } => format!("ParallelLoop (n {n}, assert in parallel_range)"),
             GadgetKind::ConstFold { src, value } => format!("ConstFold (v == {src} = {value})"),
             GadgetKind::ForwardDeclEq => "ForwardDeclEq (x: Imm assigned in both branches)".to_string(),
@@ -298,6 +332,14 @@ impl Gadget {
                 e.line(&format!("{p}in0 = {p}buf[0]"));
                 e.line(&format!("assert {p}in0 <= {bound}"));
             }
+            GadgetKind::UnrolledRangeLt { n, bound } => {
+                // n distinct range checks, one per unrolled iteration; each must lower to its own
+                // pair of DerefHints (the structural oracle counts the total).
+                e.line(&format!("for {p}i in unroll(0, {n}):"));
+                e.indented(|e| {
+                    e.line(&format!("assert {p}buf[{p}i] < {bound}"));
+                });
+            }
             GadgetKind::IfThen => {
                 e.line(&format!("{p}sel = {p}buf[{}]", n + 1));
                 e.line(&format!("if {p}sel == 1:"));
@@ -321,6 +363,15 @@ impl Gadget {
                 e.line(&format!("{p}sel = {p}buf[0]"));
                 e.line(&format!(
                     "{p}res = match_range({p}sel, range(0, {m}), lambda {p}i: fz_square({p}i))"
+                ));
+                e.line(&format!("{p}exp = {p}buf[1]"));
+                e.line(&format!("assert {p}res == {p}exp"));
+            }
+            GadgetKind::MatchChained => {
+                // Two contiguous ranges, distinct arm bodies: 0..2 ↦ i*10, 2..5 ↦ i*100.
+                e.line(&format!("{p}sel = {p}buf[0]"));
+                e.line(&format!(
+                    "{p}res = match_range({p}sel, range(0, 2), lambda {p}i: {p}i * 10, range(2, 5), lambda {p}i: {p}i * 100)"
                 ));
                 e.line(&format!("{p}exp = {p}buf[1]"));
                 e.line(&format!("assert {p}res == {p}exp"));
@@ -406,6 +457,25 @@ impl Gadget {
                     });
                 });
             }
+            GadgetKind::NestedMutLoop { outer, inner } => {
+                // buf = [a0, b0, da, db, exp_a, exp_b]. Two mutables carried across a nested
+                // range loop, each accumulating its per-iteration delta. After outer*inner
+                // iterations: a = a0 + (outer*inner)*da, b = b0 + (outer*inner)*db.
+                e.line(&format!("{p}a: Mut = {p}buf[0]"));
+                e.line(&format!("{p}b: Mut = {p}buf[1]"));
+                e.line(&format!("for {p}i in range(0, {outer}):"));
+                e.indented(|e| {
+                    e.line(&format!("for {p}j in range(0, {inner}):"));
+                    e.indented(|e| {
+                        e.line(&format!("{p}a = {p}a + {p}buf[2]"));
+                        e.line(&format!("{p}b = {p}b + {p}buf[3]"));
+                    });
+                });
+                e.line(&format!("{p}exp_a = {p}buf[4]"));
+                e.line(&format!("{p}exp_b = {p}buf[5]"));
+                e.line(&format!("assert {p}a == {p}exp_a"));
+                e.line(&format!("assert {p}b == {p}exp_b"));
+            }
             GadgetKind::BitDecomp { n } => {
                 // buf = [bit_0 .. bit_{n-1} | expected]; acc = sum bit_i * 2^(n-1-i).
                 e.line(&format!("{p}acc: Mut = 0"));
@@ -478,6 +548,18 @@ impl Gadget {
                 e.line(&format!("{p}exp = {p}buf[9]"));
                 e.line(&format!("assert {p}v == {p}exp"));
             }
+            GadgetKind::PointerOffsetSub => {
+                // buf = [base(=5) | fillers(8) | expected]; reads arr[base - 2] = arr[3] = buf[4].
+                e.line(&format!("{p}arr = Array(8)"));
+                e.line(&format!("for {p}i in unroll(0, 8):"));
+                e.indented(|e| {
+                    e.line(&format!("{p}arr[{p}i] = {p}buf[{p}i + 1]"));
+                });
+                e.line(&format!("{p}base = {p}buf[0]"));
+                e.line(&format!("{p}v = {p}arr[{p}base - 2]"));
+                e.line(&format!("{p}exp = {p}buf[9]"));
+                e.line(&format!("assert {p}v == {p}exp"));
+            }
             GadgetKind::ParallelLoop { n } => {
                 // buf = [v(n) | expected(n)]; each iteration independent (no Mut, disjoint cells).
                 e.line(&format!("for {p}i in parallel_range(0, {n}):"));
@@ -540,6 +622,7 @@ impl Gadget {
             GadgetKind::Bool => vec![u64::from(rng.flip())],
             GadgetKind::RangeLt { bound } => vec![rng.below(*bound as usize) as u64],
             GadgetKind::RangeLe { bound } => vec![rng.below(*bound as usize + 1) as u64],
+            GadgetKind::UnrolledRangeLt { n, bound } => (0..*n).map(|_| rng.below(*bound as usize) as u64).collect(),
             GadgetKind::IfThen => {
                 let inputs: Vec<u64> = (0..n).map(|_| rand_canonical(rng)).collect();
                 let value = self.comp.eval(&inputs);
@@ -559,6 +642,11 @@ impl Gadget {
                 let sel = rng.below(*m as usize) as u64;
                 vec![sel, mul_mod(sel, sel)]
             }
+            GadgetKind::MatchChained => {
+                let sel = rng.below(5) as u64; // selector in [0, 5)
+                let res = if sel < 2 { sel * 10 } else { sel * 100 };
+                vec![sel, res]
+            }
             GadgetKind::HintDiv { d } => {
                 let a = rng.below(*d as usize * 1000) as u64;
                 vec![a, a / d]
@@ -568,7 +656,9 @@ impl Gadget {
                 vec![x, x] // v = x + 0 == exp(=x)
             }
             GadgetKind::CseEq => {
-                let (a, b) = (rand_canonical(rng), rand_canonical(rng));
+                // Non-zero operands so perturbing either input reliably changes the product
+                // (enables the input-side violations; a zero factor would mask them).
+                let (a, b) = (rand_canonical_nonzero(rng), rand_canonical_nonzero(rng));
                 let prod = mul_mod(a, b);
                 vec![a, b, prod, prod] // both asserts: in0*in1 == prod
             }
@@ -606,6 +696,22 @@ impl Gadget {
                 buf.extend(v); // expected == value
                 buf.push(1); // sel: take the branch
                 buf
+            }
+            GadgetKind::NestedMutLoop { outer, inner } => {
+                let (a0, b0, da, db) = (
+                    rand_canonical(rng),
+                    rand_canonical(rng),
+                    rand_canonical(rng),
+                    rand_canonical(rng),
+                );
+                let iters = (outer * inner) as u64;
+                let mut a = a0;
+                let mut b = b0;
+                for _ in 0..iters {
+                    a = add_mod(a, da);
+                    b = add_mod(b, db);
+                }
+                vec![a0, b0, da, db, a, b]
             }
             GadgetKind::BitDecomp { n } => {
                 let bits: Vec<u64> = (0..*n).map(|_| u64::from(rng.flip())).collect();
@@ -646,6 +752,14 @@ impl Gadget {
                 buf.push(exp);
                 buf
             }
+            GadgetKind::PointerOffsetSub => {
+                let fillers: Vec<u64> = (0..8).map(|_| rand_canonical(rng)).collect();
+                let exp = fillers[3]; // arr[base(=5) - 2] == arr[3] == fillers[3]
+                let mut buf = vec![5]; // non-zero runtime base
+                buf.extend(fillers);
+                buf.push(exp);
+                buf
+            }
             GadgetKind::ParallelLoop { n } => {
                 let v: Vec<u64> = (0..*n).map(|_| rand_canonical(rng)).collect();
                 let mut buf = v.clone();
@@ -677,8 +791,12 @@ impl Gadget {
             | GadgetKind::Loop => {
                 buf[n] = add_mod(buf[n], 1);
             }
-            GadgetKind::MatchDispatch { .. } | GadgetKind::HintDiv { .. } | GadgetKind::TwoReadsEq => {
+            GadgetKind::MatchDispatch { .. } | GadgetKind::HintDiv { .. } | GadgetKind::MatchChained => {
                 buf[1] = add_mod(buf[1], 1);
+            }
+            GadgetKind::TwoReadsEq => {
+                // k=0 breaks the `w` side, k=1 the `v` side: `assert v == w` must reject either.
+                buf[1 - k] = add_mod(buf[1 - k], 1);
             }
             GadgetKind::CopyPropEq => {
                 buf[1] = add_mod(buf[1], 1); // exp no longer equals v
@@ -686,13 +804,23 @@ impl Gadget {
             GadgetKind::Div => buf[2] = add_mod(buf[2], 1), // exp no longer equals a / b
             GadgetKind::CompoundAssign => buf[3] = add_mod(buf[3], 1),
             GadgetKind::ConstFold { .. } => buf[0] = add_mod(buf[0], 1),
-            GadgetKind::PointerOffset => buf[9] = add_mod(buf[9], 1),
+            GadgetKind::PointerOffset | GadgetKind::PointerOffsetSub => buf[9] = add_mod(buf[9], 1),
             GadgetKind::MultiReturn => buf[1 + k] = add_mod(buf[1 + k], 1), // k=0 → e1, k=1 → e2
             GadgetKind::CseEq => {
-                buf[2 + k] = add_mod(buf[2 + k], 1); // k=0 → exp1, k=1 → exp2
+                // k∈{0,1}: perturb the dedicated expected cell (exp1/exp2). k∈{2,3}: perturb a
+                // shared *input* (in0/in1) — both products change, so the correct compiler rejects;
+                // an accept means a check was bound to the wrong operand or read a stale value.
+                match k {
+                    0 | 1 => buf[2 + k] = add_mod(buf[2 + k], 1),
+                    _ => buf[k - 2] = add_mod(buf[k - 2], 1),
+                }
             }
             GadgetKind::RunningChain { len } => {
-                buf[len + k] = add_mod(buf[len + k], 1); // break only checkpoint k
+                if k < *len {
+                    buf[len + k] = add_mod(buf[len + k], 1); // break only checkpoint k
+                } else {
+                    buf[0] = add_mod(buf[0], 1); // input-side: perturb the base ⇒ every checkpoint shifts
+                }
             }
             GadgetKind::ExtOp { mode, n, .. } => {
                 let off = ext_a_len(*mode, *n) + n * DIMENSION;
@@ -700,6 +828,9 @@ impl Gadget {
             }
             GadgetKind::NestedIfLoop { n } | GadgetKind::ParallelLoop { n } => {
                 buf[n + k] = add_mod(buf[n + k], 1); // perturb expected of pair k
+            }
+            GadgetKind::NestedMutLoop { .. } => {
+                buf[4 + k] = add_mod(buf[4 + k], 1); // k=0 → exp_a, k=1 → exp_b
             }
             GadgetKind::BitDecomp { n } => {
                 if k < *n {
@@ -721,6 +852,7 @@ impl Gadget {
             GadgetKind::ForwardDeclEq => buf[3] = add_mod(buf[3], 1), // exp no longer equals x
             GadgetKind::RangeLt { bound } => buf[0] = *bound,
             GadgetKind::RangeLe { bound } => buf[0] = *bound + 1,
+            GadgetKind::UnrolledRangeLt { bound, .. } => buf[k] = *bound, // iteration k out of range
         }
         buf
     }

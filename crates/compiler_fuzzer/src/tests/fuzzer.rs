@@ -292,9 +292,15 @@ fn all_gadget_kinds() -> Vec<GadgetKind> {
         GadgetKind::Bool,
         GadgetKind::RangeLt { bound: 1000 },
         GadgetKind::RangeLe { bound: 1000 },
+        // The 2^16 soundness boundary: `< 2^16` and `<= 2^16 - 1` are the largest sound bounds; the
+        // violating value (== bound) must still be rejected via the `bound-1-value` deref.
+        GadgetKind::RangeLt { bound: 1 << 16 },
+        GadgetKind::RangeLe { bound: (1 << 16) - 1 },
+        GadgetKind::UnrolledRangeLt { n: 4, bound: 1000 },
         GadgetKind::IfThen,
         GadgetKind::Loop,
         GadgetKind::MatchDispatch { m: 5 },
+        GadgetKind::MatchChained,
         GadgetKind::InlineWrapped,
         GadgetKind::HintDiv { d: 7 },
         GadgetKind::CopyPropEq,
@@ -302,6 +308,8 @@ fn all_gadget_kinds() -> Vec<GadgetKind> {
         GadgetKind::TwoReadsEq,
         GadgetKind::RunningChain { len: 4 },
         GadgetKind::NestedIfLoop { n: 3 },
+        GadgetKind::NestedMutLoop { outer: 3, inner: 2 },
+        GadgetKind::NestedMutLoop { outer: 1, inner: 1 },
         GadgetKind::BitDecomp { n: 6 },
         GadgetKind::Panic,
         GadgetKind::DebugAssertLt { bound: 1000 },
@@ -310,13 +318,15 @@ fn all_gadget_kinds() -> Vec<GadgetKind> {
         GadgetKind::Div,
         GadgetKind::MultiReturn,
         GadgetKind::PointerOffset,
+        GadgetKind::PointerOffsetSub,
         GadgetKind::ParallelLoop { n: 3 },
         GadgetKind::ForwardDeclEq,
     ];
-    // Every extension-op (operation × mode) at lengths 1 and 2 — validates the reference math.
+    // Every extension-op (operation × mode) at lengths 1, 2, and the odd length 3 — validates the
+    // reference math and the backward-accumulation/stride at an odd n.
     for op in [ExtOp::Add, ExtOp::Dot, ExtOp::PolyEq] {
         for mode in [ExtMode::Ee, ExtMode::Be] {
-            for n in [1, 2] {
+            for n in [1, 2, 3] {
                 kinds.push(GadgetKind::ExtOp { op, mode, n });
             }
         }

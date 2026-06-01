@@ -52,13 +52,19 @@ pub fn count_lowerings(bc: &Bytecode) -> Lowerings {
     c
 }
 
-/// Number of `<` / `<=` checks the program's source declares.
+/// Number of `<` / `<=` checks the program's source declares. `UnrolledRangeLt { n }` declares `n`
+/// of them (one per unrolled iteration), so an over-aggressive fusion that collapses iterations
+/// shows up as a deficit in the deref-hint count below.
 #[must_use]
 pub fn expected_range_checks(prog: &CheckedProgram) -> usize {
     prog.gadgets
         .iter()
-        .filter(|g| matches!(g.kind, GadgetKind::RangeLt { .. } | GadgetKind::RangeLe { .. }))
-        .count()
+        .map(|g| match g.kind {
+            GadgetKind::RangeLt { .. } | GadgetKind::RangeLe { .. } => 1,
+            GadgetKind::UnrolledRangeLt { n, .. } => n,
+            _ => 0,
+        })
+        .sum()
 }
 
 /// Evaluate the structural property. Each `<` / `<=` must leave behind exactly one inequality
