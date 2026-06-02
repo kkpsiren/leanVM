@@ -49,9 +49,29 @@ pub fn load_corpus(dir: &Path) -> Vec<(String, String)> {
     out
 }
 
+/// How many times [`mutate`] re-rolls to avoid emitting a recursive `@inline`.
+const MUTATE_RETRIES: usize = 16;
+
 /// Apply one random small mutation to `src`, returning the mutant.
+///
+/// The result never contains a recursive `@inline` function (an unsupported
+/// construct the compiler would try to inline forever — see the KNOWN LIMITATIONS
+/// note in the simplifier). A line-duplication / shuffle can splice a call to an
+/// inline function into that function's own body; if a mutation does, we re-roll.
+/// Corpus programs never contain such a cycle, so the unmutated source is a safe
+/// fallback if every re-roll happens to introduce one.
 #[must_use]
 pub fn mutate(src: &str, rng: &mut Rng) -> String {
+    for _ in 0..MUTATE_RETRIES {
+        let mutant = mutate_once(src, rng);
+        if !has_recursive_inline(&mutant) {
+            return mutant;
+        }
+    }
+    src.to_string()
+}
+
+fn mutate_once(src: &str, rng: &mut Rng) -> String {
     let mut lines: Vec<String> = src.lines().map(str::to_string).collect();
     if lines.is_empty() {
         return src.to_string();
@@ -106,6 +126,112 @@ fn perturb_first_int(line: &str, rng: &mut Rng) -> String {
         _ => format!("{}", rng.next_u32()),
     };
     format!("{}{}{}", &line[..start], replacement, &line[end..])
+}
+
+/// Whether `src` defines a recursive `@inline` function: a self-call, or a cycle of
+/// `@inline` functions calling one another. The compiler expands `@inline` calls
+/// eagerly, so such a cycle never terminates — generated programs must avoid it.
+#[must_use]
+pub fn has_recursive_inline(src: &str) -> bool {
+    // Parse top-level functions. A function is `def NAME(...)` at column 0, possibly
+    // preceded by an `@inline` decorator; its body is the following indented / blank
+    // lines, up to the next top-level construct.
+    struct Func {
+        name: String,
+        inline: bool,
+        body: String,
+    }
+    let mut funcs: Vec<Func> = Vec::new();
+    let mut pending_inline = false;
+    let mut cur: Option<usize> = None;
+    for line in src.lines() {
+        let at_col0 = !line.starts_with([' ', '\t']);
+        let trimmed = line.trim_start();
+        if at_col0 && trimmed == "@inline" {
+            pending_inline = true;
+            cur = None;
+        } else if at_col0 && trimmed.starts_with("def ") {
+            let name = trimmed[4..].split('(').next().unwrap_or("").trim().to_string();
+            funcs.push(Func {
+                name,
+                inline: pending_inline,
+                body: String::new(),
+            });
+            cur = Some(funcs.len() - 1);
+            pending_inline = false;
+        } else if at_col0 && !trimmed.is_empty() {
+            cur = None;
+            pending_inline = false;
+        } else if let Some(c) = cur {
+            funcs[c].body.push_str(line);
+            funcs[c].body.push('\n');
+        }
+    }
+
+    let inline_names: Vec<&str> = funcs.iter().filter(|f| f.inline).map(|f| f.name.as_str()).collect();
+    if inline_names.is_empty() {
+        return false;
+    }
+    // Inline-call graph: F -> M when inline F's body calls inline M.
+    let edges: std::collections::BTreeMap<&str, Vec<&str>> = funcs
+        .iter()
+        .filter(|f| f.inline)
+        .map(|f| {
+            let callees = inline_names
+                .iter()
+                .copied()
+                .filter(|m| body_calls(&f.body, m))
+                .collect();
+            (f.name.as_str(), callees)
+        })
+        .collect();
+
+    // DFS: a back-edge to a function still on the current path (incl. a self-edge) is a cycle.
+    fn has_cycle<'a>(
+        node: &'a str,
+        edges: &std::collections::BTreeMap<&'a str, Vec<&'a str>>,
+        on_path: &mut Vec<&'a str>,
+        done: &mut std::collections::BTreeSet<&'a str>,
+    ) -> bool {
+        on_path.push(node);
+        for &next in edges.get(node).into_iter().flatten() {
+            if on_path.contains(&next) || (!done.contains(next) && has_cycle(next, edges, on_path, done)) {
+                return true;
+            }
+        }
+        on_path.pop();
+        done.insert(node);
+        false
+    }
+    let mut done = std::collections::BTreeSet::new();
+    edges
+        .keys()
+        .any(|&n| !done.contains(n) && has_cycle(n, &edges, &mut Vec::new(), &mut done))
+}
+
+/// Whether `body` contains a call `name(` — `name` as a whole identifier, directly
+/// followed (modulo spaces) by `(`.
+fn body_calls(body: &str, name: &str) -> bool {
+    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let bytes = body.as_bytes();
+    let nb = name.as_bytes();
+    let mut i = 0;
+    while i + nb.len() <= bytes.len() {
+        let word_start = i == 0 || !is_ident(bytes[i - 1]);
+        if &bytes[i..i + nb.len()] == nb && word_start {
+            let mut j = i + nb.len();
+            if !(j < bytes.len() && is_ident(bytes[j])) {
+                while j < bytes.len() && (bytes[j] == b' ' || bytes[j] == b'\t') {
+                    j += 1;
+                }
+                if j < bytes.len() && bytes[j] == b'(' {
+                    return true;
+                }
+            }
+        }
+        i += 1;
+    }
+    false
 }
 
 /// Run a mutation campaign: `iterations` mutants drawn from the corpus, each compiled in a

@@ -444,3 +444,56 @@ fn baseline_campaign_is_clean() {
         actionable.join("\n")
     );
 }
+
+// === Recursive-@inline guard: the compiler cannot inline a recursive @inline, so
+// the corpus mutator must never produce one. ===
+
+#[test]
+fn has_recursive_inline_classifies_correctly() {
+    use crate::corpus::has_recursive_inline;
+
+    // Direct self-recursion.
+    assert!(has_recursive_inline(
+        "@inline\ndef f(x):\n    y = f(x)\n    return y\ndef main():\n    z = f(3)\n    return\n"
+    ));
+    // Mutual recursion a -> b -> a.
+    assert!(has_recursive_inline(
+        "@inline\ndef a(x):\n    y = b(x)\n    return y\n@inline\ndef b(x):\n    y = a(x)\n    return y\n"
+    ));
+
+    // Non-recursive inline (identity).
+    assert!(!has_recursive_inline(
+        "@inline\ndef f(x):\n    return x + 0\ndef main():\n    z = f(3)\n    return\n"
+    ));
+    // Recursion through a NON-inline function is legal (only loops at exec time).
+    assert!(!has_recursive_inline(
+        "def f(n):\n    return f(n + 1)\ndef main():\n    x = f(0)\n    return\n"
+    ));
+    // An inline function calling a non-inline function is not a recursive inline.
+    assert!(!has_recursive_inline(
+        "@inline\ndef f(x):\n    y = g(x)\n    return y\ndef g(x):\n    return x + 1\n"
+    ));
+    // A bare mention without a call (substring of another identifier) is not a call.
+    assert!(!has_recursive_inline(
+        "@inline\ndef f(x):\n    ff = x + 0\n    return ff\ndef main():\n    z = f(1)\n    return\n"
+    ));
+}
+
+#[test]
+fn mutate_never_produces_recursive_inline() {
+    use crate::corpus::{has_recursive_inline, mutate};
+    use crate::rng::Rng;
+
+    // Defines an @inline function and calls it twice: the line-duplication / shuffle
+    // mutations can splice a `f(..)` call into f's own body. mutate() must re-roll
+    // so its result never contains a recursive inline.
+    let src = "from snark_lib import *\n@inline\ndef f(x):\n    return x + 0\ndef main():\n    a = f(1)\n    b = f(2)\n    assert a == 1\n    assert b == 2\n    return\n";
+    for seed in 0..3000u64 {
+        let mut rng = Rng::new(seed);
+        let mutant = mutate(src, &mut rng);
+        assert!(
+            !has_recursive_inline(&mutant),
+            "seed {seed} produced recursive inline:\n{mutant}"
+        );
+    }
+}
