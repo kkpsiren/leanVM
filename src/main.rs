@@ -1,15 +1,16 @@
 use clap::Parser;
 use rec_aggregation::benchmark::{AggregationTopology, biggest_leaf, run_aggregation_benchmark};
 
-// Allocator: mimalloc — a robust production allocator, tuned to retain freed memory (see
-// `lean_multisig::tune_allocator`). Replaces the former `zk-alloc` bump arena, which was
-// fast but fragile: any allocation outliving a phase, or a pointer retained across
-// `begin_phase`'s slab reset (e.g. from a background thread, tracing, or a stray clone),
-// silently corrupted memory. mimalloc-with-retention is both **faster** here and stable.
+// Allocator: smalloc (crate `smmalloc`) — a simple, fast allocator that serves allocations
+// from a large, sparsely-used virtual reservation, reusing freed slots in place. Replaces
+// the former `zk-alloc` bump arena, which was fast but fragile: any allocation outliving a
+// phase, or a pointer retained across `begin_phase`'s slab reset (e.g. from a background
+// thread, tracing, or a stray clone), silently corrupted memory. smalloc is stable (real
+// per-slot free, no phase ceremony) while keeping the page-reuse that made the arena fast.
 // The `standard-alloc` feature selects the plain system allocator for comparison.
 #[cfg(not(feature = "standard-alloc"))]
 #[global_allocator]
-static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+static ALLOC: smalloc::Smalloc = smalloc::Smalloc::new();
 
 #[derive(Parser)]
 enum Cli {
@@ -73,8 +74,8 @@ fn run_with_warmup(topology: &AggregationTopology, tracing: bool, json: bool, re
 
 #[allow(clippy::too_many_lines)]
 fn main() {
-    // Retain freed memory (no purging) so the prover's huge buffer churn reuses pages
-    // instead of re-faulting — the property that made the old arena fast. Before any work.
+    // Disable Transparent Huge Pages for this process so the allocator's large arenas stay
+    // on 4 KB pages — avoids a strided-access cache-set collapse in the prover. Before any work.
     lean_multisig::tune_allocator();
 
     let cli = Cli::parse();
