@@ -330,6 +330,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
 
 [[package]]
+name = "errno"
+version = "0.3.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
+dependencies = [
+ "libc",
+ "windows-sys",
+]
+
+[[package]]
+name = "fastrand"
+version = "2.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9f1f227452a390804cdb637b74a86990f2a7d7ba4b7d5693aac9b4dd6defd8d6"
+
+[[package]]
 name = "foldhash"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -496,11 +512,11 @@ dependencies = [
  "rand",
  "rec_aggregation",
  "serde_json",
+ "smmalloc",
  "sub_protocols",
  "system-info",
  "utils",
  "xmss",
- "zk-alloc",
 ]
 
 [[package]]
@@ -566,6 +582,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 
 [[package]]
+name = "linux-raw-sys"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
+
+[[package]]
 name = "lock_api"
 version = "0.4.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -587,6 +609,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "db9a0d582c2874f68138a16ce1867e0ffde6c0bb0a0df85e1f36d04146db488a"
 dependencies = [
  "twox-hash",
+]
+
+[[package]]
+name = "mach-sys"
+version = "0.5.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "48460c2e82a3a0de197152fdf8d2c2d5e43adc501501553e439bf2156e6f87c7"
+dependencies = [
+ "fastrand",
 ]
 
 [[package]]
@@ -949,7 +980,6 @@ dependencies = [
  "tracing",
  "utils",
  "xmss",
- "zk-alloc",
 ]
 
 [[package]]
@@ -976,6 +1006,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cfcb3a22ef46e85b45de6ee7e79d063319ebb6594faafcf1c225ea92ab6e9b92"
 dependencies = [
  "semver",
+]
+
+[[package]]
+name = "rustix"
+version = "1.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b6fe4565b9518b83ef4f91bb47ce29620ca828bd32cb7e408f0062e9930ba190"
+dependencies = [
+ "bitflags",
+ "errno",
+ "libc",
+ "linux-raw-sys",
+ "windows-sys",
 ]
 
 [[package]]
@@ -1070,6 +1113,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
 
 [[package]]
+name = "smmalloc"
+version = "7.6.10+c55d2f585a638d795a1d2927baa982712eed93ab"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "027cb6587cf11dbf2da1d6d9b25b32b1cbf7648235b85de0e8221249ab6b379a"
+dependencies = [
+ "mach-sys",
+ "rustix",
+ "windows-sys",
+]
+
+[[package]]
 name = "spin"
 version = "0.9.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1118,7 +1172,6 @@ name = "system-info"
 version = "0.1.0"
 dependencies = [
  "libc",
- "rayon",
 ]
 
 [[package]]
@@ -1471,15 +1524,6 @@ dependencies = [
  "serde",
  "sha3",
  "utils",
-]
-
-[[package]]
-name = "zk-alloc"
-version = "0.1.0"
-dependencies = [
- "libc",
- "rayon",
- "system-info",
 ]
 
 [[package]]

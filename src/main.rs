@@ -3,7 +3,7 @@ use rec_aggregation::benchmark::{AggregationTopology, biggest_leaf, run_aggregat
 
 #[cfg(not(feature = "standard-alloc"))]
 #[global_allocator]
-static ALLOC: zk_alloc::ZkAllocator = zk_alloc::ZkAllocator;
+static ALLOC: smalloc::Smalloc = smalloc::Smalloc::new();
 
 #[derive(Parser)]
 enum Cli {
@@ -67,9 +67,6 @@ fn run_with_warmup(topology: &AggregationTopology, tracing: bool, json: bool, re
 
 #[allow(clippy::too_many_lines)]
 fn main() {
-    #[cfg(not(feature = "standard-alloc"))]
-    zk_alloc::init();
-
     let cli = Cli::parse();
 
     match cli {
