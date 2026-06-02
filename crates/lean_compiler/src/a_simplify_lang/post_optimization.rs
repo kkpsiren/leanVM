@@ -1,11 +1,19 @@
 use std::collections::{BTreeMap, BTreeSet, btree_map::Entry};
 
-use backend::PrimeCharacteristicRing;
+use backend::{PrimeCharacteristicRing, PrimeField32};
 
 use crate::{F, a_simplify_lang::*, lang::ConstExpression};
 
 pub fn propagate_copies(program: &mut SimpleProgram) {
     for func in program.functions.values_mut() {
+        // Pass 0: scalarize eligible const-malloc buffers into ordinary variables. A buffer
+        // accessed only at compile-time-constant offsets (and never used as a whole array) is
+        // morally a bag of independent scalar cells, so we turn each slot into a plain SSA
+        // variable. Every pass below then optimizes those slots uniformly with all other
+        // variables (copy-prop, CSE, deref-folding, assert-fusion) — no const-malloc-specific
+        // pass needed.
+        scalarize_const_mallocs(&mut func.instructions);
+
         // Pass 1: copy propagation. `var = mem_expr + 0` with `var`
         // single-defined ⇒ rewrite uses with `mem_expr`, drop the assignment.
         let refs = get_var_refs(&func.instructions);
@@ -131,6 +139,129 @@ fn apply_substitutions(lines: &mut Vec<SimpleLine>, subst: &BTreeMap<Var, Simple
         | SimpleLine::ForwardDeclaration { var: v } => !subst.contains_key(v),
         _ => true,
     });
+}
+
+/// Replace every constant-offset slot of an eligible const-malloc buffer with a fresh ordinary
+/// variable, and drop the `ConstMalloc` declaration. After this the buffer's slots are plain SSA
+/// variables, so the generic passes (copy-prop, CSE, deref-folding, assert-fusion) optimize them
+/// uniformly with everything else — recovering the redundant accumulator-buffer copies that the
+/// manual-SSA lowering introduces, without any const-malloc-specific machinery.
+///
+/// A buffer is eligible iff it behaves exactly like a bag of independent scalar cells:
+///   - its base var is never used as a value (`refs[base].uses == 0`): so it is never passed to a
+///     function, used in pointer arithmetic, or runtime-indexed. (Const-index slot accesses carry
+///     the label, not the base var, so they don't count as uses.)
+///   - every slot access uses a compile-time-constant offset, so each slot maps to exactly one var.
+///   - no slot is consumed as a multi-element *region pointer*. A `ConstMallocAccess` denotes the
+///     slot's value in arithmetic positions, but its *address* when handed to a precompile or hint
+///     (which then read/write a contiguous run starting there). Scalarizing such a slot would break
+///     contiguity, so any buffer whose slot appears in a precompile / custom-hint / hint-witness
+///     operand is disqualified. (In practice such regions are always passed via the base var or
+///     base + offset arithmetic, which already trips the `uses == 0` gate; this is belt-and-braces.)
+fn scalar_slot_var(label: ConstMallocLabel, offset: u32) -> Var {
+    format!("@cm_{label}_{offset}")
+}
+
+fn scalarize_const_mallocs(lines: &mut Vec<SimpleLine>) {
+    let refs = get_var_refs(lines);
+
+    // One walk: collect eligible labels, disqualifications, and the offsets actually used.
+    fn analyze(
+        lines: &[SimpleLine],
+        refs: &BTreeMap<Var, VarRefs>,
+        eligible: &mut BTreeSet<ConstMallocLabel>,
+        disqualified: &mut BTreeSet<ConstMallocLabel>,
+        used: &mut BTreeMap<ConstMallocLabel, BTreeSet<u32>>,
+    ) {
+        for line in lines {
+            if let SimpleLine::ConstMalloc { var, label, .. } = line
+                && refs.get(var).map(|r| r.uses).unwrap_or(0) == 0
+            {
+                eligible.insert(*label);
+            }
+            // A precompile / custom-hint / hint-witness reads or writes a contiguous region
+            // starting at its pointer operands — any const-malloc slot used there is a region
+            // base, not a scalar, so it cannot be scalarized.
+            let region_context = matches!(
+                line,
+                SimpleLine::Precompile(_) | SimpleLine::CustomHint(..) | SimpleLine::HintWitness { .. }
+            );
+            let mut exprs = line.operand_exprs();
+            if let SimpleLine::Assignment { var, .. } = line {
+                exprs.push(var);
+            }
+            for e in exprs {
+                if let SimpleExpr::Memory(VarOrConstMallocAccess::ConstMallocAccess { malloc_label, offset }) = e {
+                    match offset.naive_eval() {
+                        Some(o) if !region_context => {
+                            used.entry(*malloc_label).or_default().insert(o.as_canonical_u32());
+                        }
+                        _ => {
+                            disqualified.insert(*malloc_label);
+                        }
+                    }
+                }
+            }
+            for block in line.nested_blocks() {
+                analyze(block, refs, eligible, disqualified, used);
+            }
+        }
+    }
+    let mut eligible = BTreeSet::new();
+    let mut disqualified = BTreeSet::new();
+    let mut used = BTreeMap::new();
+    analyze(lines, &refs, &mut eligible, &mut disqualified, &mut used);
+    eligible.retain(|l| !disqualified.contains(l));
+    if eligible.is_empty() {
+        return;
+    }
+
+    // Rewrite every eligible slot access to its scalar variable, and expand each eligible
+    // `ConstMalloc` declaration into a `ForwardDeclaration` per used slot. The declarations stay
+    // at the buffer's declaration point — i.e. the same scope where the const-malloc region was
+    // reserved — so reads in nested branches/loops below still resolve, exactly as before.
+    fn rewrite_expr(e: &mut SimpleExpr, eligible: &BTreeSet<ConstMallocLabel>) {
+        if let SimpleExpr::Memory(VarOrConstMallocAccess::ConstMallocAccess { malloc_label, offset }) = e
+            && eligible.contains(malloc_label)
+            && let Some(o) = offset.naive_eval()
+        {
+            *e = SimpleExpr::Memory(VarOrConstMallocAccess::Var(scalar_slot_var(
+                *malloc_label,
+                o.as_canonical_u32(),
+            )));
+        }
+    }
+    fn rewrite(
+        lines: &mut Vec<SimpleLine>,
+        eligible: &BTreeSet<ConstMallocLabel>,
+        used: &BTreeMap<ConstMallocLabel, BTreeSet<u32>>,
+    ) {
+        let mut out = Vec::with_capacity(lines.len());
+        for mut line in lines.drain(..) {
+            if let SimpleLine::Assignment { var, .. } = &mut line {
+                rewrite_expr(var, eligible);
+            }
+            for e in line.operand_exprs_mut() {
+                rewrite_expr(e, eligible);
+            }
+            for block in line.nested_blocks_mut() {
+                rewrite(block, eligible, used);
+            }
+            if let SimpleLine::ConstMalloc { label, .. } = &line
+                && eligible.contains(label)
+            {
+                for &offset in used.get(label).into_iter().flatten() {
+                    out.push(SimpleLine::ForwardDeclaration {
+                        var: scalar_slot_var(*label, offset),
+                    });
+                }
+            } else {
+                out.push(line);
+            }
+        }
+        *lines = out;
+    }
+    rewrite(lines, &eligible, &used);
 }
 
 #[derive(Default)]
