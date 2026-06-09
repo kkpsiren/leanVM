@@ -3,6 +3,7 @@ import Formal.Wrapping
 import Formal.ExecTable
 import Formal.Complete
 import Formal.Bus
+import Formal.Logup
 import Formal.ExtensionTable
 import Formal.ExtensionLen
 import Formal.Trace
