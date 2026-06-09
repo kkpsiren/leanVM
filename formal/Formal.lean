@@ -6,6 +6,7 @@ import Formal.Bus
 import Formal.Logup
 import Formal.ExtensionTable
 import Formal.ExtensionLen
+import Formal.Poseidon
 import Formal.Trace
 import Formal.Sanity
 
@@ -20,7 +21,8 @@ the existence of a valid execution — leaving the cryptographic layer (PCS,
 Fiat–Shamir, the probabilistic logup reduction) as the trust boundary.
 
 Scope: the four **core instructions** `ADD`, `MUL`, `DEREF`, `JUMP`. Precompiles
-are partial — the EXTENSION table's accumulation is done; POSEIDON is future work.
+are partial — the EXTENSION table's accumulation is done, and the POSEIDON
+sparse partial-round optimization's correctness mechanism is formalized.
 
 ## Modules
 
@@ -33,6 +35,9 @@ are partial — the EXTENSION table's accumulation is done; POSEIDON is future w
 * `Logup`          — `logup_vanishing`: the deterministic core of "logup ⟹ balance".
 * `ExtensionTable` — EXTENSION-table accumulation: `ext_add/dot/eq_sound`.
 * `ExtensionLen`   — `len_bound` (`§lem:len-bound`) via the wrapping pair.
+* `Poseidon`       — the sparse partial-round optimization: `mulVec_sbox0_comm`
+                     (lane-0-fixing matrices commute with the lane-0 S-box) and
+                     `round_pushThrough` / `two_round_push` (sparse encodes vanilla).
 * `Trace`          — trace-level soundness: `trace_sound`, `trace_sound_table`,
                      and the end-to-end `trace_sound_table_of_bus`.
 * `Sanity`         — machine-checked non-vacuity of the main premises.
