@@ -1,4 +1,6 @@
 import Formal.ExecTable
+import Formal.Bus
+import Formal.Wrapping
 
 /-!
 # Trace-level soundness of the EXECUTION table (core instructions)
@@ -80,5 +82,80 @@ theorem trace_sound (hchar : (2 : F) ≠ 0) (m : F → F) (bytecode : F → Inst
   · intro i
     exact exec_sound hchar m (bytecode (rows i.castSucc).pc)
       (rows i.castSucc) (rows i.succ) (hwf _) (hmem _) (hair i)
+
+/-! ## Extracting the consecutive-pair constraints from the committed table
+
+`trace_sound` above assumed the per-consecutive-pair form of the AIR constraints
+(`hair`). The faithful statement is instead that the constraint holds on **every
+committed row** `r` with the wrapping-pair shift `wrapNext r` — this is what the
+batched zerocheck establishes (the constraint MLE vanishes on the whole boolean
+hypercube). The lemma below derives the consecutive form from the table form: on
+an interior row `i.castSucc`, `wrapNext` is exactly the successor `i.succ`. The
+last row's self-pairing carries no transition, so it is correctly absent from the
+`Fin n` family of consecutive pairs. -/
+
+variable {n : ℕ}
+
+/-- The table-level AIR constraint (holding on every row, with `wrapNext`) yields
+the consecutive-pair constraints `(rows i, rows (i+1))` for every `i : Fin n`. -/
+theorem execConstraints_consecutive (rows : Fin (n + 1) → ExecRow F)
+    (hairAll : ∀ r, ExecConstraints (rows r) (rows (wrapNext r))) :
+    ∀ i : Fin n, ExecConstraints (rows i.castSucc) (rows i.succ) := by
+  intro i
+  have h := hairAll i.castSucc
+  rwa [wrapNext_castSucc] at h
+
+/-- **Trace soundness from the committed table.** Same as `trace_sound`, but the
+AIR hypothesis is the faithful table-level form `hairAll` (constraint on every
+row with the wrapping-pair shift); the consecutive-pair structure is *derived*,
+not assumed. -/
+theorem trace_sound_table (hchar : (2 : F) ≠ 0) (m : F → F) (bytecode : F → Instr F)
+    (rows : Fin (n + 1) → ExecRow F) (initpc initfp finalpc finalfp : F)
+    (hwf  : ∀ i, (rows i).instr = encodeInstr (bytecode (rows i).pc))
+    (hmem : ∀ i, MemBinding m (rows i))
+    (hairAll : ∀ r, ExecConstraints (rows r) (rows (wrapNext r)))
+    (hstart : (rows 0).pc = initpc ∧ (rows 0).fp = initfp)
+    (hend   : (rows (Fin.last n)).pc = finalpc ∧ (rows (Fin.last n)).fp = finalfp) :
+    ∃ exec : Fin (n + 1) → State F,
+      exec 0 = ⟨initpc, initfp⟩ ∧
+      exec (Fin.last n) = ⟨finalpc, finalfp⟩ ∧
+      ∀ i : Fin n,
+        (bytecode (exec i.castSucc).pc).NextState m (exec i.castSucc) (exec i.succ) :=
+  trace_sound hchar m bytecode n rows initpc initfp finalpc finalfp hwf hmem
+    (execConstraints_consecutive rows hairAll) hstart hend
+
+/-- **End-to-end EXECUTION-table trace soundness.** With the committed table
+satisfying the AIR on every row (wrapping shift), the memory and bytecode buses
+balanced (the logup-GKR output), each row's pulls placed on those buses, and the
+boundary registers fixed, there exists a valid execution trace from the initial
+to the final state — each step a `NextState` transition for the **actual bytecode
+instruction**. No `MemBinding`, bytecode-binding, or consecutive-pair hypotheses
+remain free: they are all discharged here. -/
+theorem trace_sound_table_of_bus (hchar : (2 : F) ≠ 0) (m : F → F)
+    (bytecode : F → Instr F) (rows : Fin (n + 1) → ExecRow F)
+    (initpc initfp finalpc finalfp : F)
+    {memBus : Bus (F × F)} {bcBus : Bus (InstrCols F × F)}
+    (hmemBal : memBus.Balanced) (hmemPush : IsMemoryPush m memBus.pushes)
+    (hbcBal : bcBus.Balanced) (hbcPush : IsBytecodePush bytecode bcBus.pushes)
+    (hpullMem : ∀ r : Fin (n + 1),
+      ((rows r).addrA, (rows r).valA) ∈ memBus.pulls ∧
+      ((rows r).addrB, (rows r).valB) ∈ memBus.pulls ∧
+      ((rows r).addrC, (rows r).valC) ∈ memBus.pulls)
+    (hpullBc : ∀ r : Fin (n + 1), ((rows r).instr, (rows r).pc) ∈ bcBus.pulls)
+    (hairAll : ∀ r, ExecConstraints (rows r) (rows (wrapNext r)))
+    (hstart : (rows 0).pc = initpc ∧ (rows 0).fp = initfp)
+    (hend   : (rows (Fin.last n)).pc = finalpc ∧ (rows (Fin.last n)).fp = finalfp) :
+    ∃ exec : Fin (n + 1) → State F,
+      exec 0 = ⟨initpc, initfp⟩ ∧
+      exec (Fin.last n) = ⟨finalpc, finalfp⟩ ∧
+      ∀ i : Fin n,
+        (bytecode (exec i.castSucc).pc).NextState m (exec i.castSucc) (exec i.succ) := by
+  have hwf : ∀ r, (rows r).instr = encodeInstr (bytecode (rows r).pc) := fun r =>
+    bytecode_lookup_sound bytecode hbcBal hbcPush (hpullBc r)
+  have hmem : ∀ r, MemBinding m (rows r) := fun r =>
+    memBinding_of_bus m (rows r) hmemBal hmemPush
+      (hpullMem r).1 (hpullMem r).2.1 (hpullMem r).2.2
+  exact trace_sound_table hchar m bytecode rows initpc initfp finalpc finalfp
+    hwf hmem hairAll hstart hend
 
 end LeanVM

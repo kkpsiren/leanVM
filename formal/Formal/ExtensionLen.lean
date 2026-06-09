@@ -1,5 +1,6 @@
 import Mathlib.Data.ZMod.Basic
 import Mathlib.Tactic
+import Formal.Wrapping
 
 /-!
 # The EXTENSION table `len` bound (and the wrapping pair)
@@ -22,24 +23,6 @@ representative `ZMod.val` and the no-overflow step needs `H < p`.
 -/
 
 namespace LeanVM
-
-/-- The "next row" index with the **wrapping pair** (`§next-mle`): row `r` is
-paired with `r + 1`, except the last row `n`, which is paired with itself. -/
-def wrapNext {n : ℕ} (r : Fin (n + 1)) : Fin (n + 1) :=
-  if h : (r : ℕ) + 1 < n + 1 then ⟨r + 1, h⟩ else r
-
-@[simp] theorem wrapNext_last {n : ℕ} : wrapNext (Fin.last n) = Fin.last n := by
-  unfold wrapNext
-  rw [dif_neg]
-  simp [Fin.val_last]
-
-theorem wrapNext_castSucc {n : ℕ} (i : Fin n) : wrapNext i.castSucc = i.succ := by
-  unfold wrapNext
-  rw [dif_pos]
-  · apply Fin.ext
-    simp [Fin.val_succ]
-  · simp only [Fin.val_castSucc]
-    omega
 
 /-- **`len`-bound (`§lem:len-bound`).** Given the EXTENSION-table `len`/`flag_start`
 columns over `ZMod p` (`p` prime, height `H = n+1 < p`), and the booleanity,

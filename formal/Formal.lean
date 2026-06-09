@@ -1,4 +1,5 @@
 import Formal.Isa
+import Formal.Wrapping
 import Formal.ExecTable
 import Formal.Complete
 import Formal.Bus
