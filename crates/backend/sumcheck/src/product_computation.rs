@@ -1,8 +1,8 @@
 use fiat_shamir::*;
 use field::*;
 use poly::*;
-use rayon::prelude::*;
 use tracing::instrument;
+use zk_alloc::ArenaVec;
 
 use crate::{SumcheckComputation, sumcheck_prove_many_rounds};
 
@@ -150,15 +150,13 @@ pub fn compute_product_sumcheck_polynomial<
                 (a0 + b0, a2 + b2)
             })
     } else {
-        pol_0[..n / 2]
-            .par_iter()
-            .zip(pol_0[n / 2..].par_iter())
-            .zip(pol_1[..n / 2].par_iter().zip(pol_1[n / 2..].par_iter()))
-            .map(sumcheck_quadratic)
-            .reduce(
-                || (EFPacking::ZERO, EFPacking::ZERO),
-                |(a0, a2), (b0, b2)| (a0 + b0, a2 + b2),
-            )
+        let half = n / 2;
+        parallel::map_reduce(
+            half,
+            || (EFPacking::ZERO, EFPacking::ZERO),
+            |i| sumcheck_quadratic(((&pol_0[i], &pol_0[half + i]), (&pol_1[i], &pol_1[half + i]))),
+            |(a0, a2), (b0, b2)| (a0 + b0, a2 + b2),
+        )
     };
 
     let c0 = decompose(c0_packed).into_iter().sum::<EF>();
@@ -190,15 +188,17 @@ pub fn compute_product_sumcheck_polynomial_base_ext_packed<
 
     let chunk_size = 1024;
 
-    let (c0_acc, c2_acc) = pol_0[..half]
-        .par_chunks(chunk_size)
-        .zip(pol_0[half..].par_chunks(chunk_size))
-        .zip(
-            pol_1[..half]
-                .par_chunks(chunk_size)
-                .zip(pol_1[half..].par_chunks(chunk_size)),
-        )
-        .map(|((b_lo, b_hi), (e_lo, e_hi))| {
+    let n_chunks = half.div_ceil(chunk_size);
+    let (c0_acc, c2_acc) = parallel::map_reduce(
+        n_chunks,
+        || ([F::ZERO; DIM], [F::ZERO; DIM]),
+        |chunk| {
+            let start = chunk * chunk_size;
+            let end = (start + chunk_size).min(half);
+            let b_lo = &pol_0[start..end];
+            let b_hi = &pol_0[half + start..half + end];
+            let e_lo = &pol_1[start..end];
+            let e_hi = &pol_1[half + start..half + end];
             let mut c0 = [F::ZERO; DIM];
             let mut c2 = [F::ZERO; DIM];
             for i in 0..b_lo.len() {
@@ -220,17 +220,15 @@ pub fn compute_product_sumcheck_polynomial_base_ext_packed<
                 }
             }
             (c0, c2)
-        })
-        .reduce(
-            || ([F::ZERO; DIM], [F::ZERO; DIM]),
-            |(mut a0, mut a2): ([F; DIM], [F; DIM]), (b0, b2): ([F; DIM], [F; DIM])| {
-                for j in 0..DIM {
-                    a0[j] += b0[j];
-                    a2[j] += b2[j];
-                }
-                (a0, a2)
-            },
-        );
+        },
+        |(mut a0, mut a2): ([F; DIM], [F; DIM]), (b0, b2): ([F; DIM], [F; DIM])| {
+            for j in 0..DIM {
+                a0[j] += b0[j];
+                a2[j] += b2[j];
+            }
+            (a0, a2)
+        },
+    );
 
     let c0 = EF::from_basis_coefficients_fn(|j| c0_acc[j]);
     let c2 = EF::from_basis_coefficients_fn(|j| c2_acc[j]);
@@ -249,14 +247,14 @@ pub fn fold_and_compute_product_sumcheck_polynomial<
     prev_folding_factor: EF,
     sum: EF,
     decompose: impl Fn(EFPacking) -> Vec<EF>,
-) -> (DensePolynomial<EF>, Vec<Vec<EFPacking>>) {
+) -> (DensePolynomial<EF>, Vec<ArenaVec<EFPacking>>) {
     let n = pol_0.len();
     assert_eq!(n, pol_1.len());
     assert!(n.is_power_of_two());
     let prev_folding_factor_packed = EFPacking::from(prev_folding_factor);
 
-    let mut pol_0_folded = unsafe { uninitialized_vec::<EFPacking>(n / 2) };
-    let mut pol_1_folded = unsafe { uninitialized_vec::<EFPacking>(n / 2) };
+    let mut pol_0_folded = unsafe { ArenaVec::<EFPacking>::uninitialized(n / 2) };
+    let mut pol_1_folded = unsafe { ArenaVec::<EFPacking>::uninitialized(n / 2) };
 
     #[allow(clippy::type_complexity)]
     let process_element = |(p0_prev, p0_f): (((&F, &F), (&F, &F)), (&mut EFPacking, &mut EFPacking)),
@@ -287,13 +285,33 @@ pub fn fold_and_compute_product_sumcheck_polynomial<
                 (a0 + b0, a2 + b2)
             })
     } else {
-        par_zip_fold_2(pol_0, &mut pol_0_folded)
-            .zip(par_zip_fold_2(pol_1, &mut pol_1_folded))
-            .map(|(p0, p1)| process_element(p0, p1))
-            .reduce(
-                || (EFPacking::ZERO, EFPacking::ZERO),
-                |(a0, a2), (b0, b2)| (a0 + b0, a2 + b2),
-            )
+        let quarter = n / 4;
+        let p0f = parallel::SendPtr(pol_0_folded.as_mut_ptr());
+        let p1f = parallel::SendPtr(pol_1_folded.as_mut_ptr());
+        parallel::map_reduce(
+            quarter,
+            || (EFPacking::ZERO, EFPacking::ZERO),
+            |i| {
+                let diff_0 = pol_0[2 * quarter + i] - pol_0[i];
+                let diff_1 = pol_0[3 * quarter + i] - pol_0[quarter + i];
+                let x_0 = prev_folding_factor_packed * diff_0 + pol_0[i];
+                let x_1 = prev_folding_factor_packed * diff_1 + pol_0[quarter + i];
+
+                let y_0 = prev_folding_factor_packed * (pol_1[2 * quarter + i] - pol_1[i]) + pol_1[i];
+                let y_1 =
+                    prev_folding_factor_packed * (pol_1[3 * quarter + i] - pol_1[quarter + i]) + pol_1[quarter + i];
+
+                unsafe {
+                    *p0f.add(i) = x_0;
+                    *p0f.add(quarter + i) = x_1;
+                    *p1f.add(i) = y_0;
+                    *p1f.add(quarter + i) = y_1;
+                }
+
+                sumcheck_quadratic(((&x_0, &x_1), (&y_0, &y_1)))
+            },
+            |(a0, a2), (b0, b2)| (a0 + b0, a2 + b2),
+        )
     };
 
     let c0 = decompose(c0_packed).into_iter().sum::<EF>();

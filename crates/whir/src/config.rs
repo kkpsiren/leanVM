@@ -5,7 +5,7 @@ use poly::*;
 
 // (Goldilocks two adicity is 32) We use a smaller one to avoid having to deal with PoW grinding at folding in WHIR
 // TODO we likely want a bit more than 24, so we should reintroduce PoW grinding for folding in the future
-// But hopefully we will have better proximity gaps formulas by then 
+// But hopefully we will have better proximity gaps formulas by then
 pub const EFFECTIVE_TWO_ADICITY: usize = 24;
 
 /// Defines the folding factor for polynomial commitments.
@@ -351,10 +351,6 @@ where
             res -= self.rs_reduction_factor(r);
         }
         res
-    }
-
-    pub fn merkle_tree_height(&self, round: usize) -> usize {
-        self.log_inv_rate_at(round) + self.num_variables - self.folding_factor.total_number(round)
     }
 
     pub fn n_vars_of_final_polynomial(&self) -> usize {

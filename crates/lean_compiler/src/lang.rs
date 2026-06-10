@@ -2,9 +2,8 @@ use backend::*;
 use lean_vm::*;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{Display, Formatter};
-use utils::ToUsize;
 
-use crate::a_simplify_lang::{VarOrConstMallocAccess, VectorLenTracker};
+use crate::a_simplify_lang::VarOrConstMallocAccess;
 use crate::{F, parser::ConstArrayValue};
 pub use lean_vm::{FileId, FunctionName, SourceLocation};
 
@@ -17,22 +16,11 @@ pub struct Program {
     pub filepaths: BTreeMap<FileId, String>,
 }
 
-impl Program {
-    pub fn inlined_function_names(&self) -> BTreeSet<FunctionName> {
-        self.functions
-            .iter()
-            .filter(|(_, func)| func.inlined)
-            .map(|(name, _)| name.clone())
-            .collect()
-    }
-}
-
 /// A function argument with its modifiers
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct FunctionArg {
     pub name: Var,
     pub is_const: bool,
-    pub is_mutable: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -47,9 +35,6 @@ pub struct Function {
 impl Function {
     pub fn has_const_arguments(&self) -> bool {
         self.arguments.iter().any(|arg| arg.is_const)
-    }
-    pub fn has_mutable_arguments(&self) -> bool {
-        self.arguments.iter().any(|arg| arg.is_mutable)
     }
 }
 
@@ -206,7 +191,7 @@ impl ConstExpression {
                 for arg in args {
                     eval_args.push(arg.eval_with(func)?);
                 }
-                Some(math_expr.eval(&eval_args))
+                math_expr.eval(&eval_args)
             }
         }
     }
@@ -334,28 +319,26 @@ impl MathOperation {
             | Self::DivFloor => 2,
         }
     }
-    pub fn eval(&self, args: &[F]) -> F {
+    pub fn eval(&self, args: &[F]) -> Option<F> {
         assert_eq!(args.len(), self.num_args());
-        match self {
+        let divisor_nonzero = |x: F| -> Option<F> { (!x.is_zero()).then_some(x) };
+        Some(match self {
             Self::Add => args[0] + args[1],
             Self::Mul => args[0] * args[1],
             Self::Sub => args[0] - args[1],
-            Self::Div => args[0] / args[1],
+            Self::Div => args[0] / divisor_nonzero(args[1])?,
             Self::Exp => args[0].exp_u64(args[1].as_canonical_u64()),
-            Self::Mod => F::from_usize(args[0].to_usize() % args[1].to_usize()),
+            Self::Mod => F::from_usize(args[0].to_usize() % divisor_nonzero(args[1])?.to_usize()),
             Self::Log2Ceil => F::from_usize(log2_ceil_usize(args[0].to_usize())),
             Self::NextMultipleOf => {
-                let value = args[0];
-                let multiple = args[1];
-                let value_usize = value.to_usize();
-                let multiple_usize = multiple.to_usize();
-                let res = value_usize.next_multiple_of(multiple_usize);
-                F::from_usize(res)
+                let value_usize = args[0].to_usize();
+                let multiple_usize = divisor_nonzero(args[1])?.to_usize();
+                F::from_usize(value_usize.next_multiple_of(multiple_usize))
             }
             Self::SaturatingSub => F::from_usize(args[0].to_usize().saturating_sub(args[1].to_usize())),
-            Self::DivCeil => F::from_usize(args[0].to_usize().div_ceil(args[1].to_usize())),
-            Self::DivFloor => F::from_usize(args[0].to_usize() / args[1].to_usize()),
-        }
+            Self::DivCeil => F::from_usize(args[0].to_usize().div_ceil(divisor_nonzero(args[1])?.to_usize())),
+            Self::DivFloor => F::from_usize(args[0].to_usize() / divisor_nonzero(args[1])?.to_usize()),
+        })
     }
 }
 
@@ -366,33 +349,23 @@ impl From<SimpleExpr> for Expression {
 }
 
 impl Expression {
-    pub fn compile_time_eval(
-        &self,
-        const_arrays: &BTreeMap<String, ConstArrayValue>,
-        vector_len: &VectorLenTracker,
-    ) -> Option<F> {
+    pub fn compile_time_eval(&self, const_arrays: &BTreeMap<String, ConstArrayValue>) -> Option<F> {
         // Handle Len specially since it needs const_arrays
         if let Self::Len { array, indices } = self {
             let idx = indices
                 .iter()
-                .map(|e| e.compile_time_eval(const_arrays, vector_len))
+                .map(|e| e.compile_time_eval(const_arrays))
                 .collect::<Option<Vec<F>>>()?;
-            if let Some(arr) = const_arrays.get(array) {
-                let target = arr.navigate(&idx)?;
-                return Some(F::from_usize(target.len()));
-            }
-            if let Some(arr) = vector_len.get(array) {
-                let usize_idx: Vec<usize> = idx.iter().map(|f| f.to_usize()).collect();
-                let target = arr.navigate(&usize_idx)?;
-                return Some(F::from_usize(target.len()));
-            }
-            return None;
+            let arr = const_arrays.get(array)?;
+            return match arr.navigate(&idx)? {
+                ConstArrayValue::Array(elems) => Some(F::from_usize(elems.len())),
+                ConstArrayValue::Scalar(_) => None, // len() of a scalar is undefined
+            };
         }
         self.eval_with(
             &|value: &SimpleExpr| value.as_constant()?.naive_eval(),
             &|arr, indexes| {
                 let array = const_arrays.get(arr.as_var()?)?;
-                assert_eq!(indexes.len(), array.depth());
                 array.navigate(&indexes)?.as_scalar()
             },
         )
@@ -417,7 +390,7 @@ impl Expression {
                 for arg in args {
                     eval_args.push(arg.eval_with(value_fn, array_fn)?);
                 }
-                Some(math_expr.eval(&eval_args))
+                math_expr.eval(&eval_args)
             }
             Self::FunctionCall { .. } => None,
             Self::Len { .. } => None,
@@ -510,46 +483,16 @@ impl AssignmentTarget {
     }
 }
 
-/// A compile-time dynamic array literal: DynArray(elem1, elem2, ...)
-/// Elements can be expressions or nested DynArray literals.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum VecLiteral {
-    /// A scalar expression element
-    Expr(Expression),
-    /// A nested vector literal
-    Vec(Vec<VecLiteral>),
-}
-
-impl VecLiteral {
-    pub fn all_exprs_mut_in_slice(arr: &mut [Self]) -> Vec<&mut Expression> {
-        let mut exprs = Vec::new();
-        for elem in arr {
-            match elem {
-                Self::Expr(expr) => exprs.push(expr),
-                Self::Vec(nested) => {
-                    exprs.extend(Self::all_exprs_mut_in_slice(nested));
-                }
-            }
-        }
-        exprs
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum LoopKind {
     Range,
     ParallelRange,
     Unroll,
-    /// `for i in dynamic_unroll(0, a, n_bits): body` — unrolls over runtime-bounded range
-    /// using bit decomposition. `n_bits` must be compile-time known.
-    DynamicUnroll {
-        n_bits: Expression,
-    },
 }
 
 impl LoopKind {
     pub fn is_unroll(&self) -> bool {
-        matches!(self, Self::Unroll | Self::DynamicUnroll { .. })
+        matches!(self, Self::Unroll)
     }
 
     pub fn is_parallel(&self) -> bool {
@@ -600,25 +543,6 @@ pub enum Line {
     },
     // noop, debug purpose only
     LocationReport {
-        location: SourceLocation,
-    },
-    /// Compile-time dynamic array declaration: var = DynArray(...)
-    VecDeclaration {
-        var: Var,
-        elements: Vec<VecLiteral>,
-        location: SourceLocation,
-    },
-    /// Compile-time vector push: push(vec_var, element) or push(vec_var[i][j], element)
-    Push {
-        vector: Var,
-        indices: Vec<Expression>,
-        element: VecLiteral,
-        location: SourceLocation,
-    },
-    /// Compile-time vector pop: vec_var.pop() or vec_var[i][j].pop()
-    Pop {
-        vector: Var,
-        indices: Vec<Expression>,
         location: SourceLocation,
     },
 }
@@ -726,7 +650,7 @@ impl Line {
                 if *is_mutable {
                     format!("{var}: Mut")
                 } else {
-                    format!("{var}: Imu")
+                    format!("{var}: Imm")
                 }
             }
             Self::Statement { targets, value, .. } => {
@@ -783,25 +707,17 @@ impl Line {
                     .map(|line| line.to_string_with_indent(indent + 1))
                     .collect::<Vec<_>>()
                     .join("\n");
-                match loop_kind {
-                    LoopKind::DynamicUnroll { n_bits } => format!(
-                        "for {} in dynamic_unroll({}, {}, {}) {{\n{}\n{}}}",
-                        iterator, start, end, n_bits, body_str, spaces
-                    ),
-                    _ => {
-                        let range_fn = if loop_kind.is_unroll() {
-                            "unroll"
-                        } else if loop_kind.is_parallel() {
-                            "parallel_range"
-                        } else {
-                            "range"
-                        };
-                        format!(
-                            "for {} in {}({}, {}) {{\n{}\n{}}}",
-                            iterator, range_fn, start, end, body_str, spaces
-                        )
-                    }
-                }
+                let range_fn = if loop_kind.is_unroll() {
+                    "unroll"
+                } else if loop_kind.is_parallel() {
+                    "parallel_range"
+                } else {
+                    "range"
+                };
+                format!(
+                    "for {} in {}({}, {}) {{\n{}\n{}}}",
+                    iterator, range_fn, start, end, body_str, spaces
+                )
             }
             Self::FunctionRet { return_data } => {
                 let return_data_str = return_data
@@ -815,33 +731,6 @@ impl Line {
                 Some(msg) => format!("assert False, \"{msg}\""),
                 None => "assert False".to_string(),
             },
-            Self::VecDeclaration { var, elements, .. } => {
-                format!("{var} = DynArray({})", elements.len())
-            }
-            Self::Push {
-                vector,
-                indices,
-                element,
-                ..
-            } => {
-                format!(
-                    "{}[{}].push({})",
-                    vector,
-                    indices.iter().map(|i| format!("{i}")).collect::<Vec<_>>().join("]["),
-                    element
-                )
-            }
-            Self::Pop { vector, indices, .. } => {
-                if indices.is_empty() {
-                    format!("{}.pop()", vector)
-                } else {
-                    format!(
-                        "{}[{}].pop()",
-                        vector,
-                        indices.iter().map(|i| format!("{i}")).collect::<Vec<_>>().join("][")
-                    )
-                }
-            }
         };
         format!("{spaces}{line_str}")
     }
@@ -860,10 +749,7 @@ impl Line {
             | Self::Assert { .. }
             | Self::FunctionRet { .. }
             | Self::Panic { .. }
-            | Self::LocationReport { .. }
-            | Self::VecDeclaration { .. }
-            | Self::Push { .. }
-            | Self::Pop { .. } => vec![],
+            | Self::LocationReport { .. } => vec![],
         }
     }
 
@@ -881,10 +767,7 @@ impl Line {
             | Self::Assert { .. }
             | Self::FunctionRet { .. }
             | Self::Panic { .. }
-            | Self::LocationReport { .. }
-            | Self::VecDeclaration { .. }
-            | Self::Push { .. }
-            | Self::Pop { .. } => vec![],
+            | Self::LocationReport { .. } => vec![],
         }
     }
 
@@ -904,23 +787,10 @@ impl Line {
             }
             Self::Assert { boolean, .. } => vec![&mut boolean.left, &mut boolean.right],
             Self::IfCondition { condition, .. } => vec![&mut condition.left, &mut condition.right],
-            Self::ForLoop {
-                start, end, loop_kind, ..
-            } => {
-                let mut exprs = vec![start, end];
-                if let LoopKind::DynamicUnroll { n_bits } = loop_kind {
-                    exprs.push(n_bits);
-                }
-                exprs
+            Self::ForLoop { start, end, .. } => {
+                vec![start, end]
             }
             Self::FunctionRet { return_data } => return_data.iter_mut().collect(),
-            Self::Push { indices, element, .. } => {
-                let mut exprs = indices.iter_mut().collect::<Vec<_>>();
-                exprs.extend(VecLiteral::all_exprs_mut_in_slice(std::slice::from_mut(element)));
-                exprs
-            }
-            Self::Pop { indices, .. } => indices.iter_mut().collect(),
-            Self::VecDeclaration { elements, .. } => VecLiteral::all_exprs_mut_in_slice(elements),
             Self::ForwardDeclaration { .. } | Self::Panic { .. } | Self::LocationReport { .. } => vec![],
         }
     }
@@ -939,22 +809,6 @@ impl Display for ConstantValue {
             }
             Self::MatchBlockSize { match_index } => {
                 write!(f, "@match_block_size_{match_index}")
-            }
-        }
-    }
-}
-
-impl Display for VecLiteral {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Expr(expr) => write!(f, "{expr}"),
-            Self::Vec(elements) => {
-                let elements_str = elements
-                    .iter()
-                    .map(|elem| format!("{elem}"))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                write!(f, "DynArray([{elements_str}])")
             }
         }
     }
@@ -1032,8 +886,6 @@ impl Display for Function {
             .map(|arg| {
                 if arg.is_const {
                     format!("const {}", arg.name)
-                } else if arg.is_mutable {
-                    format!("mut {}", arg.name)
                 } else {
                     arg.name.to_string()
                 }

@@ -7,12 +7,8 @@ def main():
     x = p[1]
     y = p[2]
     expected = p[3]
-    secondary = p[4]
-    flag = p[5]
-    offset = p[6]
-    total = p[7]
 
-    computed: Imu
+    computed: Imm
     match mode:
         case 0:
             computed = add_op(x, y)
@@ -23,17 +19,6 @@ def main():
         case 3:
             computed = combined(x, y)
     assert computed == expected
-
-    adjusted: Imu
-    if flag == 0:
-        adjusted = bump(secondary, 1)
-    elif flag == 1:
-        adjusted = bump(secondary, 10)
-    else:
-        adjusted = bump(secondary, 100)
-    assert adjusted == offset
-
-    assert total == expected + offset
     return
 
 
@@ -51,8 +36,3 @@ def mul_op(a, b):
 
 def combined(a, b):
     return mul_op(a, b) + add_op(a, b)
-
-
-@inline
-def bump(v, k):
-    return v + k

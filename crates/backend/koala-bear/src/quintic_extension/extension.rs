@@ -12,8 +12,6 @@ use field::{
     Algebra, BasedVectorSpace, ExtensionField, Field, Packable, PrimeCharacteristicRing, RawDataSerializable,
     TwoAdicField, field_to_array,
 };
-use itertools::Itertools;
-use num_bigint::BigUint;
 use rand::distr::StandardUniform;
 use rand::prelude::Distribution;
 use serde::{Deserialize, Serialize};
@@ -274,8 +272,8 @@ impl<F: QuinticExtendable> Field for QuinticExtensionField<F> {
     }
 
     #[inline]
-    fn order() -> BigUint {
-        F::order().pow(5)
+    fn bits() -> usize {
+        5 * F::bits()
     }
 }
 
@@ -299,6 +297,7 @@ where
                     (_, true) => format!("X^{i}"),
                     (_, false) => format!("{x} X^{i}"),
                 })
+                .collect::<Vec<_>>()
                 .join(" + ");
             write!(f, "{str}")
         }

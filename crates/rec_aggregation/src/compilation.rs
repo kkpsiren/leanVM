@@ -5,15 +5,24 @@ use lean_prover::{
     WHIR_SUBSEQUENT_FOLDING_FACTOR, default_whir_config,
 };
 use lean_vm::*;
-use std::collections::{BTreeMap, HashMap};
-use std::path::Path;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::OnceLock;
 use sub_protocols::{N_VARS_TO_SEND_GKR_COEFFS, min_stacked_n_vars, total_whir_statements};
 use tracing::instrument;
-use utils::Counter;
 use xmss::{LOG_LIFETIME, MESSAGE_LEN_FE, PUBLIC_PARAM_LEN_FE, RANDOMNESS_LEN_FE, TARGET_SUM, V, W, XMSS_DIGEST_LEN};
 
-use crate::{MERKLE_LEVELS_PER_CHUNK_FOR_SLOT, N_MERKLE_CHUNKS_FOR_SLOT, NUM_REPEATED_ONES, ZERO_VEC_LEN};
+use crate::bytecode_claims::bytecode_reduction_sumcheck_proof_size;
+use crate::single_message_aggregation::TWEAK_TABLE_SIZE_FE_PADDED;
+
+// preamble memory layout: see `build_preamble_memory` in utils.py:
+// [000.. (ZERO_VEC_LEN)][10000000 (fiat-shamir domain sep)][10000 (one in extension field)][111... (NUM_REPEATED_ONES)][tweak table]
+pub const ZERO_VEC_LEN: usize = 16;
+pub const NUM_REPEATED_ONES: usize = 32;
+pub const PREAMBLE_MEMORY_LEN: usize =
+    ZERO_VEC_LEN + DIGEST_LEN + DIMENSION + NUM_REPEATED_ONES + TWEAK_TABLE_SIZE_FE_PADDED;
+
+pub(crate) const MERKLE_LEVELS_PER_CHUNK_FOR_SLOT: usize = 4;
+pub(crate) const N_MERKLE_CHUNKS_FOR_SLOT: usize = LOG_LIFETIME / MERKLE_LEVELS_PER_CHUNK_FOR_SLOT;
 
 static BYTECODE: OnceLock<Bytecode> = OnceLock::new();
 
@@ -23,59 +32,79 @@ pub fn get_aggregation_bytecode() -> &'static Bytecode {
         .unwrap_or_else(|| panic!("call init_aggregation_bytecode() first"))
 }
 
+pub fn try_get_aggregation_bytecode() -> Option<&'static Bytecode> {
+    BYTECODE.get()
+}
+
 pub fn init_aggregation_bytecode() {
     BYTECODE.get_or_init(compile_main_program_self_referential);
 }
 
-fn compile_main_program(program_log_size: usize, bytecode_zero_eval: F) -> Bytecode {
-    let bytecode_point_n_vars = program_log_size + log2_ceil_usize(N_INSTRUCTION_COLUMNS);
-    let claim_data_size = (bytecode_point_n_vars + 1) * DIMENSION;
-    let claim_data_size_padded = claim_data_size.next_multiple_of(DIGEST_LEN);
-    // input_data_buf layout (part of the witness, "hinted" then hashed to a single digest that should match public input):
-    //   n_sigs(1) + pubkeys_hash(8) + message + merkle_chunks_for_slot
-    //   + tweaks_hash(8) + bytecode_claim_padded + bytecode_hash_domsep(8)
-    let input_data_size =
-        1 + DIGEST_LEN + MESSAGE_LEN_FE + N_MERKLE_CHUNKS_FOR_SLOT + DIGEST_LEN + claim_data_size_padded + DIGEST_LEN;
-    let input_data_size_padded = input_data_size.next_multiple_of(DIGEST_LEN);
-    let replacements = build_replacements(program_log_size, bytecode_zero_eval, input_data_size_padded);
+static EMBEDDED_ZK_DSL: include_dir::Dir<'_> = include_dir::include_dir!("$CARGO_MANIFEST_DIR/zkdsl_implem");
 
-    let filepath = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("main.py")
-        .to_str()
-        .unwrap()
-        .to_string();
-    compile_program_with_flags(&ProgramSource::Filepath(filepath), CompilationFlags { replacements })
+pub const MAX_RECURSIONS: usize = 16;
+pub const MAX_XMSS_AGGREGATED: usize = 1 << 15; // TODO increase (we would need a bigger minimal memory size, totally doable)
+pub const MAX_XMSS_DUPLICATES: usize = 1 << 15; // ...same
+
+pub(crate) const SINGLE_MESSAGE_FLAG: usize = 1;
+pub(crate) const MULTI_MESSAGE_FLAG: usize = 0;
+
+pub(crate) const BYTECODE_CLAIM_OFFSET: usize = DIGEST_LEN;
+/// Single-message component data: pubkeys_hash | message | merkle_chunks | tweaks_hash.
+pub(crate) const COMPONENT_DATA_SIZE: usize = DIGEST_LEN + MESSAGE_LEN_FE + N_MERKLE_CHUNKS_FOR_SLOT + DIGEST_LEN;
+
+pub(crate) fn bytecode_claim_size_padded(program_log_size: usize) -> usize {
+    let bytecode_point_n_vars = program_log_size + log2_ceil_usize(N_INSTRUCTION_COLUMNS);
+    ((bytecode_point_n_vars + 1) * DIMENSION).next_multiple_of(DIGEST_LEN)
+}
+
+pub(crate) fn initial_fiat_shamir_cap_offset(program_log_size: usize) -> usize {
+    BYTECODE_CLAIM_OFFSET + bytecode_claim_size_padded(program_log_size)
+}
+
+pub(crate) fn component_data_offset(program_log_size: usize) -> usize {
+    initial_fiat_shamir_cap_offset(program_log_size) + DIGEST_LEN
+}
+
+pub(crate) fn single_message_input_data_size_padded(program_log_size: usize) -> usize {
+    component_data_offset(program_log_size) + COMPONENT_DATA_SIZE
+}
+
+fn compile_main_program(program_log_size: usize, bytecode_zero_eval: F) -> Bytecode {
+    let replacements = build_replacements(program_log_size, bytecode_zero_eval);
+
+    let source = ProgramSource::Embedded {
+        entry: "main.py".to_string(),
+        dir: &EMBEDDED_ZK_DSL,
+    };
+    compile_program_with_flags(&source, CompilationFlags { replacements })
 }
 
 #[instrument(skip_all)]
 fn compile_main_program_self_referential() -> Bytecode {
     let mut log_size_guess = 19;
-    let bytecode_zero_eval = F::ONE;
-    loop {
+    let bytecode_zero_eval = F::ZERO;
+    for _ in 0..10 {
         let bytecode = compile_main_program(log_size_guess, bytecode_zero_eval);
-        assert_eq!(bytecode_zero_eval, bytecode.instructions_multilinear[0]);
         let actual_log_size = bytecode.log_size();
+        assert_eq!(bytecode.ending_pc, (1 << actual_log_size) - 1);
+        assert_eq!(bytecode_zero_eval, bytecode.instructions_multilinear[0]);
         if actual_log_size == log_size_guess {
             return bytecode;
-        } else {
-            println!(
-                "Wrong guess at `compile_main_program_self_referential`, should be {} instead of {}, recompiling...",
-                actual_log_size, log_size_guess
-            );
         }
+        eprintln!(
+            "Wrong guess at `compile_main_program_self_referential` (log_size {log_size_guess}->{actual_log_size})"
+        );
         log_size_guess = actual_log_size;
     }
+    panic!("`compile_main_program_self_referential` did not converge");
 }
 
-fn build_replacements(
-    inner_program_log_size: usize,
-    bytecode_zero_eval: F,
-    input_data_size_padded: usize,
-) -> BTreeMap<String, String> {
-    let mut replacements = BTreeMap::new();
-
-    let log_inner_bytecode = inner_program_log_size;
+fn build_replacements(log_inner_bytecode: usize, bytecode_zero_eval: F) -> BTreeMap<String, String> {
+    let ending_pc = (1 << log_inner_bytecode) - 1;
     let min_stacked = min_stacked_n_vars(log_inner_bytecode);
+
+    let mut replacements = BTreeMap::new();
 
     let mut all_potential_num_queries = vec![];
     let mut all_potential_query_grinding = vec![];
@@ -199,15 +228,11 @@ fn build_replacements(
     );
     replacements.insert(
         "MAX_BUS_WIDTH_PLACEHOLDER".to_string(),
-        max_bus_width_including_domainsep().to_string(),
+        (1 << LOG_MAX_BUS_WIDTH).to_string(),
     );
     replacements.insert(
         "LOGUP_MEMORY_DOMAINSEP_PLACEHOLDER".to_string(),
         LOGUP_MEMORY_DOMAINSEP.to_string(),
-    );
-    replacements.insert(
-        "LOGUP_PRECOMPILE_DOMAINSEP_PLACEHOLDER".to_string(),
-        LOGUP_PRECOMPILE_DOMAINSEP.to_string(),
     );
     replacements.insert(
         "LOGUP_BYTECODE_DOMAINSEP_PLACEHOLDER".to_string(),
@@ -217,66 +242,102 @@ fn build_replacements(
         "LOG_GUEST_BYTECODE_LEN_PLACEHOLDER".to_string(),
         log_inner_bytecode.to_string(),
     );
-    replacements.insert("COL_PC_PLACEHOLDER".to_string(), COL_PC.to_string());
-    replacements.insert(
-        "INPUT_DATA_SIZE_PADDED_PLACEHOLDER".to_string(),
-        input_data_size_padded.to_string(),
-    );
+    replacements.insert("COL_PC_PLACEHOLDER".to_string(), EXEC_COL_PC.to_string());
     let bytecode_point_n_vars = log_inner_bytecode + log2_ceil_usize(N_INSTRUCTION_COLUMNS);
     replacements.insert(
         "BYTECODE_SUMCHECK_PROOF_SIZE_PLACEHOLDER".to_string(),
         bytecode_reduction_sumcheck_proof_size(bytecode_point_n_vars).to_string(),
     );
 
-    let mut lookup_indexes_str = vec![];
-    let mut lookup_values_str = vec![];
+    let mut one_buses_domseps = vec![];
+    let mut one_buses_data_cols = vec![];
+    let mut one_buses_data_offsets = vec![];
+    let mut one_buses_new_cols = vec![];
     let mut num_cols_air = vec![];
-    let mut air_degrees = vec![];
     let mut n_air_columns = vec![];
-    let mut air_down_columns = vec![];
+    let mut n_air_shift_columns = vec![];
+    let mut n_air_constraints = vec![];
+    let mut one_buses_all_cols = vec![];
     for table in ALL_TABLES {
-        let this_look_f_indexes_str = table
-            .lookups()
-            .iter()
-            .map(|lookup_f| lookup_f.index.to_string())
-            .collect::<Vec<_>>();
-        lookup_indexes_str.push(format!("[{}]", this_look_f_indexes_str.join(", ")));
-        num_cols_air.push(table.n_columns().to_string());
-        let this_lookup_f_values_str = table
-            .lookups()
-            .iter()
-            .map(|lookup_f| {
-                format!(
-                    "[{}]",
-                    lookup_f
-                        .values
-                        .iter()
-                        .map(|v| v.to_string())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )
-            })
-            .collect::<Vec<_>>();
-        lookup_values_str.push(format!("[{}]", this_lookup_f_values_str.join(", ")));
-        air_degrees.push(table.degree_air().to_string());
-        n_air_columns.push(table.n_columns().to_string());
-        air_down_columns.push(format!(
+        let mut table_domseps = vec![];
+        let mut table_data_cols = vec![];
+        let mut table_data_offsets = vec![];
+        let mut table_new_cols = vec![];
+        let mut seen_cols: HashSet<ColIndex> = HashSet::new();
+        for bus in table.bus_interactions() {
+            if !matches!(bus.multiplicity, BusMultiplicity::One) {
+                continue;
+            }
+            let BusData::Constant(domsep) = bus.domainsep else {
+                panic!("Multiplicity::One bus domsep must be a constant");
+            };
+            let mut data_cols = vec![];
+            let mut data_offsets = vec![];
+            let mut new_cols = vec![];
+            for entry in &bus.data {
+                let (col, ofs) = match entry {
+                    BusData::Column(c) => (*c, 0),
+                    BusData::ColumnPlusConstant(c, o) => (*c, *o),
+                    BusData::Constant(_) => panic!("Multiplicity::One bus data must be a column"),
+                };
+                data_cols.push(col);
+                data_offsets.push(ofs);
+                if seen_cols.insert(col) {
+                    new_cols.push(col);
+                }
+            }
+            table_domseps.push(domsep.to_string());
+            table_data_cols.push(format!(
+                "[{}]",
+                data_cols.iter().map(usize::to_string).collect::<Vec<_>>().join(", ")
+            ));
+            table_data_offsets.push(format!(
+                "[{}]",
+                data_offsets.iter().map(usize::to_string).collect::<Vec<_>>().join(", ")
+            ));
+            table_new_cols.push(format!(
+                "[{}]",
+                new_cols.iter().map(usize::to_string).collect::<Vec<_>>().join(", ")
+            ));
+        }
+        one_buses_domseps.push(format!("[{}]", table_domseps.join(", ")));
+        one_buses_data_cols.push(format!("[{}]", table_data_cols.join(", ")));
+        one_buses_data_offsets.push(format!("[{}]", table_data_offsets.join(", ")));
+        one_buses_new_cols.push(format!("[{}]", table_new_cols.join(", ")));
+
+        let mut sorted_seen: Vec<ColIndex> = seen_cols.iter().copied().collect();
+        sorted_seen.sort();
+        one_buses_all_cols.push(format!(
             "[{}]",
-            table
-                .down_column_indexes()
-                .iter()
-                .map(|v| v.to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
+            sorted_seen.iter().map(usize::to_string).collect::<Vec<_>>().join(", ")
         ));
+
+        num_cols_air.push(table.n_columns().to_string());
+        n_air_columns.push(table.n_columns().to_string());
+        n_air_shift_columns.push(table.n_shift_columns().to_string());
+        n_air_constraints.push(table.n_constraints().to_string());
     }
+    let max_num_cols_air = ALL_TABLES.iter().map(|t| t.n_columns()).max().unwrap();
+    replacements.insert("MAX_NUM_COLS_AIR_PLACEHOLDER".to_string(), max_num_cols_air.to_string());
     replacements.insert(
-        "LOOKUPS_INDEXES_PLACEHOLDER".to_string(),
-        format!("[{}]", lookup_indexes_str.join(", ")),
+        "ONE_BUSES_ALL_COLS_PLACEHOLDER".to_string(),
+        format!("[{}]", one_buses_all_cols.join(", ")),
     );
     replacements.insert(
-        "LOOKUPS_VALUES_PLACEHOLDER".to_string(),
-        format!("[{}]", lookup_values_str.join(", ")),
+        "ONE_BUSES_DOMSEPS_PLACEHOLDER".to_string(),
+        format!("[{}]", one_buses_domseps.join(", ")),
+    );
+    replacements.insert(
+        "ONE_BUSES_DATA_COLS_PLACEHOLDER".to_string(),
+        format!("[{}]", one_buses_data_cols.join(", ")),
+    );
+    replacements.insert(
+        "ONE_BUSES_DATA_OFFSETS_PLACEHOLDER".to_string(),
+        format!("[{}]", one_buses_data_offsets.join(", ")),
+    );
+    replacements.insert(
+        "ONE_BUSES_NEW_COLS_PLACEHOLDER".to_string(),
+        format!("[{}]", one_buses_new_cols.join(", ")),
     );
     replacements.insert(
         "NUM_COLS_AIR_PLACEHOLDER".to_string(),
@@ -287,12 +348,22 @@ fn build_replacements(
         Table::execution().index().to_string(),
     );
     replacements.insert(
-        "MAX_NUM_AIR_CONSTRAINTS_PLACEHOLDER".to_string(),
-        max_air_constraints().to_string(),
+        "TOTAL_NUM_AIR_CONSTRAINTS_PLACEHOLDER".to_string(),
+        total_air_constraints().to_string(),
     );
     replacements.insert(
-        "AIR_DEGREES_PLACEHOLDER".to_string(),
-        format!("[{}]", air_degrees.join(", ")),
+        "N_AIR_CONSTRAINTS_PLACEHOLDER".to_string(),
+        format!("[{}]", n_air_constraints.join(", ")),
+    );
+    let mut air_alpha_offsets = Vec::with_capacity(n_air_constraints.len());
+    let mut cumul: usize = 0;
+    for s in &n_air_constraints {
+        air_alpha_offsets.push(cumul.to_string());
+        cumul += s.parse::<usize>().unwrap();
+    }
+    replacements.insert(
+        "AIR_ALPHA_OFFSETS_PLACEHOLDER".to_string(),
+        format!("[{}]", air_alpha_offsets.join(", ")),
     );
     replacements.insert(
         "MAX_AIR_FULL_DEGREE_PLACEHOLDER".to_string(),
@@ -303,8 +374,8 @@ fn build_replacements(
         format!("[{}]", n_air_columns.join(", ")),
     );
     replacements.insert(
-        "AIR_DOWN_COLUMNS_PLACEHOLDER".to_string(),
-        format!("[{}]", air_down_columns.join(", ")),
+        "N_AIR_SHIFT_COLUMNS_PLACEHOLDER".to_string(),
+        format!("[{}]", n_air_shift_columns.join(", ")),
     );
     replacements.insert(
         "EVALUATE_AIR_FUNCTIONS_PLACEHOLDER".to_string(),
@@ -315,15 +386,11 @@ fn build_replacements(
         N_INSTRUCTION_COLUMNS.to_string(),
     );
     replacements.insert(
-        "N_COMMITTED_EXEC_COLUMNS_PLACEHOLDER".to_string(),
-        N_RUNTIME_COLUMNS.to_string(),
-    );
-    replacements.insert(
         "TOTAL_WHIR_STATEMENTS_PLACEHOLDER".to_string(),
         total_whir_statements().to_string(),
     );
     replacements.insert("STARTING_PC_PLACEHOLDER".to_string(), STARTING_PC.to_string());
-    replacements.insert("ENDING_PC_PLACEHOLDER".to_string(), ENDING_PC.to_string());
+    replacements.insert("ENDING_PC_PLACEHOLDER".to_string(), ending_pc.to_string());
 
     // XMSS-specific replacements
     replacements.insert("V_PLACEHOLDER".to_string(), V.to_string());
@@ -342,6 +409,24 @@ fn build_replacements(
     );
     replacements.insert("XMSS_DIGEST_LEN_PLACEHOLDER".to_string(), XMSS_DIGEST_LEN.to_string());
 
+    replacements.insert(
+        "SINGLE_MESSAGE_FLAG_PLACEHOLDER".to_string(),
+        SINGLE_MESSAGE_FLAG.to_string(),
+    );
+    replacements.insert(
+        "MULTI_MESSAGE_FLAG_PLACEHOLDER".to_string(),
+        MULTI_MESSAGE_FLAG.to_string(),
+    );
+    replacements.insert(
+        "MAX_XMSS_AGGREGATED_PLACEHOLDER".to_string(),
+        MAX_XMSS_AGGREGATED.to_string(),
+    );
+    replacements.insert(
+        "MAX_XMSS_DUPLICATES_PLACEHOLDER".to_string(),
+        MAX_XMSS_DUPLICATES.to_string(),
+    );
+    replacements.insert("MAX_RECURSIONS_PLACEHOLDER".to_string(), MAX_RECURSIONS.to_string());
+
     // Bytecode zero eval
     replacements.insert(
         "BYTECODE_ZERO_EVAL_PLACEHOLDER".to_string(),
@@ -354,11 +439,6 @@ fn build_replacements(
     );
 
     replacements
-}
-
-pub(crate) fn bytecode_reduction_sumcheck_proof_size(bytecode_point_n_vars: usize) -> usize {
-    let per_round = (3 * DIMENSION).next_multiple_of(DIGEST_LEN);
-    DIGEST_LEN + bytecode_point_n_vars * per_round
 }
 
 fn all_air_evals_in_zk_dsl() -> String {
@@ -416,11 +496,13 @@ fn air_eval_in_zk_dsl<T: TableT>(table: T) -> String
 where
     T::ExtraData: Default,
 {
-    let (constraints, bus_flag, bus_data) = get_symbolic_constraints_and_bus_data_values::<F, _>(&table);
+    let (constraints, bus_multiplicity, bus_data) = get_symbolic_constraints_and_bus_data_values::<F, _>(&table);
+    // `bus_data`'s last entry is the domainsep (logup domain separation).
+    let (bus_domainsep, bus_real_data) = bus_data.split_last().unwrap();
     let mut ctx = AirCodegenCtx::new();
 
     let mut res = format!(
-        "def evaluate_air_constraints_table_{}({}, air_alpha_powers, bus_beta, logup_alphas_eq_poly):\n",
+        "def evaluate_air_constraints_table_{}({}, air_alpha_powers, logup_beta_eq_poly):\n",
         table.table().index(),
         AIR_INNER_VALUES_VAR
     );
@@ -433,29 +515,36 @@ where
     }
 
     // first: bus data
-    let flag = eval_air_constraint(bus_flag, None, &mut ctx, &mut res);
-    res += &format!("\n    buff = Array(DIM * {})", bus_data.len());
-    for (i, data) in bus_data.iter().enumerate() {
+    let multiplicity = eval_air_constraint(bus_multiplicity, None, &mut ctx, &mut res);
+    res += &format!("\n    buff = Array(DIM * {})", bus_real_data.len());
+    for (i, data) in bus_real_data.iter().enumerate() {
         let data_str = eval_air_constraint(*data, None, &mut ctx, &mut res);
         res += &format!("\n    copy_ef({}, buff + DIM * {})", data_str, i);
     }
-    // dot product: bus_res = sum(buff[i] * logup_alphas_eq_poly[i]) for i in 0..bus_data.len()
+    let domainsep_str = eval_air_constraint(*bus_domainsep, None, &mut ctx, &mut res);
+    // bus_res = sum(buff[i] * logup_beta_eq_poly[i]) + disc * logup_beta_eq_poly.last()
     res += "\n    bus_res_init = Array(DIM)";
     res += &format!(
-        "\n    dot_product_ee(buff, logup_alphas_eq_poly, bus_res_init, {})",
-        bus_data.len()
+        "\n    dot_product_ee(buff, logup_beta_eq_poly, bus_res_init, {})",
+        bus_real_data.len()
     );
     res += &format!(
-        "\n    bus_res: Mut = add_extension_ret(mul_base_extension_ret(LOGUP_PRECOMPILE_DOMAINSEP, logup_alphas_eq_poly + {} * DIM), bus_res_init)",
-        max_bus_width_including_domainsep().next_power_of_two() - 1
+        "\n    bus_res: Mut = add_extension_ret(mul_extension_ret({}, logup_beta_eq_poly + {} * DIM), bus_res_init)",
+        domainsep_str,
+        (1 << LOG_MAX_BUS_WIDTH) - 1
     );
-    res += "\n    bus_res = mul_extension_ret(bus_res, bus_beta)";
-    res += &format!("\n    sum: Mut = add_extension_ret(bus_res, {})", flag);
+    // `air_alpha_powers` is the slice [alpha^offset, alpha^{offset+1}, …] for this table.
+    // Multiplicity → slot 0, bus fingerprint → slot 1, remaining AIR constraints → slot 2+.
+    res += "\n    bus_res = mul_extension_ret(bus_res, air_alpha_powers + DIM)";
+    res += &format!(
+        "\n    weighted_multiplicity = mul_extension_ret(air_alpha_powers, {})",
+        multiplicity
+    );
+    res += "\n    sum: Mut = add_extension_ret(bus_res, weighted_multiplicity)";
 
-    // Batch constraint weighting: single dot_product_ee(alpha_powers, constraints_buf, result, n_constraints)
     res += "\n    weighted_constraints = Array(DIM)";
     res += &format!(
-        "\n    dot_product_ee(air_alpha_powers + DIM, constraints_buf, weighted_constraints, {})",
+        "\n    dot_product_ee(air_alpha_powers + 2 * DIM, constraints_buf, weighted_constraints, {})",
         n_constraints
     );
     res += "\n    sum = add_extension_ret(sum, weighted_constraints)";
@@ -481,7 +570,7 @@ fn eval_air_constraint(
                 ctx.expr_cache.insert(idx, v.clone());
                 return v;
             } else {
-                let node = get_node::<F>(idx);
+                let node = unsafe { get_node::<F>(idx) };
                 let v = match node.op {
                     SymbolicOperation::Neg => {
                         let a = eval_air_constraint(node.lhs, None, ctx, res);
@@ -518,7 +607,7 @@ fn try_emit_dot_product_be(idx: u32, dest: Option<&str>, ctx: &mut AirCodegenCtx
                 if op_idx != idx && ctx.expr_cache.contains_key(&op_idx) {
                     return None;
                 }
-                let node = get_node::<F>(op_idx);
+                let node = unsafe { get_node::<F>(op_idx) };
                 if node.op != SymbolicOperation::Add {
                     return None;
                 }
@@ -526,7 +615,7 @@ fn try_emit_dot_product_be(idx: u32, dest: Option<&str>, ctx: &mut AirCodegenCtx
                     SymbolicExpression::Operation(i) => i,
                     _ => return None,
                 };
-                let mul = get_node::<F>(mul_idx);
+                let mul = unsafe { get_node::<F>(mul_idx) };
                 if mul.op != SymbolicOperation::Mul {
                     return None;
                 }

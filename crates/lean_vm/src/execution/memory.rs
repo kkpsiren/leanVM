@@ -11,6 +11,13 @@ pub trait MemoryAccess {
         (0..len).map(|i| self.get(start + i)).collect()
     }
 
+    fn get_slice_into(&self, start: usize, dest: &mut [F]) -> Result<(), RunnerError> {
+        for (i, d) in dest.iter_mut().enumerate() {
+            *d = self.get(start + i)?;
+        }
+        Ok(())
+    }
+
     fn set_slice(&mut self, start: usize, values: &[F]) -> Result<(), RunnerError> {
         for (i, v) in values.iter().enumerate() {
             self.set(start + i, *v)?;
@@ -63,7 +70,7 @@ pub trait MemoryAccess {
 }
 
 #[derive(Debug, Clone, Default)]
-pub struct Memory(pub Vec<Option<F>>);
+pub struct Memory(pub ArenaVec<Option<F>>);
 
 impl MemoryAccess for Memory {
     fn get(&self, index: usize) -> Result<F, RunnerError> {
@@ -77,7 +84,7 @@ impl MemoryAccess for Memory {
 
 impl Memory {
     pub fn new(public_memory: Vec<F>) -> Self {
-        Self(public_memory.into_par_iter().map(Some).collect())
+        Self(public_memory.into_iter().map(Some).collect::<ArenaVec<_>>())
     }
 
     pub fn get(&self, index: usize) -> Result<F, RunnerError> {

@@ -2,7 +2,7 @@
 
 use backend::*;
 
-use crate::{EF, F, FileId, FunctionName, Hint, SourceLocation};
+use crate::{DIMENSION, F, FileId, FunctionName, Hint, N_INSTRUCTION_COLUMNS, SourceLocation};
 
 use super::Instruction;
 use std::collections::BTreeMap;
@@ -14,12 +14,15 @@ pub struct CodeEntry {
     pub instruction: Instruction,
 }
 
+/// `instructions_multilinear`, `hash`, and `ending_pc` must be checked at initialization to match `code`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Bytecode {
-    pub code: Vec<CodeEntry>,
+    pub unpadded_size: usize,
+    pub code: Vec<CodeEntry>, // assumed to be well-formed
+    pub hint_name_to_index: BTreeMap<String, usize>,
     pub instructions_multilinear: Vec<F>,
-    pub instructions_multilinear_packed: Vec<EFPacking<EF>>, // embedded in the extension field(bad, TODO)
     pub starting_frame_memory: usize,
+    pub ending_pc: usize, // Must equal `code.len() - 1`.
     pub hash: [F; DIGEST_ELEMS],
     // debug
     pub function_locations: BTreeMap<SourceLocation, FunctionName>,
@@ -40,6 +43,21 @@ impl Bytecode {
 
     pub fn log_size(&self) -> usize {
         log2_ceil_usize(self.size())
+    }
+
+    pub fn hint_slot(&self, name: &str) -> usize {
+        *self
+            .hint_name_to_index
+            .get(name)
+            .unwrap_or_else(|| panic!("hint '{name}' is not declared by the program"))
+    }
+
+    pub fn cumulated_n_vars(&self) -> usize {
+        self.log_size() + log2_ceil_usize(N_INSTRUCTION_COLUMNS)
+    }
+
+    pub fn bytecode_claim_size(&self) -> usize {
+        (self.cumulated_n_vars() + 1) * DIMENSION
     }
 }
 

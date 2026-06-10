@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-libc = "0.2"
+libc.workspace = true
 
 [lints]
 workspace = true

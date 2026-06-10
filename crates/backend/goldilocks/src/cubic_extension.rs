@@ -17,8 +17,6 @@ use field::{
     Algebra, BasedVectorSpace, ExtensionField, Field, Packable, PrimeCharacteristicRing, RawDataSerializable,
     TwoAdicField, field_to_array,
 };
-use itertools::Itertools;
-use num_bigint::BigUint;
 use rand::distr::{Distribution, StandardUniform};
 use rand::prelude::Rng;
 use serde::{Deserialize, Serialize};
@@ -269,8 +267,8 @@ impl Field for CubicExtensionFieldGL {
     }
 
     #[inline]
-    fn order() -> BigUint {
-        Goldilocks::order().pow(3)
+    fn bits() -> usize {
+        3 * Goldilocks::bits()
     }
 }
 
@@ -291,6 +289,7 @@ impl Display for CubicExtensionFieldGL {
                     (_, true) => format!("X^{i}"),
                     (_, false) => format!("{x} X^{i}"),
                 })
+                .collect::<Vec<_>>()
                 .join(" + ");
             write!(f, "{str}")
         }
@@ -476,10 +475,15 @@ impl TwoAdicField for CubicExtensionFieldGL {
 ///
 /// Given `a = a_0 + a_1 X + a_2 X^2` and `b = b_0 + b_1 X + b_2 X^2`, computes the
 /// product reduced by `X^3 - X - 1` (so `X^3 = X + 1`, `X^4 = X^2 + X`).
+///
+/// Uses 3-term Karatsuba: 6 multiplications instead of the 9 of schoolbook.
+/// On Goldilocks each multiply carries a 128->64-bit reduction (the dominant
+/// cost), so trading 3 of them for cheap field adds/subs is a net win — this
+/// is the hottest field op in the prover (sumcheck + poseidon AIR eval).
 #[inline]
 pub fn cubic_mul_generic<R>(a: &[R; 3], b: &[R; 3], res: &mut [R; 3])
 where
-    R: Copy + core::ops::Mul<Output = R> + core::ops::Add<Output = R>,
+    R: Copy + core::ops::Mul<Output = R> + core::ops::Add<Output = R> + core::ops::Sub<Output = R>,
 {
     let a0 = a[0];
     let a1 = a[1];
@@ -488,16 +492,23 @@ where
     let b1 = b[1];
     let b2 = b[2];
 
-    let a1b2 = a1 * b2;
-    let a2b1 = a2 * b1;
-    let a2b2 = a2 * b2;
+    // Karatsuba products for the degree-4 polynomial product A(X)*B(X).
+    let m0 = a0 * b0;
+    let m1 = a1 * b1;
+    let m2 = a2 * b2;
+    let m3 = (a0 + a1) * (b0 + b1);
+    let m4 = (a0 + a2) * (b0 + b2);
+    let m5 = (a1 + a2) * (b1 + b2);
 
-    // constant: a0 b0 + a1 b2 + a2 b1
-    res[0] = a0 * b0 + a1b2 + a2b1;
-    // linear: a0 b1 + a1 b0 + a1 b2 + a2 b1 + a2 b2
-    res[1] = a0 * b1 + a1 * b0 + a1b2 + a2b1 + a2b2;
-    // quadratic: a0 b2 + a1 b1 + a2 b0 + a2 b2
-    res[2] = a0 * b2 + a1 * b1 + a2 * b0 + a2b2;
+    // Coefficients of A*B = c0 + c1 X + c2 X^2 + c3 X^3 + c4 X^4:
+    //   c0 = m0,  c1 = m3-m0-m1,  c2 = m4-m0-m2+m1,  c3 = m5-m1-m2,  c4 = m2.
+    // Reduce by X^3 = X+1, X^4 = X^2+X:
+    //   res0 = c0 + c3      = m0 + m5 - m1 - m2
+    //   res1 = c1 + c3 + c4 = m3 + m5 - m0 - m1 - m1
+    //   res2 = c2 + c4      = m4 + m1 - m0
+    res[0] = m0 + m5 - m1 - m2;
+    res[1] = m3 + m5 - m0 - m1 - m1;
+    res[2] = m4 + m1 - m0;
 }
 
 /// Square a cubic extension element (same reduction rule as `cubic_mul_generic`).
@@ -616,6 +627,54 @@ mod tests {
             let a_frob = a.frobenius();
             let a_pth = a.exp_u64(Goldilocks::ORDER_U64);
             assert_eq!(a_frob, a_pth);
+        }
+    }
+
+    // Reference schoolbook cubic multiply (9 muls), reduced by `X^3 = X+1`.
+    fn cubic_mul_schoolbook(a: &[Goldilocks; 3], b: &[Goldilocks; 3]) -> [Goldilocks; 3] {
+        let [a0, a1, a2] = *a;
+        let [b0, b1, b2] = *b;
+        let a1b2 = a1 * b2;
+        let a2b1 = a2 * b1;
+        let a2b2 = a2 * b2;
+        [
+            a0 * b0 + a1b2 + a2b1,
+            a0 * b1 + a1 * b0 + a1b2 + a2b1 + a2b2,
+            a0 * b2 + a1 * b1 + a2 * b0 + a2b2,
+        ]
+    }
+
+    #[test]
+    fn karatsuba_matches_schoolbook_scalar() {
+        let mut rng = StdRng::seed_from_u64(7);
+        for _ in 0..10_000 {
+            let a: [Goldilocks; 3] = [rng.random(), rng.random(), rng.random()];
+            let b: [Goldilocks; 3] = [rng.random(), rng.random(), rng.random()];
+            let mut got = [Goldilocks::ZERO; 3];
+            cubic_mul_generic(&a, &b, &mut got);
+            assert_eq!(got, cubic_mul_schoolbook(&a, &b));
+        }
+    }
+
+    #[test]
+    fn karatsuba_matches_schoolbook_packed() {
+        use field::{Field, PackedValue};
+        type P = <Goldilocks as Field>::Packing;
+        let mut rng = StdRng::seed_from_u64(11);
+        for _ in 0..2_000 {
+            let a: [P; 3] = core::array::from_fn(|_| P::from_fn(|_| rng.random()));
+            let b: [P; 3] = core::array::from_fn(|_| P::from_fn(|_| rng.random()));
+            let mut got = [P::ZERO; 3];
+            cubic_mul_generic(&a, &b, &mut got);
+            // Compare lane-by-lane against the scalar schoolbook reference.
+            for lane in 0..P::WIDTH {
+                let a_s = [a[0].as_slice()[lane], a[1].as_slice()[lane], a[2].as_slice()[lane]];
+                let b_s = [b[0].as_slice()[lane], b[1].as_slice()[lane], b[2].as_slice()[lane]];
+                let want = cubic_mul_schoolbook(&a_s, &b_s);
+                for i in 0..3 {
+                    assert_eq!(got[i].as_slice()[lane], want[i], "lane {lane} coord {i}");
+                }
+            }
         }
     }
 }

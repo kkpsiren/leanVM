@@ -1,14 +1,15 @@
 use crate::Table;
 
 /// Domain separation in logup
-pub const LOGUP_MEMORY_DOMAINSEP: usize = 0;
-pub const LOGUP_PRECOMPILE_DOMAINSEP: usize = 1;
+pub const LOGUP_MEMORY_DOMAINSEP: usize = 1;
 pub const LOGUP_BYTECODE_DOMAINSEP: usize = 2;
 
 /// Large field = extension field of degree DIMENSION over Goldilocks
 pub const DIMENSION: usize = 3;
 
 pub const DIGEST_LEN: usize = 4;
+
+pub const PUBLIC_INPUT_LEN: usize = DIGEST_LEN;
 
 pub const MIN_WHIR_LOG_INV_RATE: usize = 1;
 pub const MAX_WHIR_LOG_INV_RATE: usize = 4;
@@ -18,13 +19,17 @@ pub const MIN_LOG_MEMORY_SIZE: usize = 16;
 pub const MAX_LOG_MEMORY_SIZE: usize = 26;
 
 pub const MIN_BYTECODE_LOG_SIZE: usize = 8;
+pub const MAX_BYTECODE_LOG_SIZE: usize = 22;
 
 /// Minimum and maximum number of rows per table (as powers of two), both inclusive
 pub const MIN_LOG_N_ROWS_PER_TABLE: usize = 8; // Zero padding will be added to each at least, if this minimum is not reached, (ensuring AIR / GKR work fine, with SIMD, without too much edge cases). Long term, we should find a more elegant solution.
 pub const MAX_LOG_N_ROWS_PER_TABLE: [(Table, usize); 3] = [
     (Table::execution(), 25),
     (Table::extension_op(), 21),
-    (Table::poseidon8(), 21),
+    // 20 (not 21): the `poseidon8_permute` variant widened the table by 5 columns
+    // (`flag_permute` + 4 `outputs_right`), so 2^21 rows would exceed the WHIR
+    // commitment surface cap (see `ensure_not_too_big_commitment_surface`).
+    (Table::poseidon8(), 20),
 ];
 
 pub fn max_log_n_rows_per_table(table: &Table) -> usize {
@@ -36,10 +41,7 @@ pub fn max_log_n_rows_per_table(table: &Table) -> usize {
 }
 
 /// Starting program counter
-pub const STARTING_PC: usize = 1;
-
-/// Ending program counter (the final block is a looping block of 1 instruction)
-pub const ENDING_PC: usize = 0;
+pub const STARTING_PC: usize = 0;
 
 #[cfg(test)]
 mod tests {
@@ -51,7 +53,7 @@ mod tests {
     #[test]
     fn ensure_no_overflow_in_logup() {
         fn memory_lookups_count<T: TableT>(t: &T) -> usize {
-            t.lookups().iter().map(|l| l.values.len()).sum::<usize>()
+            t.bus_interactions().iter().filter(|bus| bus.is_memory_lookup()).count()
         }
         // memory lookup
         let mut max_memory_logup_sum: u64 = 0;

@@ -16,7 +16,6 @@ use field::{
     Algebra, BasedVectorSpace, Field, PackedField, PackedFieldExtension, PackedValue, Powers, PrimeCharacteristicRing,
     field_to_array,
 };
-use itertools::Itertools;
 use rand::distr::{Distribution, StandardUniform};
 use serde::{Deserialize, Serialize};
 use utils::{flatten_to_base, reconstitute_from_base};
@@ -184,7 +183,7 @@ impl PackedFieldExtension<Goldilocks, CubicExtensionFieldGL>
     #[inline]
     fn packed_ext_powers(base: CubicExtensionFieldGL) -> Powers<Self> {
         let width = <Goldilocks as Field>::Packing::WIDTH;
-        let powers = base.powers().take(width + 1).collect_vec();
+        let powers = base.powers().take(width + 1).collect();
         let current = Self::from_ext_slice(&powers[..width]);
         let multiplier = powers[width].into();
 

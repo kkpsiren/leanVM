@@ -1,14 +1,49 @@
+use backend::ansi as s;
 use backend::*;
 use lean_vm::*;
 use serde::{Deserialize, Serialize};
 use std::io::{self, Write};
 use std::time::Instant;
-use utils::ansi as s;
 use xmss::signers_cache::{BENCHMARK_SLOT, get_benchmark_signatures, message_for_benchmark};
 use xmss::{XmssPublicKey, XmssSignature};
 
 use crate::compilation::{get_aggregation_bytecode, init_aggregation_bytecode};
-use crate::{AggregatedXMSS, AggregationTopology, count_signers, xmss_aggregate};
+use crate::single_message_aggregation::{
+    SingleMessageAggregateSignature, aggregate_single_message_signatures, verify_single_message_aggregate,
+};
+
+#[derive(Debug, Clone)]
+pub struct AggregationTopology {
+    pub raw_xmss: usize,
+    pub children: Vec<AggregationTopology>,
+    pub log_inv_rate: usize,
+    pub overlap: usize, // Ignored for leaves.
+}
+
+pub fn biggest_leaf(topology: &AggregationTopology) -> Option<AggregationTopology> {
+    fn visit(t: &AggregationTopology, best: &mut Option<(usize, usize)>) {
+        if t.raw_xmss > 0 && best.is_none_or(|(n, _)| t.raw_xmss > n) {
+            *best = Some((t.raw_xmss, t.log_inv_rate));
+        }
+        for c in &t.children {
+            visit(c, best);
+        }
+    }
+    let mut best = None;
+    visit(topology, &mut best);
+    best.map(|(raw_xmss, log_inv_rate)| AggregationTopology {
+        raw_xmss,
+        children: vec![],
+        log_inv_rate,
+        overlap: 0,
+    })
+}
+
+pub(crate) fn count_signers(topology: &AggregationTopology) -> usize {
+    let child_count: usize = topology.children.iter().map(count_signers).sum();
+    let n_overlaps = topology.children.len().saturating_sub(1);
+    topology.raw_xmss + child_count - topology.overlap * n_overlaps
+}
 
 fn count_nodes(topology: &AggregationTopology) -> usize {
     1 + topology.children.iter().map(count_nodes).sum::<usize>()
@@ -17,12 +52,66 @@ fn count_nodes(topology: &AggregationTopology) -> usize {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct NodeStats {
     pub time_secs: f64,
+    /// 95% confidence interval half-width on `time_secs`. Zero when only one sample was taken.
+    #[serde(default)]
+    pub time_ci_secs: f64,
+    #[serde(default = "default_samples")]
+    pub samples: usize,
     pub proof_kib: usize,
     pub cycles: usize,
     pub memory: usize,
     pub poseidons: usize,
     pub dots: usize,
     pub n_xmss: Option<usize>,
+}
+
+fn default_samples() -> usize {
+    1
+}
+
+fn t_critical_95(df: usize) -> f64 {
+    if df == 0 {
+        return f64::INFINITY;
+    }
+    let z = 1.959964_f64;
+    let df = df as f64;
+    z + (z.powi(3) + z) / (4.0 * df) + (5.0 * z.powi(5) + 16.0 * z.powi(3) + 3.0 * z) / (96.0 * df.powi(2))
+}
+
+/// Returns (mean, 95% CI half-width). Half-width is 0 when n < 2.
+fn mean_and_ci(samples: &[f64]) -> (f64, f64) {
+    let n = samples.len();
+    let mean = samples.iter().sum::<f64>() / n as f64;
+    if n < 2 {
+        return (mean, 0.0);
+    }
+    let variance = samples.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (n - 1) as f64;
+    let std_err = variance.sqrt() / (n as f64).sqrt();
+    (mean, t_critical_95(n - 1) * std_err)
+}
+
+const TIME_COL_WIDTH: usize = 20;
+const CI_COL_WIDTH: usize = 8;
+
+fn fmt_throughput_col(n: usize, st: &NodeStats) -> String {
+    let throughput = n as f64 / st.time_secs;
+    format!(
+        "{:>w$}",
+        format!("{:.0} XMSS/s - {:.3}s", throughput, st.time_secs),
+        w = TIME_COL_WIDTH
+    )
+}
+
+fn fmt_time_col(st: &NodeStats) -> String {
+    format!("{:>w$}", format!("{:.3}s", st.time_secs), w = TIME_COL_WIDTH)
+}
+
+fn fmt_ci_col(st: &NodeStats) -> String {
+    if st.samples > 1 {
+        format!("± {:.1}%", 100.0 * st.time_ci_secs / st.time_secs)
+    } else {
+        String::new()
+    }
 }
 
 /// `path` is the topology-relative path from the root (`[]` = root)
@@ -51,10 +140,11 @@ struct LiveTree {
     statuses: Vec<Option<NodeStats>>,
     n_nodes: usize,
     silent: bool,
+    show_ci_col: bool,
 }
 
 impl LiveTree {
-    fn new(descs: Vec<String>, plain_lens: Vec<usize>, silent: bool) -> Self {
+    fn new(descs: Vec<String>, plain_lens: Vec<usize>, silent: bool, show_ci_col: bool) -> Self {
         let max_plain_len = plain_lens.iter().copied().max().unwrap_or(0);
         let n_nodes = descs.len();
         Self {
@@ -64,6 +154,23 @@ impl LiveTree {
             statuses: vec![None; n_nodes],
             n_nodes,
             silent,
+            show_ci_col,
+        }
+    }
+
+    fn ci_header_fragment(&self) -> String {
+        if self.show_ci_col {
+            format!("  {:>w$}", "± %", w = CI_COL_WIDTH)
+        } else {
+            String::new()
+        }
+    }
+
+    fn ci_cell(&self, st: &NodeStats) -> String {
+        if self.show_ci_col {
+            format!("  {}{:>w$}{}", s::PUR, fmt_ci_col(st), s::R, w = CI_COL_WIDTH)
+        } else {
+            String::new()
         }
     }
 
@@ -71,16 +178,18 @@ impl LiveTree {
         let pad = self.max_plain_len + 6; // desc + dots + " ▸ "
         let spacer = " ".repeat(pad);
         format!(
-            "{}{}{:>20}  {:>8}  {:>10}  {:>10}  {:>10}  {:>10}{}",
+            "{}{}{:>w$}  {:>8}{}  {:>10}  {:>10}  {:>10}  {:>10}{}",
             s::D,
             spacer,
             "time",
             "size",
+            self.ci_header_fragment(),
             "cycles",
             "memory",
             "poseidons",
             "extension-ops",
             s::R,
+            w = TIME_COL_WIDTH,
         )
     }
 
@@ -91,20 +200,13 @@ impl LiveTree {
         match &self.statuses[i] {
             None => desc.to_string(),
             Some(st) => {
-                // Both branches produce exactly 20 visible characters.
                 let time_col_text = match st.n_xmss {
-                    Some(n) => {
-                        let throughput = n as f64 / st.time_secs;
-                        // "1200 XMSS/s - 0.781s" = 20 chars (3-digit throughput
-                        // pads to 4 chars: " 766 XMSS/s - 0.781s")
-                        format!("{:>4.0} XMSS/s - {:>5.3}s", throughput, st.time_secs)
-                    }
-                    // "              1.815s" = 20 chars (right-aligned)
-                    None => format!("{:>20}", format!("{:.3}s", st.time_secs)),
+                    Some(n) => fmt_throughput_col(n, st),
+                    None => fmt_time_col(st),
                 };
                 let time_col = format!("{}{}{}{}", s::ORG, s::B, time_col_text, s::R);
                 format!(
-                    "{} {} {}▸{} {}  {}{}{:>4} KiB{}  {}{:>10}{}  {}{:>10}{}  {}{:>10}{}  {}{:>10}{}",
+                    "{} {} {}▸{} {}  {}{}{:>4} KiB{}{}  {}{:>10}{}  {}{:>10}{}  {}{:>10}{}  {}{:>10}{}",
                     desc,
                     dots,
                     s::DRK,
@@ -114,6 +216,7 @@ impl LiveTree {
                     s::B,
                     st.proof_kib,
                     s::R,
+                    self.ci_cell(st),
                     s::WHT,
                     pretty_integer(st.cycles),
                     s::R,
@@ -249,20 +352,20 @@ fn build_aggregation(
     signatures: &[XmssSignature],
     tracing: bool,
     is_root: bool,
-) -> (Vec<XmssPublicKey>, AggregatedXMSS) {
+    repeat: usize,
+) -> SingleMessageAggregateSignature {
     let raw_count = topology.raw_xmss;
     let raw_xmss: Vec<(XmssPublicKey, XmssSignature)> = (0..raw_count)
         .map(|i| (pub_keys[i].clone(), signatures[i].clone()))
         .collect();
 
-    let mut child_pub_keys_list: Vec<Vec<XmssPublicKey>> = vec![];
-    let mut child_aggs: Vec<AggregatedXMSS> = vec![];
+    let mut children: Vec<SingleMessageAggregateSignature> = vec![];
     let mut child_start = raw_count;
     let mut child_display_index = display_index;
     for (child_idx, child) in topology.children.iter().enumerate() {
         let child_count = count_signers(child);
         path.push(child_idx);
-        let (child_pks, child_agg) = build_aggregation(
+        let child_sig = build_aggregation(
             child,
             child_display_index,
             nodes,
@@ -272,10 +375,10 @@ fn build_aggregation(
             &signatures[child_start..child_start + child_count],
             tracing,
             false,
+            repeat,
         );
         path.pop();
-        child_pub_keys_list.push(child_pks);
-        child_aggs.push(child_agg);
+        children.push(child_sig);
         child_display_index += count_nodes(child);
         child_start += child_count;
         if child_idx < topology.children.len() - 1 {
@@ -283,65 +386,90 @@ fn build_aggregation(
         }
     }
 
-    let children: Vec<(&[XmssPublicKey], AggregatedXMSS)> = child_pub_keys_list
-        .iter()
-        .zip(child_aggs)
-        .map(|(pks, agg)| (pks.as_slice(), agg))
-        .collect();
-
-    let time = Instant::now();
-
     if tracing && is_root {
-        utils::init_tracing();
+        init_tracing();
     }
 
-    #[cfg(not(feature = "standard-alloc"))]
-    zk_alloc::begin_phase();
-
-    let (global_pub_keys, result) = xmss_aggregate(
-        &children,
-        raw_xmss,
-        &message_for_benchmark(),
-        BENCHMARK_SLOT,
-        topology.log_inv_rate,
-    );
-
-    // Clone the outputs out of the arena before the next phase resets its slabs.
-    #[cfg(not(feature = "standard-alloc"))]
-    let (global_pub_keys, result) = {
-        zk_alloc::end_phase();
-        (global_pub_keys.clone(), result.clone())
-    };
-
-    let elapsed = time.elapsed();
-    let meta = result.metadata.as_ref().unwrap();
-    let proof_kib = result.proof.proof_size_fe() * F::bits() / (8 * 1024);
+    assert!(repeat > 0);
     let is_leaf = topology.children.is_empty();
+    let n_xmss_opt = is_leaf.then_some(topology.raw_xmss);
+    let mut times = Vec::with_capacity(repeat);
+    let mut last_result: Option<SingleMessageAggregateSignature> = None;
+    let own_display_index = display_index + count_nodes(topology) - 1;
+    for _ in 0..repeat {
+        let time = Instant::now();
+        let result = aggregate_single_message_signatures(
+            &children,
+            raw_xmss.clone(),
+            message_for_benchmark(),
+            BENCHMARK_SLOT,
+            topology.log_inv_rate,
+        )
+        .unwrap();
+        let elapsed = time.elapsed();
+
+        times.push(elapsed.as_secs_f64());
+        last_result = Some(result);
+
+        if !tracing && repeat > 1 {
+            let r = last_result.as_ref().unwrap();
+            let meta = r.proof.metadata.as_ref().unwrap();
+            let proof_kib = r.proof.proof.proof_size_fe() * F::bits() / (8 * 1024);
+            let (mean, ci) = mean_and_ci(&times);
+            live_tree.update_node(
+                own_display_index,
+                &NodeStats {
+                    time_secs: mean,
+                    time_ci_secs: ci,
+                    samples: times.len(),
+                    proof_kib,
+                    cycles: meta.cycles,
+                    memory: meta.memory,
+                    poseidons: meta.n_poseidons,
+                    dots: meta.n_extension_ops,
+                    n_xmss: n_xmss_opt,
+                },
+            );
+        }
+    }
+
+    let result = last_result.unwrap();
+    let (mean_time, time_ci) = mean_and_ci(&times);
+    let meta = result.proof.metadata.as_ref().unwrap();
+    let proof_kib = result.proof.proof.proof_size_fe() * F::bits() / (8 * 1024);
 
     if tracing {
         println!("{}", meta.display());
         if is_leaf {
             println!(
-                "{} XMSS/s",
-                (topology.raw_xmss as f64 / elapsed.as_secs_f64()).round() as usize
+                "{} XMSS/s (avg over {} run{})",
+                (topology.raw_xmss as f64 / mean_time).round() as usize,
+                repeat,
+                if repeat == 1 { "" } else { "s" }
             );
         } else {
-            println!("{:.3}s the final aggregation step", elapsed.as_secs_f64());
+            println!(
+                "{:.3}s the final aggregation step (avg over {} run{})",
+                mean_time,
+                repeat,
+                if repeat == 1 { "" } else { "s" }
+            );
         }
         println!("Proof size: {} KiB", proof_kib);
     }
 
     let stats = NodeStats {
-        time_secs: elapsed.as_secs_f64(),
+        time_secs: mean_time,
+        time_ci_secs: time_ci,
+        samples: repeat,
         proof_kib,
         cycles: meta.cycles,
         memory: meta.memory,
         poseidons: meta.n_poseidons,
         dots: meta.n_extension_ops,
-        n_xmss: if is_leaf { Some(topology.raw_xmss) } else { None },
+        n_xmss: n_xmss_opt,
     };
     if !tracing {
-        let own_display_index = display_index + count_nodes(topology) - 1;
         live_tree.update_node(own_display_index, &stats);
     }
     nodes.push(NodeReport {
@@ -349,10 +477,15 @@ fn build_aggregation(
         stats,
     });
 
-    (global_pub_keys, result)
+    result
 }
 
-pub fn run_aggregation_benchmark(topology: &AggregationTopology, tracing: bool, silent: bool) -> BenchmarkReport {
+pub fn run_aggregation_benchmark(
+    topology: &AggregationTopology,
+    tracing: bool,
+    silent: bool,
+    repeat: usize,
+) -> BenchmarkReport {
     // Tell macOS this is a user-initiated, latency-critical computation and
     // should not be throttled / App-Napped.
     #[cfg(target_os = "macos")]
@@ -371,7 +504,7 @@ pub fn run_aggregation_benchmark(topology: &AggregationTopology, tracing: bool, 
     if !silent {
         println!(
             "Aggregation program: {} instructions\n",
-            pretty_integer(get_aggregation_bytecode().code.len())
+            pretty_integer(get_aggregation_bytecode().unpadded_size)
         );
     }
 
@@ -379,7 +512,7 @@ pub fn run_aggregation_benchmark(topology: &AggregationTopology, tracing: bool, 
     let mut descs = vec![];
     let mut plain_lens = vec![];
     build_tree_descs(topology, "  ", "  ", "  ", "  ", &mut descs, &mut plain_lens);
-    let mut display = LiveTree::new(descs, plain_lens, silent);
+    let mut display = LiveTree::new(descs, plain_lens, silent, repeat > 1);
 
     if !tracing {
         display.print_initial();
@@ -387,7 +520,7 @@ pub fn run_aggregation_benchmark(topology: &AggregationTopology, tracing: bool, 
 
     let mut nodes: Vec<NodeReport> = Vec::new();
     let mut path: Vec<usize> = Vec::new();
-    let (global_pub_keys, aggregated_sigs) = build_aggregation(
+    let aggregated = build_aggregation(
         topology,
         0,
         &mut nodes,
@@ -397,16 +530,10 @@ pub fn run_aggregation_benchmark(topology: &AggregationTopology, tracing: bool, 
         &signatures,
         tracing,
         true,
+        repeat,
     );
 
-    // Verify root proof
-    crate::xmss_verify_aggregation(
-        &global_pub_keys,
-        &aggregated_sigs,
-        &message_for_benchmark(),
-        BENCHMARK_SLOT,
-    )
-    .unwrap();
+    verify_single_message_aggregate(&aggregated).expect("root single-message proof failed to verify");
 
     BenchmarkReport { nodes }
 }
@@ -465,7 +592,7 @@ fn test_aggregation_throughput_per_num_xmss() {
             log_inv_rate,
             overlap: 0,
         };
-        let time = run_aggregation_benchmark(&topology, false, true).total_time_secs();
+        let time = run_aggregation_benchmark(&topology, false, true, 1).total_time_secs();
         num_xmss_and_time.push((num_xmss, time));
         println!(
             "{} XMSS -> {} XMSS/s",

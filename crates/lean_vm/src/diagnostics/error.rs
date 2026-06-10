@@ -14,6 +14,7 @@ pub enum RunnerError {
     },
     NotAPointer,
     DivByZero,
+    NonBooleanJumpCondition(F),
     NotEqual(F, F),
     UndefinedMemory(usize),
     PCOutOfBounds,
@@ -23,6 +24,9 @@ pub enum RunnerError {
         range: usize,
     },
     InvalidExtensionOp,
+    InvalidHintArguments(String),
+    InvalidHintWitness(String),
+    ImpossibleDerefResolution,
     ParallelSegmentFailed(usize, Box<RunnerError>),
 }
 
@@ -41,6 +45,9 @@ impl Display for RunnerError {
             }
             Self::NotAPointer => write!(f, "not a pointer"),
             Self::DivByZero => write!(f, "division by zero"),
+            Self::NonBooleanJumpCondition(value) => {
+                write!(f, "non-boolean jump condition: {value}")
+            }
             Self::NotEqual(left, right) => write!(f, "not equal: {left} != {right}"),
             Self::UndefinedMemory(address) => write!(f, "undefined memory: {address}"),
             Self::PCOutOfBounds => write!(f, "pc out of bounds"),
@@ -55,6 +62,9 @@ impl Display for RunnerError {
                 )
             }
             Self::InvalidExtensionOp => write!(f, "invalid extension op"),
+            Self::InvalidHintArguments(message) => write!(f, "invalid hint arguments: {message}"),
+            Self::InvalidHintWitness(message) => write!(f, "invalid hint witness: {message}"),
+            Self::ImpossibleDerefResolution => write!(f, "impossible deref hint resolution"),
             Self::ParallelSegmentFailed(id, err) => {
                 write!(f, "parallel segment {id} failed: {err}")
             }

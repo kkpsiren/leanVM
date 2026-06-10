@@ -1,7 +1,11 @@
 [package]
-name = "mt-utils"
+name = "utils"
 version.workspace = true
 edition.workspace = true
 
 [dependencies]
 serde.workspace = true
+tracing-forest.workspace = true
+tracing-subscriber.workspace = true
+parallel.workspace = true
+

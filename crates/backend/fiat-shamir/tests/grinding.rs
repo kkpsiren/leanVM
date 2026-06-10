@@ -1,5 +1,5 @@
+use fiat_shamir::{FSProver, FSVerifier, ProverState, VerifierState};
 use goldilocks::{CubicExtensionFieldGL, default_goldilocks_poseidon1_8};
-use mt_fiat_shamir::{FSProver, FSVerifier, ProverState, VerifierState};
 use std::time::Instant;
 
 type EF = CubicExtensionFieldGL;
@@ -8,15 +8,16 @@ type EF = CubicExtensionFieldGL;
 #[ignore]
 fn bench_grinding() {
     let n_reps = 100;
+    let perm = default_goldilocks_poseidon1_8();
     for grinding_bits in 20..=20 {
-        let mut prover_state = ProverState::<EF, _>::new(default_goldilocks_poseidon1_8());
+        let mut prover_state = ProverState::<EF, _>::new(perm, Default::default());
         let time = Instant::now();
         for _ in 0..n_reps {
             prover_state.pow_grinding(grinding_bits);
         }
         let elapsed = time.elapsed();
         let mut verifier_state =
-            VerifierState::<EF, _>::new(prover_state.into_proof(), default_goldilocks_poseidon1_8()).unwrap();
+            VerifierState::<EF, _>::new(prover_state.into_proof(), perm, Default::default()).unwrap();
         for _ in 0..n_reps {
             verifier_state.check_pow_grinding(grinding_bits).unwrap()
         }

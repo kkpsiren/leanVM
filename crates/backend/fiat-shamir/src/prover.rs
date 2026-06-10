@@ -1,18 +1,16 @@
-use crate::{
-    MerklePaths, PrunedMerklePaths,
-    challenger::{Challenger, RATE, WIDTH},
-    *,
-};
+use crate::challenger::Challenger;
+use crate::{MerklePaths, PrunedMerklePaths, *};
 use field::Field;
 use field::PackedValue;
 use field::PrimeCharacteristicRing;
 use field::integers::QuotientMap;
 use field::{ExtensionField, PrimeField64};
-use rayon::prelude::*;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 use std::{fmt::Debug, sync::Mutex, time::Instant};
-use symetric::Compression;
+use symetric::RATE;
+use symetric::WIDTH;
+use symetric::{CAPACITY, Permutation};
 
 static POW_GRINDING_NANOS: AtomicU64 = AtomicU64::new(0);
 
@@ -31,15 +29,15 @@ pub struct ProverState<EF: ExtensionField<PF<EF>>, P> {
     merkle_paths: Vec<PrunedMerklePaths<PF<EF>, PF<EF>>>,
 }
 
-impl<EF: ExtensionField<PF<EF>>, P: Compression<[PF<EF>; WIDTH]>> ProverState<EF, P>
+impl<EF: ExtensionField<PF<EF>>, P: Permutation<[PF<EF>; WIDTH]>> ProverState<EF, P>
 where
     PF<EF>: PrimeField64,
 {
     #[must_use]
-    pub fn new(compressor: P) -> Self {
+    pub fn new(permutation: P, capacity: [PF<EF>; CAPACITY]) -> Self {
         assert!(EF::DIMENSION <= RATE);
         Self {
-            challenger: Challenger::new(compressor),
+            challenger: Challenger::new(permutation, capacity),
             transcript: Vec::new(),
             merkle_paths: Vec::new(),
         }
@@ -53,7 +51,7 @@ where
     }
 }
 
-impl<EF: ExtensionField<PF<EF>>, P: Compression<[PF<EF>; WIDTH]>> ChallengeSampler<EF> for ProverState<EF, P>
+impl<EF: ExtensionField<PF<EF>>, P: Permutation<[PF<EF>; WIDTH]>> ChallengeSampler<EF> for ProverState<EF, P>
 where
     PF<EF>: PrimeField64,
 {
@@ -66,18 +64,22 @@ where
     }
 }
 
-impl<EF: ExtensionField<PF<EF>>, P: Compression<[PF<EF>; WIDTH]> + Compression<[<PF<EF> as Field>::Packing; WIDTH]>>
+impl<EF: ExtensionField<PF<EF>>, P: Permutation<[PF<EF>; WIDTH]> + Permutation<[<PF<EF> as Field>::Packing; WIDTH]>>
     FSProver<EF> for ProverState<EF, P>
 where
     PF<EF>: PrimeField64,
 {
     fn add_base_scalars(&mut self, scalars: &[PF<EF>]) {
-        self.challenger.observe_scalars(scalars);
+        self.challenger.observe_many(scalars);
         self.transcript.extend_from_slice(scalars);
     }
 
     fn observe_scalars(&mut self, scalars: &[PF<EF>]) {
-        self.challenger.observe_scalars(scalars);
+        self.challenger.observe_many(scalars);
+    }
+
+    fn duplex(&mut self) {
+        self.challenger.duplex();
     }
 
     fn state(&self) -> String {
@@ -97,13 +99,13 @@ where
         match eq_alpha {
             None => {
                 let scalars = flatten_scalars_to_base(coeffs);
-                self.challenger.observe_scalars(&scalars);
+                self.challenger.observe_many(&scalars);
                 self.transcript.extend_from_slice(&scalars[EF::DIMENSION..]); // c0 reconstructed by verifier from claimed_sum
             }
             Some(alpha) => {
                 let bare_scalars = flatten_scalars_to_base(coeffs);
                 let full_scalars = flatten_scalars_to_base(&expand_bare_to_full(coeffs, alpha));
-                self.challenger.observe_scalars(&full_scalars);
+                self.challenger.observe_many(&full_scalars);
                 self.transcript.extend_from_slice(&bare_scalars[EF::DIMENSION..]); // h0 reconstructed by verifier from claimed_sum
             }
         }
@@ -128,9 +130,18 @@ where
         let witness_found = Mutex::<Option<PF<EF>>>::new(None);
         // each batch tests lanes witnesses simultaneously
         let num_batches = PF::<EF>::ORDER_U64.div_ceil(lanes as u64);
-        (0..num_batches)
-            .into_par_iter()
-            .find_any(|&batch| {
+
+        let next_batch = AtomicU64::new(0);
+        let found = AtomicBool::new(false);
+        parallel::for_each_index(parallel::num_threads(), |_| {
+            loop {
+                if found.load(Ordering::Relaxed) {
+                    return;
+                }
+                let batch = next_batch.fetch_add(1, Ordering::Relaxed);
+                if batch >= num_batches {
+                    return;
+                }
                 let base = batch * lanes as u64;
 
                 let packed_witnesses = Packed::<EF>::from_fn(|lane| {
@@ -140,30 +151,33 @@ where
                 });
 
                 let mut packed_state = [Packed::<EF>::ZERO; WIDTH];
-                packed_state[..RATE]
+                for (slot, val) in packed_state[..CAPACITY]
                     .iter_mut()
-                    .zip(&self.challenger.state)
-                    .for_each(|(val, state)| *val = Packed::<EF>::from(*state));
-                packed_state[RATE] = packed_witnesses;
+                    .zip(&self.challenger.state[..CAPACITY])
+                {
+                    *slot = Packed::<EF>::from(*val);
+                }
+                packed_state[CAPACITY] = packed_witnesses;
 
-                self.challenger.compressor.compress_mut(&mut packed_state);
+                self.challenger.permutation.permute_mut(&mut packed_state);
 
-                let samples = packed_state[0].as_slice();
+                let samples = packed_state[CAPACITY].as_slice();
                 for (sample, witness) in samples.iter().zip(packed_witnesses.as_slice()) {
                     let rand_usize = sample.as_canonical_u64() as usize;
                     if (rand_usize & ((1 << bits) - 1)) == 0 {
                         *witness_found.lock().unwrap() = Some(*witness);
-                        return true;
+                        found.store(true, Ordering::Relaxed);
+                        return;
                     }
                 }
-                false
-            })
-            .expect("failed to find witness");
+            }
+        });
+        assert!(found.load(Ordering::Relaxed), "failed to find witness");
 
         let witness = witness_found.lock().unwrap().unwrap();
 
-        self.challenger.observe_scalars(&[witness]);
-        assert!(self.challenger.state[0].as_canonical_u64() & ((1 << bits) - 1) == 0);
+        self.challenger.observe_many(&[witness]);
+        assert!(self.challenger.state[CAPACITY].as_canonical_u64() & ((1 << bits) - 1) == 0);
         self.transcript.push(witness);
 
         let elapsed = time.elapsed();

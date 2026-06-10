@@ -15,7 +15,7 @@ def multi_return(a, b):
 
 def multi_line_params(
     a,
-    b: Mut,
+    b,
     c: Const,
 ):
     return a + b + c
@@ -25,24 +25,19 @@ def main():
     result = add_four(1, 2, 3, 4)
     assert result == 10
 
-    arr = DynArray([1, 2, 3])
-    assert arr[0] == 1
-    assert arr[1] == 2
-    assert arr[2] == 3
-
     nested = add_four(1, add_four(10, 20, 30, 40), 2, 3)
     assert nested == 106
 
     x = 5
     y = 10
-    z: Imu
+    z: Imm
     if x + y == 15:
         z = 1
     else:
         z = 0
     assert z == 1
 
-    w: Imu
+    w: Imm
     if x + y * 2 == 25:
         w = 100
     else:

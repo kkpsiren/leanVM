@@ -2,6 +2,7 @@ use crate::*;
 use ::utils::log2_strict_usize;
 use field::ExtensionField;
 use field::PackedValue;
+use zk_alloc::ArenaVec;
 
 #[derive(Debug)]
 pub enum MleGroupRef<'a, EF: ExtensionField<PF<EF>>> {
@@ -158,10 +159,12 @@ impl<'a, EF: ExtensionField<PF<EF>>> MleGroupRef<'a, EF> {
 
     pub fn clone_to_owned(&self) -> MleGroupOwned<EF> {
         match self {
-            Self::Base(pols) => MleGroupOwned::Base(pols.iter().map(|v| v.to_vec()).collect()),
-            Self::Extension(pols) => MleGroupOwned::Extension(pols.iter().map(|v| v.to_vec()).collect()),
-            Self::BasePacked(pols) => MleGroupOwned::BasePacked(pols.iter().map(|v| v.to_vec()).collect()),
-            Self::ExtensionPacked(pols) => MleGroupOwned::ExtensionPacked(pols.iter().map(|v| v.to_vec()).collect()),
+            Self::Base(pols) => MleGroupOwned::Base(pols.iter().map(|v| ArenaVec::from_slice(v)).collect()),
+            Self::Extension(pols) => MleGroupOwned::Extension(pols.iter().map(|v| ArenaVec::from_slice(v)).collect()),
+            Self::BasePacked(pols) => MleGroupOwned::BasePacked(pols.iter().map(|v| ArenaVec::from_slice(v)).collect()),
+            Self::ExtensionPacked(pols) => {
+                MleGroupOwned::ExtensionPacked(pols.iter().map(|v| ArenaVec::from_slice(v)).collect())
+            }
         }
     }
 }

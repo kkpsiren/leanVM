@@ -6,7 +6,7 @@ from typing import Any
 # Type annotations
 Mut = Any
 Const = Any
-Imu = Any
+Imm = Any
 
 
 # @inline decorator (does nothing in Python execution)
@@ -17,13 +17,9 @@ def inline(fn):
 def unroll(a: int, b: int):
     return range(a, b)
 
+
 def parallel_range(a: int, b: int):
     return range(a, b)
-
-# dynamic_unroll(start, end, n_bits) returns range(start, end) for Python execution
-def dynamic_unroll(start: int, end: int, n_bits: int):
-    _ = n_bits
-    return range(start, end)
 
 
 # Array - simulates write-once memory with pointer arithmetic
@@ -49,43 +45,47 @@ class Array:
         return
 
 
-# DynArray - dynamic array with push/pop (compile-time construct)
-class DynArray:
-    def __init__(self, initial: list):
-        self._data = list(initial)
-
-    def __getitem__(self, idx):
-        return self._data[idx]
-
-    def __len__(self):
-        return len(self._data)
-
-    def push(self, value):
-        self._data.append(value)
-
-    def pop(self):
-        self._data.pop()
-
-
-def poseidon8_compress(left, right, output):
-    _ = left, right, output
+# Poseidon8 precompiles on input x = m[left..left+4] || m[right..right+4], written at `output`:
+#   - `compress_*` adds the input back, i.e. feed-forward (Poseidon(x) + x); `permute_*` is the raw Poseidon(x).
+#   - `_half` keeps 4 elements, `_quarter` keeps 2, plain `permute` keeps 8
+#   - `_hardcoded_left`: the left half is m[offset..offset+2] || m[left..left+2], at the compile-time constant `offset`.
 
 
 def poseidon8_compress_half(left, right, output):
-    """Poseidon8 compression outputting only the first 2 FE (last 2 unconstrained)."""
+    """m[output..output+4] = (Poseidon(x) + x)[0..4]."""
     _ = left, right, output
 
 
-def poseidon8_compress_hardcoded_left(left, right, output, offset):
-    """Poseidon8 compression where the first 2 FE of the left input are read from
-    memory[offset..offset+2] instead of memory[left..left+2]. The last 2 FE of the
-    left input come from memory[left..left+2]. `offset` must be a compile-time
-    constant expression."""
-    _ = left, right, output, offset
+def poseidon8_compress_quarter(left, right, output):
+    """m[output..output+2] = (Poseidon(x) + x)[0..2]."""
+    _ = left, right, output
 
 
 def poseidon8_compress_half_hardcoded_left(left, right, output, offset):
-    """Composition of `poseidon8_compress_half` and `poseidon8_compress_hardcoded_left`."""
+    """`poseidon8_compress_half` with a hardcoded left prefix: the left half of the input is
+    m[offset..offset+2] || m[left..left+2]."""
+    _ = left, right, output, offset
+
+
+def poseidon8_compress_quarter_hardcoded_left(left, right, output, offset):
+    """`poseidon8_compress_quarter` with a hardcoded left prefix: the left half of the input is
+    m[offset..offset+2] || m[left..left+2]."""
+    _ = left, right, output, offset
+
+
+def poseidon8_permute(left, right, output):
+    """m[output..output+8] = Poseidon(x) (raw permutation, no feed-forward)."""
+    _ = left, right, output
+
+
+def poseidon8_permute_half(left, right, output):
+    """m[output..output+4] = Poseidon(x)[0..4] (raw permutation, no feed-forward; high 4 discarded)."""
+    _ = left, right, output
+
+
+def poseidon8_permute_half_hardcoded_left(left, right, output, offset):
+    """`poseidon8_permute_half` with a hardcoded left prefix: the left half of the input is
+    m[offset..offset+2] || m[left..left+2]."""
     _ = left, right, output, offset
 
 
@@ -113,8 +113,9 @@ def poly_eq_ee(a, b, result, length=None):
     _ = a, b, result, length
 
 
-def hint_decompose_bits(value, bits, n_bits, endian):
-    _ = value, bits, n_bits, endian
+def hint_decompose_bits(value, bits, n_bits):
+    _ = value, bits, n_bits
+
 
 def hint_less_than(a, b, result_ptr):
     _ = a, b, result_ptr
@@ -128,8 +129,10 @@ def log2_ceil(x: int) -> int:
 def div_ceil(a: int, b: int) -> int:
     return (a + b - 1) // b
 
+
 def div_floor(a: int, b: int) -> int:
     return a // b
+
 
 def next_multiple_of(x: int, n: int) -> int:
     return x + (n - x % n) % n
@@ -171,6 +174,10 @@ def hint_decompose_bits_merkle_whir(*args):
 
 def hint_log2_ceil(n):
     return log2_ceil(n)
+
+
+def hint_div_floor(a, b, q_ptr, r_ptr):
+    _ = a, b, q_ptr, r_ptr
 
 
 def hint_witness(name, destination):

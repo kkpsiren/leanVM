@@ -2,15 +2,12 @@
 
 use std::fmt::Display;
 
-use backend::*;
-use lean_vm::{EF, F, MAX_WHIR_LOG_INV_RATE, MIN_LOG_N_ROWS_PER_TABLE, MIN_WHIR_LOG_INV_RATE, Table, TableT};
-use utils::*;
-
-mod trace_gen;
-
 pub mod prove_execution;
+mod trace_gen;
 pub mod verify_execution;
 
+use backend::*;
+use lean_vm::*;
 #[cfg(test)]
 mod test_zkvm;
 
@@ -21,8 +18,8 @@ pub const SECURITY_BITS: usize = 128; // TODO 128 bits security
 
 pub const GRINDING_BITS: usize = 16;
 pub const MAX_NUM_VARIABLES_TO_SEND_COEFFS: usize = 8;
-pub const WHIR_INITIAL_FOLDING_FACTOR: usize = 7;
-pub const WHIR_SUBSEQUENT_FOLDING_FACTOR: usize = 5;
+pub const WHIR_INITIAL_FOLDING_FACTOR: usize = 6;
+pub const WHIR_SUBSEQUENT_FOLDING_FACTOR: usize = 4;
 pub const RS_DOMAIN_INITIAL_REDUCTION_FACTOR: usize = 5;
 
 // Domain-separation digest for the zkVM SNARK. Arbitrary nothing-up-my-sleeve field
@@ -34,7 +31,13 @@ pub const SNARK_DOMAIN_SEP: [F; 4] = F::new_array([
     0xcccc_cccc_cccc_cccc, // nothing-up-my-sleeve tail
 ]);
 
+pub fn fiat_shamir_domain_sep(bytecode: &Bytecode) -> [F; 4] {
+    poseidon8_compress_pair(&bytecode.hash, &SNARK_DOMAIN_SEP)
+}
+
 pub fn default_whir_config(starting_log_inv_rate: usize) -> WhirConfigBuilder {
+    assert!(0 < starting_log_inv_rate);
+    assert!(starting_log_inv_rate <= MAX_WHIR_LOG_INV_RATE);
     WhirConfigBuilder {
         folding_factor: FoldingFactor::new(WHIR_INITIAL_FOLDING_FACTOR, WHIR_SUBSEQUENT_FOLDING_FACTOR),
         soundness_type: if cfg!(feature = "prox-gaps-conjecture") {
@@ -61,6 +64,8 @@ pub(crate) fn check_rate(log_inv_rate: usize) -> Result<(), ProofError> {
 #[derive(Debug, Clone)]
 pub enum ProverError {
     TooBigTable(TooBigTableError),
+    Runner(RunnerError),
+    InvalidRate,
 }
 
 impl From<TooBigTableError> for ProverError {
@@ -69,26 +74,36 @@ impl From<TooBigTableError> for ProverError {
     }
 }
 
+impl From<RunnerError> for ProverError {
+    fn from(err: RunnerError) -> Self {
+        Self::Runner(err)
+    }
+}
+
 impl Display for ProverError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::TooBigTable(e) => write!(f, "{}", e),
+            Self::Runner(e) => write!(f, "{}", e),
+            Self::InvalidRate => write!(
+                f,
+                "LeanVM supports rate 1/2, 1/4, 1/8 and 1/16 (log_inv_rate in {{1, 2, 3, 4}})"
+            ),
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use backend::{PrimeCharacteristicRing, default_goldilocks_poseidon1_8, hash_slice};
+    use backend::{PrimeCharacteristicRing, default_goldilocks_poseidon1_8, hash_slice_rtl, poseidon8_compress_pair};
     use lean_vm::F;
     use rec_aggregation::{get_aggregation_bytecode, init_aggregation_bytecode};
-    use utils::poseidon8_compress_pair;
 
     #[test]
     fn compute_snark_domain_sep() {
         init_aggregation_bytecode();
         let recursion_bytecode_hash = get_aggregation_bytecode().hash;
-        let name_fe = "leanMultisig-0.6.0"
+        let name_fe = "leanVM-0.6.0"
             .as_bytes()
             .iter()
             .map(|b| F::from_u8(*b))
@@ -101,7 +116,7 @@ mod tests {
         }
         prefix_free_name_fe.push(F::from_u64(len as u64));
         let comp = default_goldilocks_poseidon1_8();
-        let name_hash = hash_slice::<_, _, _, 8, 4>(&comp, &prefix_free_name_fe);
+        let name_hash = hash_slice_rtl::<_, _, _, 4, 4>(&comp, &prefix_free_name_fe);
 
         // We incorporate the recursion program hash, containing all the verifier logic, into fiat shamir domain separator
         // (likely not necessary but why not, is there a cleaner approach?)

@@ -1,6 +1,6 @@
 from snark_lib import *
 
-ONE_EF_PTR = 1  # right after the (empty-public-input) zero-padded cell at memory[0]
+ONE_EF_PTR = 4  # right after the 4-cell public input region, inside the reserved preamble
 
 
 def main():

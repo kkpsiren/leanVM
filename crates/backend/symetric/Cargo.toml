@@ -1,9 +1,10 @@
 [package]
-name = "mt-symetric"
+name = "symetric"
 version.workspace = true
 edition.workspace = true
 
 [dependencies]
-goldilocks = { path = "../goldilocks", package = "mt-goldilocks" }
-field = { path = "../field", package = "mt-field" }
-rayon.workspace = true
+goldilocks = { path = "../goldilocks", package = "goldilocks" }
+field = { path = "../field", package = "field" }
+parallel.workspace = true
+zk-alloc.workspace = true

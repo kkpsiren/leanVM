@@ -41,31 +41,17 @@ simple_statement = {
     return_statement |
     assert_statement |
     debug_assert_statement |
-    vec_declaration |
-    push_statement |
-    pop_statement |
     assignment
 }
-
-// Vector declaration: var = vec![...] (vectors are implicitly mutable for push)
-vec_declaration = { identifier ~ "=" ~ vec_literal }
-
-// Push statement: vec_var.push(element) or vec_var[i][j].push(element)
-push_statement = { push_target ~ "." ~ "push" ~ "(" ~ vec_element ~ ")" }
-push_target = { identifier ~ ("[" ~ expression ~ "]")* }
-
-// Pop statement: vec_var.pop() or vec_var[i][j].pop()
-pop_statement = { pop_target ~ "." ~ "pop" ~ "(" ~ ")" }
-pop_target = { identifier ~ ("[" ~ expression ~ "]")* }
 
 return_statement = { "return" ~ (("(" ~ tuple_expression ~ ")") | tuple_expression)? }
 
 
 mut_keyword = @{ "mut" ~ !(ASCII_ALPHANUMERIC | "_") }
 mut_annotation = { ":" ~ "Mut" }
-im_annotation = { ":" ~ "Imu" }
+im_annotation = { ":" ~ "Imm" }
 
-// Forward declaration: x: Imu or x: Mut (not followed by =)
+// Forward declaration: x: Imm or x: Mut (not followed by =)
 forward_declaration = { identifier ~ (im_annotation | mut_annotation) ~ !("=") }
 
 // General assignment: LHS is optional, RHS is any expression
@@ -88,11 +74,10 @@ elif_clause = { "elif" ~ condition ~ ":" ~ newline ~ statement* ~ end_block }
 
 else_clause = { "else" ~ ":" ~ newline ~ statement* ~ end_block }
 
-for_statement = { "for" ~ identifier ~ "in" ~ (dynamic_unroll_range | unroll_range | parallel_range | range) ~ ":" ~ newline ~ statement* ~ end_block }
+for_statement = { "for" ~ identifier ~ "in" ~ (unroll_range | parallel_range | range) ~ ":" ~ newline ~ statement* ~ end_block }
 range = { "range" ~ "(" ~ expression ~ "," ~ expression ~ ")" }
 parallel_range = { "parallel_range" ~ "(" ~ expression ~ "," ~ expression ~ ")" }
 unroll_range = { "unroll" ~ "(" ~ expression ~ "," ~ expression ~ ")" }
-dynamic_unroll_range = { "dynamic_unroll" ~ "(" ~ expression ~ "," ~ expression ~ "," ~ expression ~ ")" }
 
 match_statement = { "match" ~ expression ~ ":" ~ newline ~ match_arm* ~ end_block }
 match_arm = { "case" ~ pattern ~ ":" ~ newline ~ statement* ~ end_block }
@@ -132,9 +117,6 @@ primary = {
 // Lambda expression: lambda param: body
 lambda_expr = { "lambda" ~ identifier ~ ":" ~ expression }
 
-// DynArray literal: DynArray([elem1, elem2, ...]) - compile-time dynamic arrays
-vec_literal = { "DynArray" ~ "(" ~ "[" ~ (vec_element ~ ("," ~ vec_element)* ~ ","?)? ~ "]" ~ ")" }
-vec_element = { vec_literal | expression }
 function_call_expr = { identifier ~ "(" ~ tuple_expression? ~ ")" }
 hint_witness_expr = { "hint_witness" ~ "(" ~ string_literal ~ "," ~ expression ~ ")" }
 log2_ceil_expr = { "log2_ceil" ~ "(" ~ expression ~ ")" }

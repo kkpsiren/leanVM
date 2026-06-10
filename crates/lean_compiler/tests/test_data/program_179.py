@@ -1,6 +1,6 @@
 from snark_lib import *
 
-ONE_EF_PTR = 1  # right after the (empty-public-input) zero-padded cell at memory[0]
+ONE_EF_PTR = 4  # right after the 4-cell public input region, inside the reserved preamble
 
 
 def main():
@@ -9,14 +9,14 @@ def main():
     output = Array(5)
     input[0] = 1
     input[4] = 5
-    copy_5(input, output)
+    copy_ef(input, output)
     assert output[0] == 1
     assert output[4] == 5
     return
 
 
 @inline
-def copy_5(a, b):
+def copy_ef(a, b):
     dot_product_ee(a, ONE_EF_PTR, b)
     return
 

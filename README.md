@@ -1,12 +1,15 @@
-<h1 align="center">leanMultisig</h1>
+<h1 align="center">leanVM</h1>
 
 <p align="center">
   <img src="./misc/images/banner.svg">
 </p>
 
-Minimal hash-based zkVM, targeting recursion and aggregation of hash-based signatures, for a Post-Quantum Ethereum.
+Minimal hash-based zkVM, for a Post-Quantum Ethereum.
 
-Documentation: [PDF](minimal_zkVM.pdf)
+<p align="center">
+  <a href="https://github.com/leanEthereum/leanVM/releases/download/spec-latest/minimal_zkVM.pdf"><img src="https://img.shields.io/badge/Documentation-blue?style=for-the-badge&logo=data:image/svg%2bxml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0id2hpdGUiPjxwYXRoIGQ9Ik0xNCAySDZjLTEuMSAwLTIgLjktMiAydjE2YzAgMS4xLjg5IDIgMS45OSAySDE4YzEuMSAwIDItLjkgMi0yVjhsLTYtNnpNOC41IDE0LjVoMS4yNWMuOTcgMCAxLjc1LS43OCAxLjc1LTEuNzVTMTAuNzIgMTEgOS43NSAxMUg3LjV2Nmgxdi0yLjV6bTAtMVYxMmgxLjI1Yy40MSAwIC43NS4zNC43NS43NXMtLjM0Ljc1LS43NS43NUg4LjV6bTUuNSAzLjVoMnYtMWgtMnYtMWgydi0xaC0ydi0xLjVjMC0uMjguMjItLjUuNS0uNUgxN3YtMWgtMmMtLjgzIDAtMS41LjY3LTEuNSAxLjVWMTd6TTEzIDlWMy41TDE4LjUgOUgxM3oiLz48L3N2Zz4=" alt="Documentation"></a>
+  <a href="crates/lean_compiler/zkDSL.md"><img src="https://img.shields.io/badge/zkDSL%20reference-7c3aed?style=for-the-badge&logo=markdown&logoColor=white" alt="zkDSL reference"></a>
+</p>
 
 ## Proving System
 
@@ -32,8 +35,8 @@ cargo run --release -- xmss --n-signatures 1550 --log-inv-rate 1
 
 | WHIR rate | Proven Regime         | Proximity Gaps Conjecture |
 | --------- | --------------------- | ------------------------- |
-| 1/2       | 1319 XMSS/s - 338 KiB | 1345 XMSS/s - 176 KiB     |
-| 1/4       | 961 XMSS/s - 228 KiB  | 969 XMSS/s - 126 KiB      |
+| 1/2       | 1453 XMSS/s - 344 KiB | 1500 XMSS/s - 178 KiB     |
+| 1/4       | 1058 XMSS/s - 229 KiB | 1065 XMSS/s - 127 KiB     |
 
 
 (Proving throughput - proof size)
@@ -50,15 +53,14 @@ cargo run --release -- recursion --n 2 --log-inv-rate 2
 
 | n   | WHIR rate | Proven Regime               | Proximity Gaps Conjecture   |
 | --- | --------- | --------------------------- | --------------------------- |
-| 1   | 1/2       | 0.39s = 1 x 0.39s - 278 KiB | 0.24s = 1 x 0.24s - 147 KiB |
-| 1   | 1/4       | 0.32s = 1 x 0.32s - 188 KiB | 0.27s = 1 x 0.27s - 100 KiB |
-| 2   | 1/2       | 0.7s = 2 x 0.35s - 293 KiB  | 0.43s = 2 x 0.21s - 157 KiB |
-| 2   | 1/4       | 0.56s = 2 x 0.28s - 194 KiB | 0.43s = 2 x 0.22s - 102 KiB |
-| 3   | 1/2       | 0.85s = 3 x 0.28s - 312 KiB | 0.63s = 3 x 0.21s - 150 KiB |
-| 3   | 1/4       | 0.94s = 3 x 0.31s - 203 KiB | 0.73s = 3 x 0.24s - 108 KiB |
-| 4   | 1/2       | 1.27s = 4 x 0.32s - 308 KiB | 0.78s = 4 x 0.2s - 166 KiB  |
-| 4   | 1/4       | 1.02s = 4 x 0.26s - 206 KiB | 0.79s = 4 x 0.2s - 108 KiB  |
-
+| 1   | 1/2       | 0.22s = 1 x 0.22s - 285 KiB | 0.15s = 1 x 0.15s - 143 KiB |
+| 1   | 1/4       | 0.24s = 1 x 0.24s - 189 KiB | 0.18s = 1 x 0.18s - 98 KiB  |
+| 2   | 1/2       | 0.52s = 2 x 0.26s - 282 KiB | 0.33s = 2 x 0.16s - 159 KiB |
+| 2   | 1/4       | 0.45s = 2 x 0.23s - 198 KiB | 0.33s = 2 x 0.16s - 102 KiB |
+| 3   | 1/2       | 0.7s = 3 x 0.23s - 317 KiB  | 0.47s = 3 x 0.16s - 151 KiB |
+| 3   | 1/4       | 0.67s = 3 x 0.22s - 191 KiB | 0.43s = 3 x 0.14s - 111 KiB |
+| 4   | 1/2       | 1.02s = 4 x 0.26s - 309 KiB | 0.61s = 4 x 0.15s - 168 KiB |
+| 4   | 1/4       | 0.85s = 4 x 0.21s - 208 KiB | 0.62s = 4 x 0.15s - 109 KiB |
 
 
 (time for n->1 recursive aggregation - proof size)
@@ -83,7 +85,7 @@ cargo run --release -- fancy-aggregation
 
 Currently, we use an [XMSS](crates/xmss/xmss.md) with hash digests of 2 goldilocks ≈ 128 bits. Tweaks and public parameters ensure domain separation. An analysis in the ROM (resp. QROM), inspired by the section 3.1 of [Tight adaptive reprogramming in the QROM](https://arxiv.org/pdf/2010.15103) would lead to ≈ 128 (resp. 64) bits of classical (resp. quantum) security, i.e. NIST level 1.
 
-It's important to mention that a security analysis in the ROM / QROM is not the most conservative. In particular, [eprint 2025/055](https://eprint.iacr.org/2025/055.pdf)'s security proof holds in the standard model (at the cost of bigger hash digests): the implementation is available in the [leanSig](https://github.com/leanEthereum/leanSig) repository. A compatible version of leanMultisig can be found in the [devnet4](https://github.com/leanEthereum/leanMultisig/tree/devnet4) branch.
+It's important to mention that a security analysis in the ROM / QROM is not the most conservative. In particular, [eprint 2025/055](https://eprint.iacr.org/2025/055.pdf)'s security proof holds in the standard model (at the cost of bigger hash digests): the implementation is available in the [leanSig](https://github.com/leanEthereum/leanSig) repository. A compatible version of leanVM can be found in the [devnet4](https://github.com/leanEthereum/leanVM/tree/devnet4) branch.
 
 ## Credits
 

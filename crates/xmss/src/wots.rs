@@ -1,7 +1,6 @@
 use backend::*;
 use rand::{CryptoRng, RngExt};
 use serde::{Deserialize, Serialize};
-use utils::poseidon8_compress_pair;
 
 use crate::*;
 
@@ -48,9 +47,9 @@ impl WotsSecretKey {
         slot: u32,
         xmss_pub_key: &XmssPublicKey,
         randomness: Randomness,
-    ) -> WotsSignature {
-        let encoding = wots_encode(message, slot, xmss_pub_key, &randomness).unwrap();
-        self.sign_with_encoding(randomness, &encoding, xmss_pub_key.public_param, slot)
+    ) -> Option<WotsSignature> {
+        let encoding = wots_encode(message, slot, xmss_pub_key, &randomness)?;
+        Some(self.sign_with_encoding(randomness, &encoding, xmss_pub_key.public_param, slot))
     }
 
     fn sign_with_encoding(
@@ -75,9 +74,8 @@ impl WotsSignature {
         message: &[F; MESSAGE_LEN_FE],
         slot: u32,
         xmss_pub_key: &XmssPublicKey,
-        signature: &Self,
     ) -> Option<WotsPublicKey> {
-        let encoding = wots_encode(message, slot, xmss_pub_key, &signature.randomness)?;
+        let encoding = wots_encode(message, slot, xmss_pub_key, &self.randomness)?;
         Some(WotsPublicKey(std::array::from_fn(|i| {
             iterate_hash(
                 &self.chain_tips[i],
@@ -92,25 +90,19 @@ impl WotsSignature {
 }
 
 impl WotsPublicKey {
-    // We use a T-Sponge with replacement, i.e. we use Poseidon in compression mode + replace (instead of modular addition) when ingesting 4 new field elements.
+    // Overwrite-sponge
     pub fn hash(&self, public_param: PublicParam, slot: u32) -> Digest {
-        // IV: [tweak(1) | 0 | pp(2)]
-        let tweak = make_tweak(TWEAK_TYPE_WOTS_PK, 0, slot);
-        let mut state = [F::default(); DIGEST_LEN_FE];
-        state[..TWEAK_LEN].copy_from_slice(&tweak);
-        // state[1..2] = 0 (default)
-        state[DIGEST_LEN_FE - PUBLIC_PARAM_LEN_FE..].copy_from_slice(&public_param);
-
-        let zeros = [F::ZERO; DIGEST_LEN_FE]; // for snark-friendliness (not necessary for security)
-        state = poseidon8_compress_pair(&state, &zeros);
-
+        // state[0..4] = IV [tweak(1) | 0 | pp(2)]; state[4..8] = 0.
+        let mut state = [F::ZERO; WIDTH];
+        state[..TWEAK_LEN].copy_from_slice(&make_tweak(TWEAK_TYPE_WOTS_PK, 0, slot));
+        state[2..2 + PUBLIC_PARAM_LEN_FE].copy_from_slice(&public_param);
+        state = poseidon8_permute(state);
         for i in (0..V).step_by(2) {
-            let mut chunk = [F::default(); DIGEST_LEN_FE];
-            chunk[..XMSS_DIGEST_LEN].copy_from_slice(&self.0[i]);
-            chunk[XMSS_DIGEST_LEN..].copy_from_slice(&self.0[i + 1]);
-            state = poseidon8_compress_pair(&state, &chunk);
+            state[CAPACITY..][..XMSS_DIGEST_LEN].copy_from_slice(&self.0[i]);
+            state[CAPACITY + XMSS_DIGEST_LEN..].copy_from_slice(&self.0[i + 1]);
+            state = poseidon8_permute(state);
         }
-        state[..XMSS_DIGEST_LEN].try_into().unwrap()
+        state[CAPACITY..][..XMSS_DIGEST_LEN].try_into().unwrap()
     }
 }
 

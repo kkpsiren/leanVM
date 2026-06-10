@@ -1,40 +1,39 @@
 use std::collections::BTreeMap;
 
 use crate::*;
+use backend::ArenaVec;
+use backend::ansi::Colorize;
 use lean_vm::*;
-
+use serde::{Deserialize, Serialize};
 use sub_protocols::*;
 use tracing::info_span;
-use utils::ansi::Colorize;
-use utils::{build_prover_state, from_end};
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecutionProof {
     pub proof: Proof<F>,
     // benchmark / debug purpose
-    pub metadata: ExecutionMetadata,
+    #[serde(skip, default)]
+    pub metadata: Option<ExecutionMetadata>,
 }
 
 pub fn prove_execution(
     bytecode: &Bytecode,
-    public_input: &[F],
+    public_input: &[F; PUBLIC_INPUT_LEN],
     witness: &ExecutionWitness,
     whir_config: &WhirConfigBuilder,
     vm_profiler: bool,
 ) -> Result<ExecutionProof, ProverError> {
-    check_rate(whir_config.starting_log_inv_rate)
-        .map_err(|err| panic!("{err}"))
-        .unwrap();
+    check_rate(whir_config.starting_log_inv_rate).map_err(|_| ProverError::InvalidRate)?;
     let ExecutionTrace {
         traces,
-        public_memory_size,
         mut memory, // padded with zeros to next power of two
         metadata,
-    } = info_span!("Witness generation").in_scope(|| {
+    } = info_span!("Witness generation").in_scope(|| -> Result<_, ProverError> {
         let execution_result = info_span!("Executing bytecode")
-            .in_scope(|| execute_bytecode(bytecode, public_input, witness, vm_profiler));
-        info_span!("Building execution trace").in_scope(|| get_execution_trace(bytecode, execution_result))
-    });
+            .in_scope(|| try_execute_bytecode(bytecode, public_input, witness, vm_profiler))?;
+        Ok(info_span!("Building execution trace")
+            .in_scope(|| get_execution_trace(bytecode, execution_result, &witness.min_table_log_n_rows)))
+    })?;
 
     // Memory must be at least MIN_LOG_MEMORY_SIZE and at least bytecode size
     // (required by the stacked polynomial ordering)
@@ -42,16 +41,11 @@ pub fn prove_execution(
     if memory.len() < min_memory_size {
         memory.resize(min_memory_size, F::ZERO);
     }
-    let mut prover_state = build_prover_state();
+    let mut prover_state = ProverState::new(*get_poseidon8(), fiat_shamir_domain_sep(bytecode));
     prover_state.observe_scalars(public_input);
-    prover_state.observe_scalars(&poseidon8_compress_pair(&bytecode.hash, &SNARK_DOMAIN_SEP));
     prover_state.add_base_scalars(
         &[
-            vec![
-                whir_config.starting_log_inv_rate,
-                log2_strict_usize(memory.len()),
-                public_input.len(),
-            ],
+            vec![whir_config.starting_log_inv_rate, log2_strict_usize(memory.len())],
             traces.values().map(|t| t.log_n_rows).collect::<Vec<_>>(),
         ]
         .concat()
@@ -86,26 +80,33 @@ pub fn prove_execution(
     tracing::info!("Trace tables sizes: {}", table_log.magenta());
 
     // TODO parrallelize
-    let mut memory_acc = F::zero_vec(memory.len());
-    info_span!("Building memory access count").in_scope(|| {
+    let mut memory_acc = unsafe { ArenaVec::<F>::zeroed(memory.len()) };
+    info_span!("Building memory access count").in_scope(|| -> Result<(), ProverError> {
         for (table, trace) in &traces {
-            for lookup in table.lookups() {
-                for i in &trace.columns[lookup.index] {
-                    for j in 0..lookup.values.len() {
-                        memory_acc[i.to_usize() + j] += F::ONE;
+            let buses = table.bus_interactions();
+            for group in memory_lookup_groups(&buses) {
+                let idx_col = &trace.columns[group.idx_col];
+                let n = group.value_cols.len();
+                for idx in idx_col {
+                    let base = idx.to_usize();
+                    let cells = memory_acc.get_mut(base..base + n).ok_or(RunnerError::OutOfMemory)?;
+                    for cell in cells {
+                        *cell += F::ONE;
                     }
                 }
             }
         }
-    });
+        Ok(())
+    })?;
 
     // // TODO parrallelize
-    let mut bytecode_acc = F::zero_vec(bytecode.padded_size());
-    info_span!("Building bytecode access count").in_scope(|| {
-        for pc in traces[&Table::execution()].columns[COL_PC].iter() {
-            bytecode_acc[pc.to_usize()] += F::ONE;
+    let mut bytecode_acc = unsafe { ArenaVec::<F>::zeroed(bytecode.padded_size()) };
+    info_span!("Building bytecode access count").in_scope(|| -> Result<(), ProverError> {
+        for pc in traces[&Table::execution()].columns[EXEC_COL_PC].iter() {
+            *bytecode_acc.get_mut(pc.to_usize()).ok_or(RunnerError::PCOutOfBounds)? += F::ONE;
         }
-    });
+        Ok(())
+    })?;
 
     // 1st Commitment
     let stacked_pcs_witness = stack_polynomials_and_commit(
@@ -119,7 +120,8 @@ pub fn prove_execution(
 
     // logup (GKR)
     let logup_c = prover_state.sample();
-    let logup_alphas = prover_state.sample_vec(log2_ceil_usize(max_bus_width_including_domainsep()));
+    prover_state.duplex();
+    let logup_alphas = prover_state.sample_vec(LOG_MAX_BUS_WIDTH);
     let logup_alphas_eq_poly = eval_eq(&logup_alphas);
 
     let logup_statements = prove_generic_logup(
@@ -146,49 +148,54 @@ pub fn prove_execution(
         );
     }
 
-    let bus_beta = prover_state.sample();
     let air_alpha = prover_state.sample();
-    let air_alpha_powers: Vec<EF> = air_alpha.powers().collect_n(max_air_constraints() + 1);
-    let air_eta: EF = prover_state.sample();
+    let air_alpha_powers: Vec<EF> = air_alpha.powers().collect_n(total_air_constraints());
 
     let tables_log_heights: BTreeMap<Table, VarCount> =
         traces.iter().map(|(table, trace)| (*table, trace.log_n_rows)).collect();
-    let tables_sorted = sort_tables_by_height(&tables_log_heights);
 
-    let column_refs: Vec<Vec<&[F]>> = tables_sorted
+    let column_refs: Vec<Vec<&[F]>> = ALL_TABLES
         .iter()
-        .map(|(table, _)| {
+        .map(|table| {
             traces[table].columns[..table.n_columns()]
                 .iter()
-                .map(Vec::as_slice)
+                .map(|c| c.as_slice())
                 .collect()
         })
         .collect();
     let _span = info_span!("Computing shifted columns for AIR sumcheck").entered();
-    let shifted_rows: Vec<Vec<Vec<F>>> = tables_sorted
-        .par_iter()
+    let shifted_rows: Vec<Vec<ArenaVec<F>>> = ALL_TABLES
+        .iter()
         .zip(&column_refs)
-        .map(|((table, _), cols)| compute_shifted_columns(&table.down_column_indexes(), cols))
+        .map(|(table, cols)| compute_shifted_columns(table.n_shift_columns(), cols))
         .collect();
     std::mem::drop(_span);
-    let mut sessions = Vec::with_capacity(tables_sorted.len());
-    for (idx, (table, log_n_rows)) in tables_sorted.iter().enumerate() {
+    let mut sessions = Vec::with_capacity(ALL_TABLES.len());
+    let mut alpha_offset = 0;
+    for (idx, table) in ALL_TABLES.iter().enumerate() {
+        let log_n_rows = tables_log_heights[table];
+        let n_constraints = table.n_constraints();
         let bus_numerator_value = logup_statements.bus_numerators_values[table];
         let bus_denominator_value = logup_statements.bus_denominators_values[table];
-        let bus_final_value = bus_numerator_value
-            * match table.bus().direction {
+        let signed_numerator = bus_numerator_value
+            * match table.bus_interactions()[0].direction {
                 BusDirection::Pull => EF::NEG_ONE,
                 BusDirection::Push => EF::ONE,
-            }
-            + bus_beta * (bus_denominator_value - logup_c);
+            };
+        // Each table consumes a disjoint range of alpha powers; alpha^offset weights the bus
+        // numerator (multiplicity), alpha^{offset+1} weights the bus fingerprint, alpha^{offset+2..}
+        // weight the remaining AIR constraints.
+        let bus_final_value = air_alpha_powers[alpha_offset] * signed_numerator
+            + air_alpha_powers[alpha_offset + 1] * (logup_c - bus_denominator_value);
 
-        let eq_suffix = from_end(gkr_point, *log_n_rows).to_vec();
+        let eq_suffix = from_end(gkr_point, log_n_rows).to_vec();
 
-        let extra_data = ExtraDataForBuses::new(logup_alphas_eq_poly.clone(), bus_beta, air_alpha_powers.clone());
+        let alpha_slice = air_alpha_powers[alpha_offset..alpha_offset + n_constraints].to_vec();
+        let extra_data = ExtraDataForBuses::new(&logup_alphas_eq_poly, alpha_slice);
 
-        let mut up_down: Vec<&[PF<EF>]> = column_refs[idx].to_vec();
-        up_down.extend(shifted_rows[idx].iter().map(Vec::as_slice));
-        let packed = MleGroupRef::<EF>::Base(up_down).pack();
+        let mut flat_and_shift: Vec<&[PF<EF>]> = column_refs[idx].to_vec();
+        flat_and_shift.extend(shifted_rows[idx].iter().map(|c| c.as_slice()));
+        let packed = MleGroupRef::<EF>::Base(flat_and_shift).pack();
 
         let non_padded = traces[table].non_padded_n_rows;
 
@@ -199,26 +206,27 @@ pub fn prove_execution(
             }};
         }
         sessions.push(delegate_to_inner!(table => make_session));
+        alpha_offset += n_constraints;
     }
 
-    let sumcheck_air_point = info_span!("batched AIR sumcheck")
-        .in_scope(|| prove_batched_air_sumcheck(&mut prover_state, &mut sessions, air_eta));
+    let sumcheck_air_point =
+        info_span!("batched AIR sumcheck").in_scope(|| prove_batched_air_sumcheck(&mut prover_state, &mut sessions));
 
-    for (idx, (table, _)) in tables_sorted.iter().enumerate() {
+    for (idx, table) in ALL_TABLES.iter().enumerate() {
         let col_evals = sessions[idx].final_column_evals();
         prover_state.add_extension_scalars(&col_evals);
 
         let natural_ordering_point =
             natural_ordering_point_for_session(&sumcheck_air_point.0, traces[table].log_n_rows);
         macro_rules! split {
-            ($t:expr) => {{ columns_evals_up_and_down($t, &col_evals, &natural_ordering_point) }};
+            ($t:expr) => {{ columns_evals_flat_and_shift($t, &col_evals, &natural_ordering_point) }};
         }
         let claim = delegate_to_inner!(table => split);
         committed_statements.get_mut(table).unwrap().push(claim);
     }
 
-    let public_memory_random_point = MultilinearPoint(prover_state.sample_vec(log2_strict_usize(public_memory_size)));
-    let public_memory_eval = (&memory[..public_memory_size]).evaluate(&public_memory_random_point);
+    let public_memory_random_point = MultilinearPoint(prover_state.sample_vec(log2_strict_usize(PUBLIC_INPUT_LEN)));
+    let public_memory_eval = (&memory[..PUBLIC_INPUT_LEN]).evaluate(&public_memory_random_point);
 
     let previous_statements = vec![
         SparseStatement::new(
@@ -248,6 +256,7 @@ pub fn prove_execution(
         stacked_pcs_witness.stacked_n_vars,
         log2_strict_usize(memory.len()),
         bytecode.log_size(),
+        bytecode.ending_pc,
         previous_statements,
         &tables_log_heights,
         &committed_statements,
@@ -265,6 +274,6 @@ pub fn prove_execution(
 
     Ok(ExecutionProof {
         proof: prover_state.into_proof(),
-        metadata,
+        metadata: Some(metadata),
     })
 }

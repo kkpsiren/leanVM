@@ -3,40 +3,35 @@ from snark_lib import *
 
 def main():
     p = 0
-    n = p[0]
-    expected_sum_pos = p[1]
-    expected_sum_neg = p[2]
-    x = p[3]
-    y = p[4]
-    expected_pipeline = p[5]
-    threshold = p[6]
-    threshold_check = p[7]
-
-    assert n == 5
+    expected_sum = p[0]
+    x = p[1]
+    expected_pipeline = p[2]
+    flag = p[3]
 
     markers = Array(5)
     for i in unroll(0, 5):
         markers[i] = i
 
-    sum_pos: Mut = 0
-    sum_neg: Mut = 0
+    sum_buf = Array(6)
+    sum_buf[0] = 0
     for i in range(0, 5):
         m = markers[i]
+        s: Mut = sum_buf[i]
         if m == 0:
-            sum_neg = sum_neg + 10
+            s = s + 10
         else:
-            sum_pos = sum_pos + m
-    assert sum_pos == expected_sum_pos
-    assert sum_neg == expected_sum_neg
+            s = s + m
+        sum_buf[i + 1] = s
+    assert sum_buf[5] == expected_sum
 
-    assert pipeline(x, y) == expected_pipeline
+    assert pipeline(x, x) == expected_pipeline
 
-    if threshold_check == 1:
-        assert threshold < 50
+    if flag == 1:
+        assert expected_sum < 50
     else:
-        assert threshold == 0
+        assert expected_sum == 0
 
-    assert threshold_check * (1 - threshold_check) == 0
+    assert flag * (1 - flag) == 0
     return
 
 

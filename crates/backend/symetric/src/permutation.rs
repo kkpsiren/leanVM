@@ -20,3 +20,22 @@ impl<R: Algebra<Goldilocks> + InjectiveMonomial<7> + Copy + Send + Sync + 'stati
         self.compress_in_place(input);
     }
 }
+
+/// A permutation in the mathematical sense.
+pub trait Permutation<T: Clone>: Clone + Sync {
+    #[inline(always)]
+    fn permute(&self, mut input: T) -> T {
+        self.permute_mut(&mut input);
+        input
+    }
+
+    fn permute_mut(&self, input: &mut T);
+}
+
+impl<R: Algebra<Goldilocks> + InjectiveMonomial<7> + Copy + Send + Sync + 'static> Permutation<[R; 8]>
+    for Poseidon1Goldilocks8
+{
+    fn permute_mut(&self, input: &mut [R; 8]) {
+        self.permute_in_place(input);
+    }
+}

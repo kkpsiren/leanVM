@@ -15,7 +15,6 @@ use field::{
     RawDataSerializable, TwoAdicField, impl_raw_serializable_primefield64, quotient_map_large_iint,
     quotient_map_large_uint, quotient_map_small_int,
 };
-use num_bigint::BigUint;
 use rand::Rng;
 use rand::distr::{Distribution, StandardUniform};
 use serde::{Deserialize, Serialize};
@@ -208,12 +207,18 @@ impl PrimeCharacteristicRing for Goldilocks {
     #[inline]
     fn mul_2exp_u64(&self, exp: u64) -> Self {
         // 2^96 = -1 mod P, 2^192 = 1 mod P.
-        if exp < 96 {
-            *self * Self::POWERS_OF_TWO[exp as usize]
-        } else if exp < 192 {
-            -*self * Self::POWERS_OF_TWO[(exp - 96) as usize]
-        } else {
-            self.mul_2exp_u64(exp % 192)
+        match exp {
+            0 => *self,
+            1 => *self + *self,
+            _ => {
+                if exp < 96 {
+                    *self * Self::POWERS_OF_TWO[exp as usize]
+                } else if exp < 192 {
+                    -*self * Self::POWERS_OF_TWO[(exp - 96) as usize]
+                } else {
+                    self.mul_2exp_u64(exp % 192)
+                }
+            }
         }
     }
 
@@ -221,7 +226,11 @@ impl PrimeCharacteristicRing for Goldilocks {
     fn div_2exp_u64(&self, mut exp: u64) -> Self {
         // 2^{-n} = 2^{192 - n} mod P.
         exp %= 192;
-        self.mul_2exp_u64(192 - exp)
+        match exp {
+            0 => *self,
+            1 => self.halve(),
+            _ => self.mul_2exp_u64(192 - exp),
+        }
     }
 
     #[inline]
@@ -323,8 +332,8 @@ impl Field for Goldilocks {
     }
 
     #[inline]
-    fn order() -> BigUint {
-        P.into()
+    fn bits() -> usize {
+        64
     }
 }
 
@@ -390,11 +399,7 @@ impl QuotientMap<i64> for Goldilocks {
     }
 }
 
-impl PrimeField for Goldilocks {
-    fn as_canonical_biguint(&self) -> BigUint {
-        self.as_canonical_u64().into()
-    }
-}
+impl PrimeField for Goldilocks {}
 
 impl PrimeField64 for Goldilocks {
     const ORDER_U64: u64 = P;

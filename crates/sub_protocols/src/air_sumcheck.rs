@@ -4,7 +4,7 @@ use std::ops::{Add, AddAssign, Mul, Sub};
 
 use backend::*;
 use lean_vm::ColIndex;
-use tracing::info_span;
+use tracing::{info_span, instrument};
 
 // Sumcheck to prove validity of AIR constraints
 //
@@ -89,22 +89,20 @@ where
                 let _span = info_span!("chunk-bit-reversing columns").entered();
                 let chunk_size = 1usize << pivot;
                 let shift = usize::BITS as usize - pivot;
-                let bit_reversed = cols
-                    .par_iter()
-                    .map(|&src| {
-                        let mut dst: Vec<PFPacking<EF>> = unsafe { uninitialized_vec(src.len()) };
-                        let src_u = PFPacking::<EF>::unpack_slice(src);
-                        let dst_u = PFPacking::<EF>::unpack_slice_mut(&mut dst);
-                        for (src_chunk, dst_chunk) in
-                            src_u.chunks_exact(chunk_size).zip(dst_u.chunks_exact_mut(chunk_size))
-                        {
-                            for (p, slot) in dst_chunk.iter_mut().enumerate() {
-                                *slot = src_chunk[p.reverse_bits() >> shift];
-                            }
+                let mut bit_reversed: Vec<ArenaVec<PFPacking<EF>>> = vec![ArenaVec::new(); cols.len()];
+                parallel::par_chunks_mut(&mut bit_reversed, 1, |i, out_slot| {
+                    let src = cols[i];
+                    let mut dst: ArenaVec<PFPacking<EF>> = unsafe { ArenaVec::uninitialized(src.len()) };
+                    let src_u = PFPacking::<EF>::unpack_slice(src);
+                    let dst_u = PFPacking::<EF>::unpack_slice_mut(&mut dst);
+                    for (src_chunk, dst_chunk) in src_u.chunks_exact(chunk_size).zip(dst_u.chunks_exact_mut(chunk_size))
+                    {
+                        for (p, slot) in dst_chunk.iter_mut().enumerate() {
+                            *slot = src_chunk[p.reverse_bits() >> shift];
                         }
-                        dst
-                    })
-                    .collect();
+                    }
+                    out_slot[0] = dst;
+                });
                 MleGroup::Owned(MleGroupOwned::BasePacked(bit_reversed))
             }
             _ => unreachable!(),
@@ -392,66 +390,54 @@ where
     let stride = 1usize << fold_bit;
     let lo_mask = stride - 1;
 
-    let acc = (0..active_count_pairs)
-        .into_par_iter()
-        .fold(
-            || {
-                (
-                    vec![EFT::ZERO; degree],
-                    Vec::<IF>::with_capacity(n_cols),
-                    Vec::<IF>::with_capacity(n_cols),
-                )
-            },
-            |(mut acc, mut point, mut diff), new_j| {
-                let i_hi = new_j >> fold_bit;
-                let i_lo = new_j & lo_mask;
-                let i0 = (i_hi << (fold_bit + 1)) | i_lo;
-                let i1 = i0 | stride;
-                let partial_eq = get_split_eq(new_j);
-                point.clear();
-                diff.clear();
-                for c in cols {
-                    let lo = c[i0];
-                    let hi = c[i1];
-                    point.push(lo);
-                    diff.push(hi - lo);
-                }
-                // z = 0 then (skip z = 1) z = 2, 3, …, degree.
-                acc[0] += eval_fn(computation, &point, extra_data) * partial_eq;
+    let acc = parallel::map_reduce_with_state(
+        active_count_pairs,
+        || (Vec::<IF>::with_capacity(n_cols), Vec::<IF>::with_capacity(n_cols)),
+        || vec![EFT::ZERO; degree],
+        |(point, diff), acc, new_j| {
+            let i_hi = new_j >> fold_bit;
+            let i_lo = new_j & lo_mask;
+            let i0 = (i_hi << (fold_bit + 1)) | i_lo;
+            let i1 = i0 | stride;
+            let partial_eq = get_split_eq(new_j);
+            point.clear();
+            diff.clear();
+            for c in cols {
+                let lo = c[i0];
+                let hi = c[i1];
+                point.push(lo);
+                diff.push(hi - lo);
+            }
+            // z = 0 then (skip z = 1) z = 2, 3, …, degree.
+            acc[0] += eval_fn(computation, point, extra_data) * partial_eq;
+            for k in 0..n_cols {
+                point[k] += diff[k];
+            }
+            for acc_z in &mut acc[1..] {
                 for k in 0..n_cols {
                     point[k] += diff[k];
                 }
-                for acc_z in &mut acc[1..] {
-                    for k in 0..n_cols {
-                        point[k] += diff[k];
-                    }
-                    *acc_z += eval_fn(computation, &point, extra_data) * partial_eq;
-                }
-                (acc, point, diff)
-            },
-        )
-        .map(|(acc, _, _)| acc)
-        .reduce(
-            || vec![EFT::ZERO; degree],
-            |mut a, b| {
-                for i in 0..degree {
-                    a[i] += b[i];
-                }
-                a
-            },
-        );
+                *acc_z += eval_fn(computation, point, extra_data) * partial_eq;
+            }
+        },
+        |mut a, b| {
+            for i in 0..degree {
+                a[i] += b[i];
+            }
+            a
+        },
+    );
 
     acc.into_iter().map(unpack_sum).collect()
 }
 
+#[instrument(skip_all)]
 pub fn prove_batched_air_sumcheck<'a, EF: ExtensionField<PF<EF>>>(
     prover_state: &mut impl FSProver<EF>,
     sessions: &mut [Box<dyn OuterSumcheckSession<EF> + 'a>],
-    eta: EF,
 ) -> MultilinearPoint<EF> {
     let n_rounds = sessions.iter().map(|s| s.initial_n_vars()).max().unwrap_or(0);
     let max_full_degree = sessions.iter().map(|s| s.bare_degree() + 1).max().unwrap_or(1);
-    let eta_powers: Vec<EF> = eta.powers().collect_n(sessions.len());
 
     let mut challenges = Vec::with_capacity(n_rounds);
     let mut k: Vec<EF> = vec![EF::ONE; sessions.len()];
@@ -463,12 +449,12 @@ pub fn prove_batched_air_sumcheck<'a, EF: ExtensionField<PF<EF>>>(
         for (idx, session) in sessions.iter_mut().enumerate() {
             let join_round = n_rounds - session.initial_n_vars();
             if round < join_round {
-                combined_coeffs[1] += eta_powers[idx] * k[idx] * session.sum();
+                combined_coeffs[1] += k[idx] * session.sum();
             } else {
                 let bare_poly = session.compute_bare_round_poly();
                 let full_coeffs = expand_bare_to_full(&bare_poly.coeffs, session.eq_alpha());
                 for (i, &c) in full_coeffs.iter().enumerate() {
-                    combined_coeffs[i] += eta_powers[idx] * k[idx] * c;
+                    combined_coeffs[i] += k[idx] * c;
                 }
                 bare_polys[idx] = Some(bare_poly);
             }
@@ -491,17 +477,17 @@ pub fn prove_batched_air_sumcheck<'a, EF: ExtensionField<PF<EF>>>(
     MultilinearPoint(challenges)
 }
 
-pub fn compute_shifted_columns<F: Field>(air_down_column_indexes: &[usize], columns: &[&[F]]) -> Vec<Vec<F>> {
-    air_down_column_indexes
-        .par_iter()
-        .map(|&col_index| {
-            let column = columns[col_index];
-            let mut down = unsafe { uninitialized_vec(column.len()) };
-            down[..column.len() - 1].copy_from_slice(&column[1..]);
-            down[column.len() - 1] = column[column.len() - 1];
-            down
-        })
-        .collect()
+pub fn compute_shifted_columns<F: Field>(n_shift_columns: usize, columns: &[&[F]]) -> Vec<ArenaVec<F>> {
+    // Convention: the first `n_shift_columns` columns are the ones that get shifted.
+    let mut out: Vec<ArenaVec<F>> = (0..n_shift_columns).map(|_| ArenaVec::new()).collect();
+    parallel::par_chunks_mut(&mut out, 1, |i, slot| {
+        let column = columns[i];
+        let mut shifted = unsafe { ArenaVec::<F>::uninitialized(column.len()) };
+        shifted[..column.len() - 1].copy_from_slice(&column[1..]);
+        shifted[column.len() - 1] = column[column.len() - 1];
+        slot[0] = shifted;
+    });
+    out
 }
 
 pub fn natural_ordering_point_for_session<EF: Copy>(sumcheck_air_point: &[EF], log_n_rows: usize) -> Vec<EF> {
@@ -512,22 +498,18 @@ pub fn natural_ordering_point_for_session<EF: Copy>(sumcheck_air_point: &[EF], l
         .collect()
 }
 
-pub fn columns_evals_up_and_down<EF: ExtensionField<PF<EF>>, A: Air>(
+pub fn columns_evals_flat_and_shift<EF: ExtensionField<PF<EF>>, A: Air>(
     air: &A,
     col_evals: &[EF],
     natural_ordering_point: &[EF],
 ) -> (MultilinearPoint<EF>, BTreeMap<ColIndex, EF>, BTreeMap<ColIndex, EF>) {
-    let n_up = air.n_columns();
-    debug_assert_eq!(col_evals.len(), n_up + air.n_down_columns());
+    let n_flat = air.n_columns();
+    debug_assert_eq!(col_evals.len(), n_flat + air.n_shift_columns());
 
     let point = MultilinearPoint(natural_ordering_point.to_vec());
 
-    let evals_eq: BTreeMap<ColIndex, EF> = col_evals[..n_up].iter().copied().enumerate().collect();
-    let evals_next: BTreeMap<ColIndex, EF> = col_evals[n_up..]
-        .iter()
-        .zip(air.down_column_indexes())
-        .map(|(&v, col_index)| (col_index, v))
-        .collect();
+    let evals_eq: BTreeMap<ColIndex, EF> = col_evals[..n_flat].iter().copied().enumerate().collect();
+    let evals_next: BTreeMap<ColIndex, EF> = col_evals[n_flat..].iter().copied().enumerate().collect();
 
     (point, evals_eq, evals_next)
 }

@@ -6,29 +6,17 @@ def main():
     n = p[0]
     sum_range = p[1]
     x = p[2]
-    y = p[3]
-    prod_xy = p[4]
-    outer = p[5]
-    inner_bound = p[6]
-    v = p[7]
+    prod = p[3]
 
     assert n == 5
 
-    s: Mut = 0
+    s_buf = Array(6)
+    s_buf[0] = 0
     for i in range(0, 5):
-        s = s + i
-    assert s == sum_range
+        s_buf[i + 1] = s_buf[i] + i
+    assert s_buf[5] == sum_range
 
-    assert mul(x, y) == prod_xy
-
-    nested: Mut = 0
-    for i in unroll(0, 3):
-        for j in unroll(0, 3):
-            nested = nested + i * j
-    assert nested == outer
-
-    assert v < inner_bound
-    assert inner_bound == v + 1
+    assert mul(x, x) == prod
     return
 
 

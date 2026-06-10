@@ -4,15 +4,11 @@ use poly::*;
 
 #[derive(Debug)]
 pub struct ConstraintFolderPacked<'a, IF, EF: ExtensionField<PF<EF>>, ExtraData: AlphaPowers<EF>> {
-    pub up: &'a [IF],
-    pub down: &'a [IF],
+    pub flat: &'a [IF],
+    pub shift: &'a [IF],
     pub extra_data: &'a ExtraData,
     pub accumulator: EFPacking<EF>,
     pub constraint_index: usize,
-    pub skip_low: bool,
-    pub accumulator_low: EFPacking<EF>,
-    pub cached_state: Option<Vec<IF>>,
-    pub low_ci_count: usize,
 }
 
 impl<'a, IF, EF, ExtraData> ConstraintFolderPacked<'a, IF, EF, ExtraData>
@@ -21,17 +17,13 @@ where
     EFPacking<EF>: PrimeCharacteristicRing,
     ExtraData: AlphaPowers<EF>,
 {
-    pub fn new(up: &'a [IF], down: &'a [IF], extra_data: &'a ExtraData) -> Self {
+    pub fn new(flat: &'a [IF], shift: &'a [IF], extra_data: &'a ExtraData) -> Self {
         Self {
-            up,
-            down,
+            flat,
+            shift,
             extra_data,
             accumulator: EFPacking::<EF>::ZERO,
             constraint_index: 0,
-            skip_low: false,
-            accumulator_low: EFPacking::<EF>::ZERO,
-            cached_state: None,
-            low_ci_count: 0,
         }
     }
 }
@@ -48,31 +40,26 @@ where
     type EF = EFPacking<EF>;
 
     #[inline]
-    fn up(&self) -> &[Self::IF] {
-        self.up
+    fn flat(&self) -> &[Self::IF] {
+        self.flat
     }
 
     #[inline]
-    fn down(&self) -> &[Self::IF] {
-        self.down
+    fn shift(&self) -> &[Self::IF] {
+        self.shift
     }
 
-    #[inline]
+    #[inline(always)]
     fn assert_zero(&mut self, x: IF) {
         let alpha_power = self.extra_data.alpha_powers()[self.constraint_index];
         self.accumulator += EFPacking::<EF>::from(alpha_power) * x;
         self.constraint_index += 1;
     }
 
-    #[inline]
+    #[inline(always)]
     fn assert_zero_ef(&mut self, x: EFPacking<EF>) {
         let alpha_power = self.extra_data.alpha_powers()[self.constraint_index];
         self.accumulator += EFPacking::<EF>::from(alpha_power) * x;
         self.constraint_index += 1;
-    }
-
-    #[inline]
-    fn eval_virtual_column(&mut self, x: Self::EF) {
-        self.assert_zero_ef(x);
     }
 }

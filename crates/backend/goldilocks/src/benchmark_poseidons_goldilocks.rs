@@ -13,7 +13,7 @@ const PACKING_WIDTH: usize = <FPacking as PackedValue>::WIDTH;
 #[test]
 #[ignore]
 fn bench_poseidon() {
-    // cargo test --release --package mt-goldilocks --lib -- benchmark_poseidons_goldilocks::bench_poseidon --exact --nocapture --ignored
+    // cargo test --release --package goldilocks --lib -- benchmark_poseidons_goldilocks::bench_poseidon --exact --nocapture --ignored
 
     let n = 1 << 23;
     let poseidon1_8 = default_goldilocks_poseidon1_8();

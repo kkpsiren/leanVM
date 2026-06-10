@@ -3,19 +3,20 @@
 use std::time::Instant;
 
 use fiat_shamir::{ProverState, VerifierState};
-use field::{Field, TwoAdicField};
+use field::Field;
 use goldilocks::{CubicExtensionFieldGL, Goldilocks, default_goldilocks_poseidon1_8};
-use mt_whir::*;
 use poly::*;
 use rand::{RngExt, SeedableRng, rngs::StdRng};
 use tracing_forest::{ForestLayer, util::LevelFilter};
 use tracing_subscriber::{EnvFilter, Registry, layer::SubscriberExt, util::SubscriberInitExt};
+use whir::*;
+use zk_alloc::ArenaVec;
 
 type F = Goldilocks;
 type EF = CubicExtensionFieldGL;
 
 /*
-WHIR_NUM_VARIABLES=25 cargo test --release --package mt-whir --test run_whir -- test_run_whir --exact --nocapture
+WHIR_NUM_VARIABLES=25 WHIR_LOG_INV_RATE=1 cargo test --release --package whir --test run_whir -- test_run_whir --exact --nocapture
 */
 
 #[test]
@@ -36,6 +37,11 @@ fn test_run_whir() {
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(18);
+    let starting_log_inv_rate = std::env::var("WHIR_LOG_INV_RATE")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(2);
+
     let num_coeffs = 1 << num_variables;
 
     let params = WhirConfigBuilder {
@@ -44,7 +50,7 @@ fn test_run_whir() {
         pow_bits: 18,
         folding_factor: FoldingFactor::new(7, 4),
         soundness_type: SecurityAssumption::JohnsonBound,
-        starting_log_inv_rate: 2,
+        starting_log_inv_rate,
         rs_domain_initial_reduction_factor: 5,
     };
     let params = WhirConfig::new(&params, num_variables);
@@ -95,11 +101,11 @@ fn test_run_whir() {
         ));
     }
 
-    let mut prover_state = ProverState::new(poseidon8);
+    let mut prover_state = ProverState::new(poseidon8, Default::default());
 
     precompute_dft_twiddles::<F>(1 << 24);
 
-    let polynomial: MleOwned<EF> = MleOwned::Base(polynomial);
+    let polynomial: MleOwned<EF> = MleOwned::Base(ArenaVec::from_iter(polynomial));
 
     let time = Instant::now();
     let witness = params.commit(&mut prover_state, &polynomial, num_coeffs);
@@ -118,7 +124,7 @@ fn test_run_whir() {
 
     let proof_size_single = pruned_proof.proof_size_fe() as f64 * F::bits() as f64 / 8.0;
 
-    let mut verifier_state = VerifierState::<EF, _>::new(pruned_proof, poseidon8).unwrap();
+    let mut verifier_state = VerifierState::<EF, _>::new(pruned_proof, poseidon8, Default::default()).unwrap();
 
     let parsed_commitment = params.parse_commitment::<F>(&mut verifier_state).unwrap();
 
@@ -140,7 +146,7 @@ fn display_whir_round_info() {
     let first_folding_factor = 7;
     for n_vars in 20..31 {
         for log_inv_rate in 1..5 {
-            if n_vars + log_inv_rate - first_folding_factor > F::TWO_ADICITY {
+            if n_vars + log_inv_rate - first_folding_factor > EFFECTIVE_TWO_ADICITY {
                 continue;
             }
             let params = WhirConfigBuilder {
