@@ -8,12 +8,10 @@ workspace = true
 
 [dependencies]
 tracing.workspace = true
-utils.workspace = true
-
 lean_vm.workspace = true
 backend.workspace = true
 
 [dev-dependencies]
-
 rand.workspace = true
+lean_prover.workspace = true
 

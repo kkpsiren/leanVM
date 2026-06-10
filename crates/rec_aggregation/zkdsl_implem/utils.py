@@ -41,8 +41,8 @@ def powers(alpha, n):
     # n: F
     assert n < 400
     assert 0 < n
-    # 2**log2_ceil(i) is not really necessary but helps reduce byetcode size (traedoff cycles / bytecode size)
-    res = match_range(n, range(1, 400), lambda i: powers_const(alpha, 2**log2_ceil(i)))
+    # 2**log2_ceil(i) is not really necessary but helps reduce bytecode size (tradeoff cycles / bytecode size)
+    res = match_range(n, range(1, 400), lambda i: powers_const(alpha, 2 ** log2_ceil(i)))
     return res
 
 
@@ -55,7 +55,7 @@ def powers_const(alpha, n: Const):
     set_to_one(res)
     if n == 1:
         return res
-    copy_5(alpha, res + DIM)
+    copy_ef(alpha, res + DIM)
     for i in unroll(1, n - 1):
         mul_extension(res + i * DIM, res + DIM, res + (i + 1) * DIM)
     return res
@@ -74,6 +74,7 @@ def product_first_n(values, n):
     res = match_range(n, range(0, 1), lambda _: ONE_EF_PTR, range(1, 33), lambda i: product_first_n_const(values, i))
     return res
 
+
 @inline
 def product_first_n_const(values, n):
     debug_assert(n != 0)
@@ -91,7 +92,7 @@ def compute_eq_mle_extension(point, n: Const):
 
     for s in unroll(0, n):
         p = Array(DIM)
-        copy_5(point + (n - 1 - s) * DIM, p)
+        copy_ef(point + (n - 1 - s) * DIM, p)
         for i in unroll(0, 2**s):
             mul_extension(p, res + (2**s - 1 + i) * DIM, res + (2 ** (s + 1) - 1 + 2**s + i) * DIM)
             sub_extension(
@@ -131,6 +132,20 @@ def poly_eq_base_extension(a, b, n):
     return res
 
 
+def poly_eq_base_extension_or_one(a, b, n):
+    # Like poly_eq_base_extension, but returns the identity (the extension element 1)
+    # when n == 0, i.e. the empty product, instead of failing the match_range dispatch.
+    debug_assert(n < 33)
+    res = match_range(
+        n,
+        range(0, 1),
+        lambda _: ONE_EF_PTR,
+        range(1, 33),
+        lambda i: poly_eq_base_extension(a, b, i),
+    )
+    return res
+
+
 @inline
 def expand_from_univariate_base(alpha, n):
     debug_assert(n < 33)
@@ -159,7 +174,7 @@ def expand_from_univariate_ext(alpha, n):
 
 def expand_from_univariate_ext_const(alpha, n: Const):
     res = Array(n * DIM)
-    copy_5(alpha, res)
+    copy_ef(alpha, res)
     for i in unroll(0, n - 1):
         mul_extension(res + i * DIM, res + i * DIM, res + (i + 1) * DIM)
     return res
@@ -184,7 +199,7 @@ def eval_multilinear_coeffs_rev(coeffs, point, n: Const):
     set_to_one(basis)
     for k in unroll(0, n):
         p = Array(DIM)
-        copy_5(point + k * DIM, p)
+        copy_ef(point + k * DIM, p)
         for j in unroll(0, 2**k):
             mul_extension(basis + j * DIM, p, basis + (j + 2**k) * DIM)
     result = Array(DIM)
@@ -198,10 +213,12 @@ def dot_product_be_dynamic(a, b, res, n):
     match_range(n, range(1, 400), lambda i: dot_product_be(a, b, res, i))
     return
 
+
 def dot_product_ee_dynamic(a, b, res, n):
     debug_assert(n < 400)
     match_range(n, range(1, 400), lambda i: dot_product_ee(a, b, res, i))
     return
+
 
 def mle_of_01234567_etc(point, n):
     if n == 0:
@@ -219,7 +236,7 @@ def mle_of_01234567_etc(point, n):
 
 @inline
 def checked_less_than(a, b):
-    res: Imu
+    res: Imm
     hint_less_than(a, b, res)
     assert res * (1 - res) == 0
     if res == 1:
@@ -232,7 +249,7 @@ def checked_less_than(a, b):
 @inline
 def maximum(a, b):
     is_a_less_than_b = checked_less_than(a, b)
-    res: Imu
+    res: Imm
     if is_a_less_than_b == 1:
         res = b
     else:
@@ -310,6 +327,7 @@ def div_extension_ret(n, d):
     div_extension(n, d, quotient)
     return quotient
 
+
 @inline
 def div_extension(n, d, res):
     dot_product_ee(d, res, n)
@@ -356,6 +374,12 @@ def sub_extension_ret(a, b):
 
 
 @inline
+def copy_ef(a, b):
+    dot_product_ee(a, ONE_EF_PTR, b)
+    return
+
+
+@inline
 def copy_5(a, b):
     dot_product_ee(a, ONE_EF_PTR, b)
     return
@@ -367,6 +391,7 @@ def set_to_5_zeros(a):
     dot_product_ee(a, ONE_EF_PTR, zero_ptr)
     return
 
+
 @inline
 def set_to_6_zeros(a):
     zero_ptr = ZERO_VEC_PTR
@@ -374,18 +399,11 @@ def set_to_6_zeros(a):
     a[5] = 0
     return
 
+
 @inline
 def copy_6(a, b):
     dot_product_ee(a, ONE_EF_PTR, b)
     a[5] = b[5]
-    return
-
-@inline
-def set_to_7_zeros(a):
-    zero_ptr = ZERO_VEC_PTR
-    dot_product_ee(a, ONE_EF_PTR, zero_ptr)
-    a[5] = 0
-    a[6] = 0
     return
 
 
@@ -405,20 +423,12 @@ def copy_8(a, b):
 
 
 @inline
-def copy_16(a, b):
-    dot_product_ee(a, ONE_EF_PTR, b)
-    dot_product_ee(a + 5, ONE_EF_PTR, b + 5)
-    dot_product_ee(a + 10, ONE_EF_PTR, b + 10)
-    a[15] = b[15]
-    return
-
-@inline
 def copy_32(a, b):
     chunks = div_floor(32, DIM)
     for i in unroll(0, chunks):
-        copy_5(a + i * DIM, b + i * DIM)
+        copy_ef(a + i * DIM, b + i * DIM)
     if DIM * chunks != 32:
-        copy_5(a + (32 - DIM), b + (32 - DIM))
+        copy_ef(a + (32 - DIM), b + (32 - DIM))
     return
 
 
@@ -433,24 +443,6 @@ def copy_many_ef(a, b, n):
 def set_to_one(a):
     dot_product_ee(ONE_EF_PTR, ONE_EF_PTR, a)
     return
-
-
-def print_ef(a):
-    for i in unroll(0, DIM):
-        print(a[i])
-    return
-
-
-def print_vec(a):
-    for i in unroll(0, DIGEST_LEN):
-        print(a[i])
-    return
-
-
-@inline
-def read_memory(ptr):
-    mem = 0
-    return mem[ptr]
 
 
 @inline
@@ -527,7 +519,7 @@ def whir_1_merkle_step_and_pow(v, state_in, path_chunk, state_out, power_shift):
 
 
 @inline
-def decompose_and_verify_merkle_query(a, domain_size, prev_root, num_chunks):
+def decompose_and_verify_merkle_query(a, domain_size, prev_root, num_chunks, leaf_iv):
     nibbles = Array(6)
     hint_decompose_bits_merkle_whir(nibbles, a, 4)
 
@@ -548,7 +540,7 @@ def decompose_and_verify_merkle_query(a, domain_size, prev_root, num_chunks):
 
     leaf_data = Array(num_chunks * DIGEST_LEN)
     hint_witness("merkle_leaf", leaf_data)
-    leaf_hash = slice_hash_rtl(leaf_data, num_chunks)
+    leaf_hash = slice_hash_rtl(leaf_data, num_chunks, leaf_iv)
 
     merkle_path = Array(domain_size * DIGEST_LEN)
     hint_witness("merkle_path", merkle_path)
@@ -557,6 +549,7 @@ def decompose_and_verify_merkle_query(a, domain_size, prev_root, num_chunks):
     states = Array((n_nibbles - 1) * DIGEST_LEN)
 
     prod: Mut = 1
+    nib_pow: Mut
 
     # First nibble: leaf_hash -> states[0]
     nib_pow = match_range(
@@ -675,10 +668,13 @@ def mle_of_zeros_then_ones(point, n_zeros, n_vars):
 
     bits, _ = checked_decompose_bits(n_zeros)
 
-    res: Mut = Array(DIM)
-    set_to_one(res)
+    res_0 = Array(DIM)
+    set_to_one(res_0)
 
+    res_buf = Array(n_vars + 1)
+    res_buf[0] = res_0
     for i in range(0, n_vars):
+        res: Mut = res_buf[i]
         p = point + (n_vars - 1 - i) * DIM
         if bits[F_BITS - 1 - i] == 0:
             one_minus_p = one_minus_self_extension_ret(p)
@@ -686,7 +682,8 @@ def mle_of_zeros_then_ones(point, n_zeros, n_vars):
             res = add_extension_ret(tmp, p)
         else:
             res = mul_extension_ret(p, res)
-    return res
+        res_buf[i + 1] = res
+    return res_buf[n_vars]
 
 
 def mle_of_zeros_then_ones_pow2(point, log_n_zeros: Const, n_vars):
@@ -694,11 +691,11 @@ def mle_of_zeros_then_ones_pow2(point, log_n_zeros: Const, n_vars):
     if log_n_zeros == n_vars:
         return ZERO_VEC_PTR
     n_factors = n_vars - log_n_zeros
-    prod: Mut = one_minus_self_extension_ret(point)
+    prod_buf = Array(n_factors)
+    prod_buf[0] = one_minus_self_extension_ret(point)
     for i in range(1, n_factors):
-        new_prod = mul_extension_ret(prod, one_minus_self_extension_ret(point + i * DIM))
-        prod = new_prod
-    return sub_base_extension_ret(1, prod)
+        prod_buf[i] = mul_extension_ret(prod_buf[i - 1], one_minus_self_extension_ret(point + i * DIM))
+    return sub_base_extension_ret(1, prod_buf[n_factors - 1])
 
 
 @inline
@@ -709,11 +706,13 @@ def embed_in_ef(f):
         res[i] = 0
     return res
 
+
 def next_mle(x, y, n):
     debug_assert(n < 32)
     debug_assert(n != 0)
     res = match_range(n, range(1, 32), lambda i: next_mle_const(x, y, i))
     return res
+
 
 def next_mle_const(x, y, n: Const):
     # x and y are pointers to n elements of extension field
@@ -758,27 +757,25 @@ def next_mle_const(x, y, n: Const):
     return result
 
 
-def _verify_log2_small(n, partial_sums_24, log2: Const):
-    # For log2 in [3, 23]: verify n has exactly log2 bits
-    assert partial_sums_24[log2 - 1] == n
-    assert partial_sums_24[log2 - 2] != n
-    return
-
-
-def _verify_log2_large(n, log2: Const):
-    # For log2 in [24, 30]: verify 2^(log2-1) < n <= 2^log2
-    # by checking that n - 2^(log2-1) - 1 fits in (log2-1) bits
-    remainder = n - 2 ** (log2 - 1) - 1
-    _unused = checked_decompose_bits_small_value_const(remainder, log2 - 1)
-    return
+def _verify_log2_ceil(n, log2: Const):
+    # log2 == ceil(log2(n))  <=>  2^(log2-1) < n <= 2^log2  <=>  r := n - 2^(log2-1) - 1 is a (log2-1)-bit value
+    # (in [0, 2^(log2-1))), which checked_decompose_bits_small_value_const checks. A wrong log2 makes r too big:
+    #   too small (n > 2^log2):       r >= 2^(log2-1)
+    #   too large (n <= 2^(log2-1)):  r in (-p, 0), so r mod p = p + n - 2^(log2-1) - 1 > 2^(log2-1),
+    #                                 since p + n - 1 - 2^log2 >= n + 2^30 - 2^24 > 0.
+    if log2 < 2:
+        assert False
+    else:
+        remainder = n - 2 ** (log2 - 1) - 1
+        _ = checked_decompose_bits_small_value_const(remainder, log2 - 1)
+        return
 
 
 def log2_ceil_runtime(n):
-    # requires: 2 < n <= 2^30
-    log2: Imu
+    # requires: 2 < n <= 2^30, so 2 <= ceil(log2(n)) <= 30
+    log2: Imm
     hint_log2_ceil(n, log2)
     assert log2 < 31
-    if two_exp(log2) != n:
-        _, partial_sums_24 = checked_decompose_bits(n)
-        match_range(log2, range(2, 24), lambda i: _verify_log2_small(n, partial_sums_24, i), range(24, 31), lambda i: _verify_log2_large(n, i))
+    match_range(log2, range(0, 31), lambda i: _verify_log2_ceil(n, i))
     return log2
+

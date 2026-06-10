@@ -8,7 +8,7 @@ def helper_const(n: Const):
 
 
 def main():
-    # Test 1: Basic match_range - no forward declaration needed (auto-generated as Imu)
+    # Test 1: Basic match_range - no forward declaration needed (auto-generated as Imm)
     x = 2
     r1 = match_range(x, range(0, 4), lambda i: i * 100)
     assert r1 == 200
@@ -127,7 +127,9 @@ def main():
 
     # Test 20: Three values with multiple ranges
     v20 = 4
-    x20, y20, z20 = match_range(v20, range(0, 3), lambda i: three_values_const(i), range(3, 6), lambda i: three_values_offset(i))
+    x20, y20, z20 = match_range(
+        v20, range(0, 3), lambda i: three_values_const(i), range(3, 6), lambda i: three_values_offset(i)
+    )
     assert x20 == 104  # 4 + 100
     assert y20 == 1004  # 4 + 1000
     assert z20 == 10004  # 4 + 10000

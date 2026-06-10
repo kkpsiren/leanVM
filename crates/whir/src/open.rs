@@ -4,10 +4,9 @@ use ::utils::log2_strict_usize;
 use fiat_shamir::{FSProver, MerklePath, ProofResult};
 use field::PrimeCharacteristicRing;
 use field::{ExtensionField, Field, TwoAdicField};
-use poly::*;
-use rayon::prelude::*;
 use sumcheck::{ProductComputation, run_product_sumcheck, sumcheck_prove_many_rounds};
 use tracing::{info_span, instrument};
+use zk_alloc::{ArenaVec, arena_vec};
 
 use crate::{config::WhirConfig, *};
 
@@ -142,6 +141,7 @@ where
         };
 
         // Randomness for combination
+        prover_state.duplex();
         let combination_randomness_gen: EF = prover_state.sample();
         let ood_combination_randomness: Vec<_> = combination_randomness_gen.powers().collect_n(ood_challenges.len());
         round_state
@@ -187,7 +187,7 @@ where
         // Convert evaluations to coefficient form and send to the verifier.
         let mut coeffs = match &round_state.sumcheck_prover.evals {
             MleOwned::Extension(evals) => evals.clone(),
-            MleOwned::ExtensionPacked(evals) => unpack_extension::<EF>(evals),
+            MleOwned::ExtensionPacked(evals) => unpack_extension(evals),
             _ => unreachable!(),
         };
         evals_to_coeffs(&mut coeffs);
@@ -211,14 +211,14 @@ where
             match answer {
                 MleOwned::Base(leaf) => {
                     base_paths.push(MerklePath {
-                        leaf_data: leaf,
+                        leaf_data: leaf.to_vec(),
                         sibling_hashes,
                         leaf_index: challenge,
                     });
                 }
                 MleOwned::Extension(leaf) => {
                     ext_paths.push(MerklePath {
-                        leaf_data: leaf,
+                        leaf_data: leaf.to_vec(),
                         sibling_hashes,
                         leaf_index: challenge,
                     });
@@ -291,14 +291,14 @@ fn open_merkle_tree_at_challenges<EF: ExtensionField<PF<EF>>>(
         match &answer {
             MleOwned::Base(leaf) => {
                 base_paths.push(MerklePath {
-                    leaf_data: leaf.clone(),
+                    leaf_data: leaf.to_vec(),
                     sibling_hashes,
                     leaf_index: challenge,
                 });
             }
             MleOwned::Extension(leaf) => {
                 ext_paths.push(MerklePath {
-                    leaf_data: leaf.clone(),
+                    leaf_data: leaf.to_vec(),
                     sibling_hashes,
                     leaf_index: challenge,
                 });
@@ -484,6 +484,7 @@ where
 
         statement.splice(0..0, ood_statements);
 
+        prover_state.duplex();
         let combination_randomness_gen: EF = prover_state.sample();
 
         let (sumcheck_prover, folding_randomness) = SumcheckSingle::run_initial_sumcheck_rounds(
@@ -513,19 +514,48 @@ where
 }
 
 #[instrument(skip_all, fields(num_constraints = statements.len(), n_vars = statements[0].total_num_variables))]
-fn combine_statement<EF>(statements: &[SparseStatement<EF>], gamma: EF) -> (Vec<EFPacking<EF>>, EF)
+fn combine_statement<EF>(statements: &[SparseStatement<EF>], gamma: EF) -> (ArenaVec<EFPacking<EF>>, EF)
 where
     EF: ExtensionField<PF<EF>>,
 {
     let num_variables = statements[0].total_num_variables;
     assert!(statements.iter().all(|e| e.total_num_variables == num_variables));
 
-    let mut combined_weights = EFPacking::<EF>::zero_vec(1 << (num_variables - packing_log_width::<EF>()));
+    let out_len = 1 << (num_variables - packing_log_width::<EF>());
 
+    let is_full = |s: &SparseStatement<EF>| {
+        !s.is_next && s.values.len() == 1 && s.values[0].selector == 0 && s.inner_num_variables() == num_variables
+    };
+
+    let mut combined_weights: ArenaVec<EFPacking<EF>>;
     let mut combined_sum = EF::ZERO;
     let mut gamma_pow = EF::ONE;
 
-    for smt in statements {
+    let start_idx = match statements {
+        [a, b, ..] if is_full(a) && is_full(b) => {
+            combined_weights = unsafe { ArenaVec::uninitialized(out_len) };
+            let sa = gamma_pow;
+            let sb = gamma_pow * gamma;
+            combined_sum = a.values[0].value * sa + b.values[0].value * sb;
+            gamma_pow = sb * gamma;
+            compute_eval_eq_packed_dual::<EF>(&a.point.0, &b.point.0, &mut combined_weights, sa, sb);
+            2
+        }
+        [a, ..] if is_full(a) => {
+            combined_weights = unsafe { ArenaVec::uninitialized(out_len) };
+            let sa = gamma_pow;
+            combined_sum = a.values[0].value * sa;
+            gamma_pow *= gamma;
+            compute_eval_eq_packed::<EF, false>(&a.point.0, &mut combined_weights, sa);
+            1
+        }
+        _ => {
+            combined_weights = unsafe { ArenaVec::zeroed(out_len) };
+            0
+        }
+    };
+
+    for smt in &statements[start_idx..] {
         if !smt.is_next && (smt.values.len() == 1 || smt.inner_num_variables() < packing_log_width::<EF>()) {
             for evaluation in &smt.values {
                 compute_sparse_eval_eq_packed::<EF>(evaluation.selector, &smt.point, &mut combined_weights, gamma_pow);
@@ -533,7 +563,7 @@ where
                 gamma_pow *= gamma;
             }
         } else {
-            let inner_poly = if smt.is_next {
+            let inner_poly: ArenaVec<EFPacking<EF>> = if smt.is_next {
                 let next = matrix_next_mle_folded(&smt.point.0);
                 pack_extension(&next)
             } else {
@@ -556,27 +586,33 @@ where
                     .collect::<Vec<_>>(),
             );
             chunks_mut.remove(0);
-            let mut next_gamma_powers = vec![gamma_pow];
+            let mut next_gamma_powers = arena_vec![gamma_pow];
             for _ in 1..indexed_smt_values.len() {
                 next_gamma_powers.push(*next_gamma_powers.last().unwrap() * gamma);
             }
             for (e, &scalar) in smt.values.iter().zip(&next_gamma_powers) {
                 combined_sum += e.value * scalar;
             }
-            chunks_mut
-                .into_par_iter()
+            let n = 1usize << shift;
+            let mask = n - 1;
+            let ptrs: ArenaVec<(parallel::SendPtr<EFPacking<EF>>, EF)> = chunks_mut
+                .iter_mut()
                 .zip(&indexed_smt_values)
-                .for_each(|(out_buff, &(origin_index, _))| {
-                    out_buff[..1 << shift]
-                        .par_iter_mut()
-                        .zip(&inner_poly)
-                        .for_each(|(out_elem, &poly_elem)| {
-                            *out_elem += poly_elem * next_gamma_powers[origin_index];
-                        });
-                });
+                .map(|(out_buff, &(origin_index, _))| {
+                    (
+                        parallel::SendPtr(out_buff.as_mut_ptr()),
+                        next_gamma_powers[origin_index],
+                    )
+                })
+                .collect();
+            let inner = inner_poly.as_slice();
+            parallel::for_each_index(ptrs.len() << shift, |flat| {
+                let (ptr, scalar) = &ptrs[flat >> shift];
+                let i = flat & mask;
+                unsafe { *ptr.add(i) += inner[i] * *scalar };
+            });
             gamma_pow = *next_gamma_powers.last().unwrap() * gamma;
         }
     }
-
     (combined_weights, combined_sum)
 }

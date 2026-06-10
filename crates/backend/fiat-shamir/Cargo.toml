@@ -1,13 +1,12 @@
 [package]
-name = "mt-fiat-shamir"
+name = "fiat-shamir"
 version.workspace = true
 edition.workspace = true
 
 [dependencies]
-field = { path = "../field", package = "mt-field" }
-koala-bear = { path = "../koala-bear", package = "mt-koala-bear" }
-symetric = { path = "../symetric", package = "mt-symetric" }
-utils = { path = "../utils", package = "mt-utils" }
-tracing.workspace = true
+field = { path = "../field", package = "field" }
+koala-bear = { path = "../koala-bear", package = "koala-bear" }
+symetric = { path = "../symetric", package = "symetric" }
+utils = { path = "../utils", package = "utils" }
 serde.workspace = true
-rayon.workspace = true
+parallel.workspace = true

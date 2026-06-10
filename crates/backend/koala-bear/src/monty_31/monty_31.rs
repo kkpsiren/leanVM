@@ -17,7 +17,6 @@ use field::{
     Field, InjectiveMonomial, Packable, PermutationMonomial, PrimeCharacteristicRing, PrimeField, PrimeField32,
     PrimeField64, RawDataSerializable, TwoAdicField, impl_raw_serializable_primefield32, quotient_map_small_int,
 };
-use num_bigint::BigUint;
 use rand::Rng;
 use rand::distr::{Distribution, StandardUniform};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -426,8 +425,8 @@ impl<FP: FieldParameters> Field for MontyField31<FP> {
     }
 
     #[inline]
-    fn order() -> BigUint {
-        FP::PRIME.into()
+    fn bits() -> usize {
+        31
     }
 }
 
@@ -587,11 +586,7 @@ impl<FP: FieldParameters> QuotientMap<i128> for MontyField31<FP> {
     }
 }
 
-impl<FP: FieldParameters> PrimeField for MontyField31<FP> {
-    fn as_canonical_biguint(&self) -> BigUint {
-        self.as_canonical_u32().into()
-    }
-}
+impl<FP: FieldParameters> PrimeField for MontyField31<FP> {}
 
 impl<FP: FieldParameters> PrimeField64 for MontyField31<FP> {
     const ORDER_U64: u64 = FP::PRIME as u64;

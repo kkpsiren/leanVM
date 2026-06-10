@@ -5,17 +5,18 @@ use std::time::Instant;
 use fiat_shamir::{ProverState, VerifierState};
 use field::{Field, TwoAdicField};
 use koala_bear::{KoalaBear, QuinticExtensionFieldKB, default_koalabear_poseidon1_16};
-use mt_whir::*;
 use poly::*;
 use rand::{RngExt, SeedableRng, rngs::StdRng};
 use tracing_forest::{ForestLayer, util::LevelFilter};
 use tracing_subscriber::{EnvFilter, Registry, layer::SubscriberExt, util::SubscriberInitExt};
+use whir::*;
+use zk_alloc::ArenaVec;
 
 type F = KoalaBear;
 type EF = QuinticExtensionFieldKB;
 
 /*
-WHIR_NUM_VARIABLES=25 WHIR_LOG_INV_RATE=1 cargo test --release --package mt-whir --test run_whir -- test_run_whir --exact --nocapture
+WHIR_NUM_VARIABLES=25 WHIR_LOG_INV_RATE=1 cargo test --release --package whir --test run_whir -- test_run_whir --exact --nocapture
 */
 
 #[test]
@@ -100,11 +101,11 @@ fn test_run_whir() {
         ));
     }
 
-    let mut prover_state = ProverState::new(poseidon16.clone());
+    let mut prover_state = ProverState::new(poseidon16.clone(), Default::default());
 
     precompute_dft_twiddles::<F>(1 << F::TWO_ADICITY);
 
-    let polynomial: MleOwned<EF> = MleOwned::Base(polynomial);
+    let polynomial: MleOwned<EF> = MleOwned::Base(ArenaVec::from_iter(polynomial));
 
     let time = Instant::now();
     let witness = params.commit(&mut prover_state, &polynomial, num_coeffs);
@@ -123,7 +124,7 @@ fn test_run_whir() {
 
     let proof_size_single = pruned_proof.proof_size_fe() as f64 * F::bits() as f64 / 8.0;
 
-    let mut verifier_state = VerifierState::<EF, _>::new(pruned_proof, poseidon16.clone()).unwrap();
+    let mut verifier_state = VerifierState::<EF, _>::new(pruned_proof, poseidon16.clone(), Default::default()).unwrap();
 
     let parsed_commitment = params.parse_commitment::<F>(&mut verifier_state).unwrap();
 

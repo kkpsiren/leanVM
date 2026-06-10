@@ -4,6 +4,7 @@ use fiat_shamir::FSProver;
 use field::{ExtensionField, TwoAdicField};
 use poly::*;
 use tracing::{info_span, instrument};
+use zk_alloc::ArenaVec;
 
 use crate::*;
 
@@ -35,11 +36,11 @@ impl<EF: ExtensionField<PF<EF>>> MerkleData<EF> {
         match self {
             MerkleData::Base(prover_data) => {
                 let (leaf, proof) = merkle_open::<PF<EF>, PF<EF>>(prover_data, index);
-                (MleOwned::Base(leaf), proof)
+                (MleOwned::Base(ArenaVec::from_slice(&leaf)), proof)
             }
             MerkleData::Extension(prover_data) => {
                 let (leaf, proof) = merkle_open::<PF<EF>, EF>(prover_data, index);
-                (MleOwned::Extension(leaf), proof)
+                (MleOwned::Extension(ArenaVec::from_slice(&leaf)), proof)
             }
         }
     }

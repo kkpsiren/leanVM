@@ -1,6 +1,6 @@
 use backend::*;
+use lean_prover::fiat_shamir_domain_sep;
 use lean_vm::*;
-use utils::{build_prover_state, get_poseidon16, poseidon_compress_slice, poseidon16_compress_pair};
 
 use crate::compilation::BYTECODE_CLAIM_OFFSET;
 use crate::{InnerVerified, get_aggregation_bytecode};
@@ -52,24 +52,22 @@ pub(crate) fn reduce_bytecode_claims(verified: &[InnerVerified]) -> ReducedBytec
         ));
         claims.push(v.bytecode_evaluation.clone());
     }
-    let claims_hash = hash_bytecode_claims(&claims);
-
-    let mut reduction_prover = build_prover_state();
-    reduction_prover.add_base_scalars(&claims_hash);
-    let alpha: EF = reduction_prover.sample();
-
     let n_claims = claims.len();
+    let claim_size_padded = bytecode.bytecode_claim_size().next_multiple_of(DIGEST_LEN);
+    let bytecode_claims_fs_input = build_bytecode_claims_ingested_by_fiatshamir(&claims, claim_size_padded);
+
+    let mut reduction_capacity = fiat_shamir_domain_sep(bytecode);
+    reduction_capacity[0] += F::ONE; // Domain-separate this sub-protocol's Fiat-Shamir from the main snark
+    let mut reduction_prover = ProverState::new(get_poseidon16().clone(), reduction_capacity);
+    reduction_prover.observe_scalars(&bytecode_claims_fs_input);
+    let alpha: EF = reduction_prover.sample();
     let alpha_powers: Vec<EF> = alpha.powers().take(n_claims).collect();
 
-    let weights_packed = claims
-        .par_iter()
-        .zip(&alpha_powers)
-        .map(|(eval, &alpha_i)| eval_eq_packed_scaled(&eval.point.0, alpha_i))
-        .reduce_with(|mut acc, eq_i| {
-            acc.par_iter_mut().zip(&eq_i).for_each(|(w, e)| *w += *e);
-            acc
-        })
-        .unwrap();
+    let n_vars = claims[0].point.0.len();
+    let mut weights_packed = EFPacking::<EF>::zero_vec(1 << (n_vars - packing_log_width::<EF>()));
+    for (claim, &alpha_pow) in claims.iter().zip(&alpha_powers) {
+        compute_eval_eq_packed::<EF, true>(&claim.point.0, &mut weights_packed, alpha_pow);
+    }
 
     let claimed_sum: EF = dot_product(claims.iter().map(|c| c.value), alpha_powers.iter().copied());
 
@@ -87,8 +85,13 @@ pub(crate) fn reduce_bytecode_claims(verified: &[InnerVerified]) -> ReducedBytec
     assert_eq!(bytecode_claim_output.len(), bytecode.bytecode_claim_size());
 
     let sumcheck_transcript = {
-        let mut vs = VerifierState::<EF, _>::new(reduction_prover.into_proof(), get_poseidon16().clone()).unwrap();
-        vs.next_base_scalars_vec(claims_hash.len()).unwrap();
+        let mut vs = VerifierState::<EF, _>::new(
+            reduction_prover.into_proof(),
+            get_poseidon16().clone(),
+            reduction_capacity,
+        )
+        .unwrap();
+        vs.observe_scalars(&bytecode_claims_fs_input);
         let _: EF = vs.sample();
         sumcheck_verify(&mut vs, bytecode.cumulated_n_vars(), 2, claimed_sum, None).unwrap();
         vs.into_raw_proof().transcript
@@ -116,21 +119,19 @@ pub(crate) fn extract_bytecode_claim_from_input_data(
     Evaluation::new(point, value)
 }
 
-pub(crate) fn hash_bytecode_claims(claims: &[Evaluation<EF>]) -> [F; DIGEST_LEN] {
-    let mut running_hash = [F::ZERO; DIGEST_LEN];
+fn build_bytecode_claims_ingested_by_fiatshamir(claims: &[Evaluation<EF>], claim_size_padded: usize) -> Vec<F> {
+    let mut buf = Vec::with_capacity(DIGEST_LEN + claims.len() * claim_size_padded);
+    buf.push(F::from_usize(claims.len()));
+    buf.resize(DIGEST_LEN, F::ZERO);
     for eval in claims {
-        let mut ef_data: Vec<EF> = eval.point.0.clone();
-        ef_data.push(eval.value);
-        let mut data = flatten_scalars_to_base::<F, EF>(&ef_data);
-        data.resize(data.len().next_multiple_of(DIGEST_LEN), F::ZERO);
-
-        let claim_hash = poseidon_compress_slice(&data, false);
-        running_hash = poseidon16_compress_pair(&running_hash, &claim_hash);
+        let start = buf.len();
+        buf.extend(flatten_bytecode_claim(eval));
+        buf.resize(start + claim_size_padded, F::ZERO);
     }
-    running_hash
+    buf
 }
 
 pub(crate) fn bytecode_reduction_sumcheck_proof_size(bytecode_point_n_vars: usize) -> usize {
     let per_round = (3 * DIMENSION).next_multiple_of(DIGEST_LEN);
-    DIGEST_LEN + bytecode_point_n_vars * per_round
+    bytecode_point_n_vars * per_round
 }

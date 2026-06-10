@@ -1,10 +1,8 @@
 use crate::*;
 use crate::{EFPacking, PF};
+use ::utils::log2_ceil_usize;
 use field::{ExtensionField, Field, PrimeCharacteristicRing};
-use itertools::Itertools;
-use rayon::{join, prelude::*};
-use std::borrow::Borrow;
-
+use zk_alloc::ArenaVec;
 pub trait EvaluationsList<F: Field> {
     fn num_variables(&self) -> usize;
     fn num_evals(&self) -> usize;
@@ -14,30 +12,30 @@ pub trait EvaluationsList<F: Field> {
     fn evaluate_sparse<EF: ExtensionField<F>>(&self, selector: usize, point: &MultilinearPoint<EF>) -> EF;
 }
 
-impl<F: Field, EL: Borrow<[F]>> EvaluationsList<F> for EL {
+impl<F: Field, EL: AsRef<[F]>> EvaluationsList<F> for EL {
     fn num_variables(&self) -> usize {
-        self.borrow().len().ilog2() as usize
+        self.as_ref().len().ilog2() as usize
     }
 
     fn num_evals(&self) -> usize {
-        self.borrow().len()
+        self.as_ref().len()
     }
 
     fn evaluate<EF: ExtensionField<F>>(&self, point: &MultilinearPoint<EF>) -> EF {
-        eval_multilinear::<_, _, true>(self.borrow(), point)
+        eval_multilinear::<_, _, true>(self.as_ref(), point)
     }
 
     fn evaluate_sequential<EF: ExtensionField<F>>(&self, point: &MultilinearPoint<EF>) -> EF {
-        eval_multilinear::<_, _, false>(self.borrow(), point)
+        eval_multilinear::<_, _, false>(self.as_ref(), point)
     }
 
     fn as_constant(&self) -> F {
-        assert_eq!(self.borrow().len(), 1);
-        self.borrow()[0]
+        assert_eq!(self.as_ref().len(), 1);
+        self.as_ref()[0]
     }
 
     fn evaluate_sparse<EF: ExtensionField<F>>(&self, selector: usize, point: &MultilinearPoint<EF>) -> EF {
-        (&self.borrow()[selector << point.len()..][..(1 << point.len())]).evaluate(point)
+        (&self.as_ref()[selector << point.len()..][..(1 << point.len())]).evaluate(point)
     }
 }
 
@@ -78,16 +76,6 @@ where
             let (c0, c1) = coeffs.split_at(coeffs.len() / 2);
             eval_multilinear_coeffs(c0, tail) + eval_multilinear_coeffs(c1, tail) * *x
         }
-    }
-}
-
-/// Multiply the polynomial by a scalar factor.
-#[must_use]
-pub fn scale_poly<F: Field, EF: ExtensionField<F>>(poly: &[F], factor: EF) -> Vec<EF> {
-    if poly.len() < PARALLEL_THRESHOLD {
-        poly.iter().map(|&e| factor * e).collect()
-    } else {
-        poly.par_iter().map(|&e| factor * e).collect()
     }
 }
 
@@ -219,7 +207,7 @@ where
                 // The `evals` are ordered lexicographically, meaning the first variable's bit changes the slowest.
                 //
                 // To align our computation with this memory layout, we process the point's coordinates in reverse.
-                let mut point_rev = point.to_vec();
+                let mut point_rev = ArenaVec::from_slice(point);
                 point_rev.reverse();
 
                 // Split the reversed point's coordinates into two halves:
@@ -236,18 +224,18 @@ where
                 // We precompute all `2^|z1|` values of eq(v_high, p_high) and store them in `right`.
 
                 // Allocate uninitialized memory for the low-order basis polynomial evaluations.
-                let mut left = unsafe { uninitialized_vec(1 << z0.len()) };
+                let mut left: ArenaVec<_> = unsafe { ArenaVec::uninitialized(1 << z0.len()) };
                 // Allocate uninitialized memory for the high-order basis polynomial evaluations.
-                let mut right = unsafe { uninitialized_vec(1 << z1.len()) };
+                let mut right: ArenaVec<_> = unsafe { ArenaVec::uninitialized(1 << z1.len()) };
 
                 // The `eval_eq` function requires the variables in their original order, so we reverse the halves back.
-                let mut z0_ordered = z0.to_vec();
+                let mut z0_ordered = ArenaVec::from_slice(z0);
                 z0_ordered.reverse();
                 // Compute all eq(v_low, p_low) values and fill the `left` vector.
                 compute_eval_eq::<_, _, false>(&z0_ordered, &mut left, Point::ONE);
 
                 // Repeat the process for the high-order variables.
-                let mut z1_ordered = z1.to_vec();
+                let mut z1_ordered = ArenaVec::from_slice(z1);
                 z1_ordered.reverse();
                 // Compute all eq(v_high, p_high) values and fill the `right` vector.
                 compute_eval_eq::<_, _, false>(&z1_ordered, &mut right, Point::ONE);
@@ -257,29 +245,32 @@ where
                     //
                     // This chain of operations computes the regrouped sum:
                     // Σ_{v_high} eq(v_high, p_high) * (Σ_{v_low} f(v_high, v_low) * eq(v_low, p_low))
-                    evals
-                        .par_chunks(left.len())
-                        .zip_eq(right.par_iter())
-                        .map(|(part, &c)| {
+                    let left_len = left.len();
+                    parallel::map_reduce(
+                        right.len(),
+                        || Res::ZERO,
+                        |i| {
+                            let part = &evals[i * left_len..][..left_len];
                             // This is the inner sum: a dot product between the evaluation chunk and the `left` basis values.
                             mul_res_point(
                                 part.iter()
-                                    .zip_eq(left.iter())
+                                    .zip(left.iter())
                                     .map(|(&a, &b)| mul_coeffs_point(a, b))
                                     .sum::<Res>(),
-                                c,
+                                right[i],
                             )
-                        })
-                        .sum()
+                        },
+                        |a, b| a + b,
+                    )
                 } else {
                     evals
                         .chunks(left.len())
-                        .zip_eq(right.iter())
+                        .zip(right.iter())
                         .map(|(part, &c)| {
                             // This is the inner sum: a dot product between the evaluation chunk and the `left` basis values.
                             mul_res_point(
                                 part.iter()
-                                    .zip_eq(left.iter())
+                                    .zip(left.iter())
                                     .map(|(&a, &b)| mul_coeffs_point(a, b))
                                     .sum::<Res>(),
                                 c,
@@ -290,58 +281,62 @@ where
             } else {
                 // For moderately sized inputs (5 to 19 variables), use the recursive strategy.
                 //
-                // Split the evaluations into two halves, corresponding to the first variable being 0 or 1.
-                let (f0, f1) = evals.split_at(evals.len() / 2);
-
-                // Recursively evaluate on the two smaller hypercubes.
-                let (f0_eval, f1_eval) = {
-                    // Only spawn parallel tasks if the subproblem is large enough to overcome
-                    // the overhead of threading.
-                    let work_size: usize = (1 << 15) / std::mem::size_of::<Coeffs>();
-                    if evals.len() > work_size && PARALLEL {
-                        join(
-                            || {
-                                eval_multilinear_generic::<_, _, _, _, _, _, PARALLEL>(
-                                    f0,
-                                    tail,
-                                    mul_coeffs_point,
-                                    add_res_coeffs,
-                                    mul_res_point,
-                                )
-                            },
-                            || {
-                                eval_multilinear_generic::<_, _, _, _, _, _, PARALLEL>(
-                                    f1,
-                                    tail,
-                                    mul_coeffs_point,
-                                    add_res_coeffs,
-                                    mul_res_point,
-                                )
-                            },
+                // Only spawn parallel tasks if the subproblem is large enough to overcome
+                // the overhead of threading.
+                let work_size: usize = (1 << 15) / std::mem::size_of::<Coeffs>();
+                if evals.len() > work_size && PARALLEL {
+                    let log_work = log2_ceil_usize(work_size.max(2));
+                    let n_split = point.len().saturating_sub(log_work).max(1);
+                    let (lead, sub_point) = point.split_at(n_split);
+                    let n_chunks = 1 << n_split;
+                    let chunk = evals.len() >> n_split;
+                    let partials = parallel::par_map_collect(n_chunks, |j| {
+                        eval_multilinear_generic::<_, _, _, _, _, _, false>(
+                            &evals[j * chunk..][..chunk],
+                            sub_point,
+                            mul_coeffs_point,
+                            add_res_coeffs,
+                            mul_res_point,
                         )
-                    } else {
-                        // For smaller subproblems, execute sequentially.
-                        (
-                            eval_multilinear_generic::<_, _, _, _, _, _, false>(
-                                f0,
-                                tail,
-                                mul_coeffs_point,
-                                add_res_coeffs,
-                                mul_res_point,
-                            ),
-                            eval_multilinear_generic::<_, _, _, _, _, _, false>(
-                                f1,
-                                tail,
-                                mul_coeffs_point,
-                                add_res_coeffs,
-                                mul_res_point,
-                            ),
-                        )
-                    }
-                };
-                // Perform the final linear interpolation for the first variable `x`.
-                f0_eval + mul_res_point(f1_eval - f0_eval, *x)
+                    });
+                    interpolate_res(&partials, lead, mul_res_point)
+                } else {
+                    let (f0, f1) = evals.split_at(evals.len() / 2);
+                    let f0_eval = eval_multilinear_generic::<_, _, _, _, _, _, false>(
+                        f0,
+                        tail,
+                        mul_coeffs_point,
+                        add_res_coeffs,
+                        mul_res_point,
+                    );
+                    let f1_eval = eval_multilinear_generic::<_, _, _, _, _, _, false>(
+                        f1,
+                        tail,
+                        mul_coeffs_point,
+                        add_res_coeffs,
+                        mul_res_point,
+                    );
+                    // Perform the final linear interpolation for the first variable `x`.
+                    f0_eval + mul_res_point(f1_eval - f0_eval, *x)
+                }
             }
+        }
+    }
+}
+
+fn interpolate_res<Point, Res, MRP>(values: &[Res], point: &[Point], mul_res_point: &MRP) -> Res
+where
+    Point: Field,
+    Res: Copy + PrimeCharacteristicRing,
+    MRP: Fn(Res, Point) -> Res,
+{
+    match point {
+        [] => values[0],
+        [x, tail @ ..] => {
+            let (low, high) = values.split_at(values.len() / 2);
+            let p0 = interpolate_res(low, tail, mul_res_point);
+            let p1 = interpolate_res(high, tail, mul_res_point);
+            p0 + mul_res_point(p1 - p0, *x)
         }
     }
 }
@@ -369,7 +364,7 @@ mod tests {
         let res_normal = eval_multilinear::<_, _, true>(&poly, &point);
         println!("Normal eval time: {:?}", time.elapsed());
 
-        let packed_poly = pack_extension(&poly);
+        let packed_poly: Vec<_> = pack_extension(&poly);
         let time = Instant::now();
         let res_packed = eval_packed::<_, true>(&packed_poly, &point);
         println!("Packed eval time: {:?}", time.elapsed());

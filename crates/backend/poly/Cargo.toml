@@ -1,17 +1,17 @@
 [package]
-name = "mt-poly"
+name = "poly"
 version.workspace = true
 edition.workspace = true
 
 [dependencies]
-field = { path = "../field", package = "mt-field" }
-utils = { path = "../utils", package = "mt-utils" }
+field = { path = "../field", package = "field" }
+utils = { path = "../utils", package = "utils" }
 system-info.workspace = true
+parallel.workspace = true
+zk-alloc.workspace = true
 
-itertools.workspace = true
-rayon.workspace = true
 rand.workspace = true
 serde.workspace = true
 
 [dev-dependencies]
-koala-bear = { path = "../koala-bear", package = "mt-koala-bear" }
+koala-bear = { path = "../koala-bear", package = "koala-bear" }

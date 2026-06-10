@@ -6,6 +6,14 @@ use std::{
 
 pub mod array_serialization;
 
+pub mod ansi;
+
+mod misc;
+pub use misc::*;
+
+mod logs;
+pub use logs::*;
+
 /// Computes `log_2(n)`
 ///
 /// # Panics
@@ -121,7 +129,6 @@ pub const fn indices_arr<const N: usize>() -> [usize; N] {
 /// reallocations.
 ///
 /// # Safety
-///
 /// This assumes that `BaseArray` has the same alignment and memory layout as `[Base; N]`.
 #[inline]
 pub unsafe fn flatten_to_base<Base, BaseArray>(vec: Vec<BaseArray>) -> Vec<Base> {
@@ -129,27 +136,21 @@ pub unsafe fn flatten_to_base<Base, BaseArray>(vec: Vec<BaseArray>) -> Vec<Base>
         assert!(align_of::<Base>() == align_of::<BaseArray>());
         assert!(size_of::<BaseArray>().is_multiple_of(size_of::<Base>()));
     }
-
     let d = size_of::<BaseArray>() / size_of::<Base>();
-    let mut values = std::mem::ManuallyDrop::new(vec);
-    let new_len = values.len() * d;
-    let new_cap = values.capacity() * d;
-    let ptr = values.as_mut_ptr() as *mut Base;
-    unsafe { Vec::from_raw_parts(ptr, new_len, new_cap) }
+    let mut me = mem::ManuallyDrop::new(vec);
+    unsafe { Vec::from_raw_parts(me.as_mut_ptr().cast::<Base>(), me.len() * d, me.capacity() * d) }
 }
 
 /// Convert a vector of `Base` elements to a vector of `BaseArray` elements.
 ///
 /// # Safety
-///
 /// This assumes that `BaseArray` has the same alignment and memory layout as `[Base; N]`.
 #[inline]
-pub unsafe fn reconstitute_from_base<Base, BaseArray: Clone>(mut vec: Vec<Base>) -> Vec<BaseArray> {
+pub unsafe fn reconstitute_from_base<Base, BaseArray: Clone>(vec: Vec<Base>) -> Vec<BaseArray> {
     const {
         assert!(align_of::<Base>() == align_of::<BaseArray>());
         assert!(size_of::<BaseArray>().is_multiple_of(size_of::<Base>()));
     }
-
     let d = size_of::<BaseArray>() / size_of::<Base>();
     assert!(
         vec.len().is_multiple_of(d),
@@ -158,33 +159,13 @@ pub unsafe fn reconstitute_from_base<Base, BaseArray: Clone>(mut vec: Vec<Base>)
         d
     );
     let new_len = vec.len() / d;
-    let cap = vec.capacity();
-
-    if cap.is_multiple_of(d) {
-        let mut values = std::mem::ManuallyDrop::new(vec);
-        let new_cap = cap / d;
-        let ptr = values.as_mut_ptr() as *mut BaseArray;
-        unsafe { Vec::from_raw_parts(ptr, new_len, new_cap) }
+    if vec.capacity().is_multiple_of(d) {
+        let mut me = mem::ManuallyDrop::new(vec);
+        unsafe { Vec::from_raw_parts(me.as_mut_ptr().cast::<BaseArray>(), new_len, me.capacity() / d) }
     } else {
-        let buf_ptr = vec.as_mut_ptr().cast::<BaseArray>();
-        let slice_ref = unsafe { slice::from_raw_parts(buf_ptr, new_len) };
-        slice_ref.to_vec()
-    }
-}
-
-/// Try to force Rust to emit a branch.
-#[inline(always)]
-pub fn branch_hint() {
-    #[cfg(any(
-        target_arch = "aarch64",
-        target_arch = "arm",
-        target_arch = "riscv32",
-        target_arch = "riscv64",
-        target_arch = "x86",
-        target_arch = "x86_64",
-    ))]
-    unsafe {
-        core::arch::asm!("", options(nomem, nostack, preserves_flags));
+        // Capacity isn't a clean multiple: copy into a fresh buffer.
+        let buf_ptr = vec.as_ptr().cast::<BaseArray>();
+        unsafe { slice::from_raw_parts(buf_ptr, new_len) }.to_vec()
     }
 }
 

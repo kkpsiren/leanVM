@@ -1,22 +1,25 @@
-use crate::{
-    CompilationFlags, F,
-    a_simplify_lang::post_optimization::propagate_copies,
-    lang::*,
-    parser::{ConstArrayValue, parse_program},
-};
-use backend::PrimeCharacteristicRing;
+use crate::{F, a_simplify_lang::post_optimization::propagate_copies, lang::*, parser::ConstArrayValue};
+use backend::*;
 use lean_vm::{
     ALL_POSEIDON16_NAMES, Boolean, BooleanExpr, CustomHint, ExtensionOpMode, FunctionName,
-    POSEIDON16_HALF_HARDCODED_LEFT_NAME, POSEIDON16_HALF_NAME, POSEIDON16_HARDCODED_LEFT_NAME, PrecompileArgs,
+    POSEIDON16_HARDCODED_LEFT_NAME, POSEIDON16_PERMUTE_HALF_HARDCODED_LEFT_NAME, POSEIDON16_PERMUTE_HALF_NAME,
+    POSEIDON16_PERMUTE_NAME, POSEIDON16_QUARTER_HARDCODED_LEFT_NAME, POSEIDON16_QUARTER_NAME, PrecompileArgs,
     PrecompileCompTimeArgs, SourceLocation,
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt::{Display, Formatter},
 };
-use utils::{Counter, ToUsize};
 
 mod post_optimization;
+
+/*
+KNOWN LIMITATIONS:
+
+- inline function recursively calling themselves (directly or indirectly) will cause the compiler to run indifinetely (and crash OOM)
+*/
+
+const MAX_UNROLL_ITERATIONS: usize = 1 << 20;
 
 #[derive(Debug, Clone)]
 pub struct SimpleProgram {
@@ -280,8 +283,30 @@ fn ends_with_early_exit(block: &[SimpleLine]) -> bool {
     }
 }
 
+fn check_no_dead_code(body: &[Line], function_name: &str) -> Result<(), String> {
+    for (i, line) in body.iter().enumerate() {
+        let exit_kind = match line {
+            Line::FunctionRet { .. } => Some("return"),
+            Line::Panic { .. } => Some("panic"),
+            _ => None,
+        };
+        if let Some(kind) = exit_kind
+            && i + 1 < body.len()
+        {
+            return Err(format!("function `{function_name}`: unreachable code after `{kind}`"));
+        }
+        for nested in line.nested_blocks() {
+            check_no_dead_code(nested, function_name)?;
+        }
+    }
+    Ok(())
+}
+
 pub fn simplify_program(mut program: Program) -> Result<SimpleProgram, String> {
-    check_program_scoping(&program);
+    check_program_scoping(&program)?;
+    for (name, func) in &program.functions {
+        check_no_dead_code(&func.body, name)?;
+    }
 
     let mut unroll_counter = Counter::new();
     let mut inline_counter = Counter::new();
@@ -289,8 +314,6 @@ pub fn simplify_program(mut program: Program) -> Result<SimpleProgram, String> {
 
     // Remove all inlined functions (they've been inlined)
     program.functions.retain(|_, func| !func.inlined);
-
-    validate_program_vectors(&program)?;
 
     // Remove all const functions - they should all have been specialized by now
     let const_func_names: Vec<_> = program
@@ -303,8 +326,7 @@ pub fn simplify_program(mut program: Program) -> Result<SimpleProgram, String> {
         program.functions.remove(&name);
     }
 
-    let mut mutable_loop_counter = Counter::new();
-    transform_mutable_in_loops_in_program(&mut program, &mut mutable_loop_counter);
+    check_no_loop_carried_mutables(&program)?;
 
     let mut new_functions = BTreeMap::new();
     let mut counters = Counters::default();
@@ -316,23 +338,15 @@ pub fn simplify_program(mut program: Program) -> Result<SimpleProgram, String> {
     for (name, func) in &program.functions {
         let mut array_manager = ArrayManager::default();
         let mut mut_tracker = MutableVarTracker::default();
-        let mut vec_tracker = VectorTracker::default();
 
-        // Register mutable arguments and capture their initial versioned names
-        // BEFORE simplifying the body
+        // All arguments are immutable; record them as assigned to detect illegal reassignment.
         let arguments: Vec<Var> = func
             .arguments
             .iter()
             .map(|arg| {
                 assert!(!arg.is_const);
-                if arg.is_mutable {
-                    mut_tracker.register_mutable(&arg.name);
-                    // Capture the initial versioned name (version 0)
-                    mut_tracker.current_name(&arg.name)
-                } else {
-                    mut_tracker.assigned.insert(arg.name.clone());
-                    arg.name.clone()
-                }
+                mut_tracker.assigned.insert(arg.name.clone());
+                arg.name.clone()
             })
             .collect();
 
@@ -340,7 +354,6 @@ pub fn simplify_program(mut program: Program) -> Result<SimpleProgram, String> {
             counters: &mut counters,
             array_manager: &mut array_manager,
             mut_tracker: &mut mut_tracker,
-            vec_tracker: &mut vec_tracker,
         };
         let simplified_instructions = simplify_lines(
             &ctx,
@@ -369,153 +382,6 @@ pub fn simplify_program(mut program: Program) -> Result<SimpleProgram, String> {
     Ok(simple_program)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TreeVec<S> {
-    Scalar(S),
-    Vector(Vec<TreeVec<S>>),
-}
-
-pub type VectorLenValue = TreeVec<()>;
-pub type VectorValue = TreeVec<Var>;
-
-#[derive(Debug, Clone, Default)]
-pub struct TreeVecTracker<S> {
-    vectors: BTreeMap<Var, TreeVec<S>>,
-}
-
-pub type VectorLenTracker = TreeVecTracker<()>;
-type VectorTracker = TreeVecTracker<Var>;
-
-impl<S> TreeVecTracker<S> {
-    fn register(&mut self, var: &Var, value: TreeVec<S>) {
-        self.vectors.insert(var.clone(), value);
-    }
-
-    fn is_vector(&self, var: &Var) -> bool {
-        self.vectors.contains_key(var)
-    }
-
-    pub fn get(&self, var: &Var) -> Option<&TreeVec<S>> {
-        self.vectors.get(var)
-    }
-
-    fn get_mut(&mut self, var: &Var) -> Option<&mut TreeVec<S>> {
-        self.vectors.get_mut(var)
-    }
-}
-
-impl<S> TreeVec<S> {
-    pub fn push(&mut self, elem: Self) {
-        match self {
-            Self::Vector(v) => v.push(elem),
-            _ => panic!("push on scalar"),
-        }
-    }
-
-    pub fn pop(&mut self) -> Option<Self> {
-        match self {
-            Self::Vector(v) => v.pop(),
-            _ => panic!("pop on scalar"),
-        }
-    }
-
-    pub fn len(&self) -> usize {
-        match self {
-            Self::Vector(v) => v.len(),
-            _ => panic!("len on scalar"),
-        }
-    }
-
-    pub fn is_vector(&self) -> bool {
-        matches!(self, Self::Vector(_))
-    }
-
-    fn get(&self, i: usize) -> Option<&Self> {
-        match self {
-            Self::Vector(v) => v.get(i),
-            _ => None,
-        }
-    }
-
-    fn get_mut(&mut self, i: usize) -> Option<&mut Self> {
-        match self {
-            Self::Vector(v) => v.get_mut(i),
-            _ => None,
-        }
-    }
-
-    pub fn navigate(&self, idx: &[usize]) -> Option<&Self> {
-        idx.iter().try_fold(self, |v, &i| v.get(i))
-    }
-
-    pub fn navigate_mut(&mut self, idx: &[usize]) -> Option<&mut Self> {
-        idx.iter().try_fold(self, |v, &i| v.get_mut(i))
-    }
-}
-
-fn scalar_indices(indices: &[Expression]) -> Option<Vec<usize>> {
-    indices
-        .iter()
-        .map(|idx| idx.as_scalar().map(|f| f.to_usize()))
-        .collect()
-}
-
-fn simplify_const_indices(
-    ctx: &SimplifyContext<'_>,
-    state: &mut SimplifyState<'_>,
-    const_malloc: &mut ConstMalloc,
-    indices: &[Expression],
-    lines: &mut Vec<SimpleLine>,
-    op: &str,
-    location: SourceLocation,
-) -> Result<Vec<usize>, String> {
-    indices
-        .iter()
-        .map(|idx| {
-            let simplified = simplify_expr(ctx, state, const_malloc, idx, lines)?;
-            let const_val = simplified
-                .as_constant()
-                .ok_or_else(|| format!("{op} index must be a compile-time constant, at {location}"))?;
-            let val = const_val
-                .naive_eval()
-                .ok_or_else(|| format!("{op} index must be evaluable at compile time, at {location}"))?;
-            Ok(val.to_usize())
-        })
-        .collect()
-}
-
-/// Navigate to the (sub-)vector to act upon and verify it is a vector.
-fn navigate_vector_target_mut<'a>(
-    tracker: &'a mut VectorTracker,
-    vector: &Var,
-    indices: &[usize],
-    op: &str,
-    location: SourceLocation,
-) -> Result<&'a mut VectorValue, String> {
-    let root = tracker
-        .get_mut(vector)
-        .ok_or_else(|| format!("{op} called on non-vector variable '{vector}', at {location}"))?;
-    let target = root
-        .navigate_mut(indices)
-        .ok_or_else(|| format!("{op} target index out of bounds, at {location}"))?;
-    if !target.is_vector() {
-        return Err(format!("{op} target must be a vector, not a scalar, at {location}"));
-    }
-    Ok(target)
-}
-
-fn build_vector_len_value(elements: &[VecLiteral]) -> VectorLenValue {
-    VectorLenValue::Vector(
-        elements
-            .iter()
-            .map(|elem| match elem {
-                VecLiteral::Vec(inner) => build_vector_len_value(inner),
-                VecLiteral::Expr(_) => VectorLenValue::Scalar(()),
-            })
-            .collect(),
-    )
-}
-
 fn compile_time_transform_in_program(
     program: &mut Program,
     unroll_counter: &mut Counter,
@@ -532,15 +398,13 @@ fn compile_time_transform_in_program(
         .collect();
 
     for func in inlined_functions.values() {
-        if func.has_mutable_arguments() {
-            return Err("Inlined functions with mutable arguments are not supported yet".to_string());
-        }
         if func.has_const_arguments() {
             return Err(format!(
                 "Inlined function should not have \"Const\" arguments (function \"{}\")",
                 func.name
             ));
         }
+        check_inline_returns(&func.body, &func.name)?;
     }
 
     // Process all functions, including newly created specialized ones
@@ -591,7 +455,6 @@ fn compile_time_transform_in_lines(
     inline_counter: &mut Counter,
     parent_const_var_exprs: &BTreeMap<Var, F>,
 ) -> Result<(), String> {
-    let mut vector_len_tracker = VectorLenTracker::default();
     let mut const_var_exprs: BTreeMap<Var, F> = parent_const_var_exprs.clone(); // used to simplify expressions containing variables with known constant values
 
     let mut i = 0;
@@ -605,8 +468,7 @@ fn compile_time_transform_in_lines(
             value,
             location,
         } = line
-            && let Some(expanded) =
-                try_expand_match_range(value, targets, *location, const_arrays, &vector_len_tracker)?
+            && let Some(expanded) = try_expand_match_range(value, targets, *location, const_arrays)?
         {
             lines.splice(i..=i, expanded);
             continue;
@@ -614,7 +476,7 @@ fn compile_time_transform_in_lines(
 
         for expr in line.expressions_mut() {
             substitute_const_vars_in_expr(expr, &const_var_exprs);
-            compile_time_transform_in_expr(expr, const_arrays, &vector_len_tracker);
+            compile_time_transform_in_expr(expr, const_arrays)?;
         }
 
         // Extract nested calls to functions requiring preprocessing (inlined or const-arg)
@@ -672,7 +534,7 @@ fn compile_time_transform_in_lines(
                         && !existing_functions.contains_key(&const_funct_name)
                     {
                         let mut new_body = func.body.clone();
-                        replace_vars_by_const_in_lines(&mut new_body, &const_evals.iter().cloned().collect());
+                        replace_vars_by_const_in_lines(&mut new_body, &const_evals.iter().cloned().collect())?;
                         new_functions.insert(
                             const_funct_name.clone(),
                             Function {
@@ -693,54 +555,6 @@ fn compile_time_transform_in_lines(
                 }
             }
 
-            Line::VecDeclaration { var, elements, .. } => {
-                vector_len_tracker.register(var, build_vector_len_value(elements));
-            }
-
-            Line::Push {
-                vector,
-                indices,
-                element,
-                ..
-            } => {
-                let const_indices =
-                    scalar_indices(indices).ok_or_else(|| "push with non-constant indices".to_string())?;
-                let new_element = match element {
-                    VecLiteral::Vec(inner) => build_vector_len_value(inner),
-                    VecLiteral::Expr(_) => VectorLenValue::Scalar(()),
-                };
-                let target = vector_len_tracker
-                    .get_mut(vector)
-                    .ok_or_else(|| "pushing to undeclared vector".to_string())?
-                    .navigate_mut(&const_indices)
-                    .ok_or_else(|| "push target index out of bounds".to_string())?;
-                if !target.is_vector() {
-                    return Err("push target is not a vector".to_string());
-                }
-                target.push(new_element);
-            }
-
-            Line::Pop {
-                vector,
-                indices,
-                location,
-            } => {
-                let const_indices = scalar_indices(indices)
-                    .ok_or_else(|| format!("line {}: pop with non-constant indices", location))?;
-                let target = vector_len_tracker
-                    .get_mut(vector)
-                    .ok_or_else(|| format!("line {}: pop on undeclared vector '{}'", location, vector))?
-                    .navigate_mut(&const_indices)
-                    .ok_or_else(|| format!("line {}: pop target index out of bounds", location))?;
-                if !target.is_vector() {
-                    return Err(format!("line {}: pop target is not a vector", location));
-                }
-                if target.len() == 0 {
-                    return Err(format!("line {}: pop on empty vector", location));
-                }
-                target.pop();
-            }
-
             Line::IfCondition {
                 condition,
                 then_branch,
@@ -755,43 +569,6 @@ fn compile_time_transform_in_lines(
             }
 
             Line::ForLoop {
-                loop_kind: LoopKind::DynamicUnroll { n_bits },
-                iterator,
-                start,
-                end,
-                body,
-                location,
-            } => {
-                let Some(start_val) = start.compile_time_eval(const_arrays, &vector_len_tracker) else {
-                    return Err(format!(
-                        "line {location}: dynamic_unroll start must be a compile-time constant"
-                    ));
-                };
-                let start_val = start_val.to_usize();
-                let Some(n_bits_val) = n_bits.compile_time_eval(const_arrays, &vector_len_tracker) else {
-                    return Err(format!(
-                        "line {location}: dynamic_unroll n_bits must be a compile-time constant"
-                    ));
-                };
-                let n_bits_val = n_bits_val.to_usize();
-                if n_bits_val < 1 {
-                    return Err(format!(
-                        "line {location}: dynamic_unroll n_bits must be >= 1, got {n_bits_val}"
-                    ));
-                }
-                let expanded = expand_dynamic_unroll(
-                    &iterator.clone(),
-                    &end.clone(),
-                    n_bits_val,
-                    start_val,
-                    &body.clone(),
-                    *location,
-                    unroll_counter,
-                );
-                lines.splice(i..=i, expanded);
-                continue;
-            }
-            Line::ForLoop {
                 iterator,
                 start,
                 end,
@@ -805,12 +582,19 @@ fn compile_time_transform_in_lines(
                         location
                     ));
                 };
+                let (start_u, end_u) = (start.to_usize(), end.to_usize());
+                let count = end_u.saturating_sub(start_u);
+                if count > MAX_UNROLL_ITERATIONS {
+                    return Err(format!(
+                        "line {location}: `unroll` loop is too large ({count} iterations; max {MAX_UNROLL_ITERATIONS})"
+                    ));
+                }
                 let unroll_index = unroll_counter.get_next();
                 let (internal_vars, _) = find_variable_usage(body, const_arrays);
                 let iterator = iterator.clone();
                 let body = body.clone();
                 let mut unrolled = Vec::new();
-                for j in start.to_usize()..end.to_usize() {
+                for j in start_u..end_u {
                     let mut body_copy = body.clone();
                     replace_vars_for_unroll(&mut body_copy, &iterator, unroll_index, j, &internal_vars);
                     unrolled.extend(body_copy);
@@ -827,7 +611,7 @@ fn compile_time_transform_in_lines(
             Line::IfCondition { .. }
                 | Line::Match { .. }
                 | Line::ForLoop {
-                    loop_kind: LoopKind::Unroll | LoopKind::DynamicUnroll { .. },
+                    loop_kind: LoopKind::Unroll,
                     ..
                 }
         ) {
@@ -861,7 +645,6 @@ fn try_expand_match_range(
     targets: &[AssignmentTarget],
     location: SourceLocation,
     const_arrays: &BTreeMap<String, ConstArrayValue>,
-    vector_len: &VectorLenTracker,
 ) -> Result<Option<Vec<Line>>, String> {
     let Expression::FunctionCall {
         function_name, args, ..
@@ -922,11 +705,11 @@ fn try_expand_match_range(
             return Err("match_range: expected range(start, end)".into());
         }
         let start = ra[0]
-            .compile_time_eval(const_arrays, vector_len)
+            .compile_time_eval(const_arrays)
             .ok_or(format!("match_range: range start must be constant (at {location})"))?
             .to_usize();
         let end = ra[1]
-            .compile_time_eval(const_arrays, vector_len)
+            .compile_time_eval(const_arrays)
             .ok_or(format!("match_range: range end must be constant (at {location})"))?
             .to_usize();
 
@@ -1141,20 +924,25 @@ fn extract_preprocessed_calls(
 fn compile_time_transform_in_expr(
     expr: &mut Expression,
     const_arrays: &BTreeMap<String, ConstArrayValue>,
-    vector_len_tracker: &VectorLenTracker,
-) -> bool {
+) -> Result<bool, String> {
     if expr.is_scalar() {
-        return false;
+        return Ok(false);
     }
     let mut changed = false;
     for inner_expr in expr.inner_exprs_mut() {
-        changed |= compile_time_transform_in_expr(inner_expr, const_arrays, vector_len_tracker);
+        changed |= compile_time_transform_in_expr(inner_expr, const_arrays)?;
     }
-    if let Some(scalar) = expr.compile_time_eval(const_arrays, vector_len_tracker) {
+    if let Some(scalar) = expr.compile_time_eval(const_arrays) {
         *expr = Expression::scalar(scalar);
         changed = true;
+    } else if let Expression::Len { .. } = &*expr {
+        return Err("Cannot call len() on a scalar value".to_string());
+    } else if let Expression::MathExpr(op, args) = &*expr
+        && args.iter().all(Expression::is_scalar)
+    {
+        return Err(format!("compile-time `{op}` failed"));
     }
-    changed
+    Ok(changed)
 }
 
 fn substitute_const_vars_in_expr(expr: &mut Expression, const_var_exprs: &BTreeMap<Var, F>) -> bool {
@@ -1171,28 +959,6 @@ fn substitute_const_vars_in_expr(expr: &mut Expression, const_var_exprs: &BTreeM
     }
     changed
 }
-
-// ============================================================================
-// TRANSFORMATION: Mutable variables in non-unrolled loops
-// ============================================================================
-//
-// This transformation handles mutable variables that are modified inside
-// non-unrolled loops by using buffers to store intermediate values.
-//
-// For a loop like:
-//   for i in start..end { x += i; }
-//
-// We transform it to:
-//   size = end - start;
-//   x_buff = Array(size + 1);
-//   x_buff[0] = x;
-//   for i in start..end {
-//       buff_idx = i - start;
-//       mut x_body = x_buff[buff_idx];
-//       x_body += i;
-//       x_buff[buff_idx + 1] = x_body;
-//   }
-//   x = x_buff[size];
 
 /// Finds mutable variables that are:
 /// 1. Defined OUTSIDE this block (external)
@@ -1268,209 +1034,45 @@ fn find_assigned_external_vars_helper(
     }
 }
 
-fn transform_mutable_in_loops_in_program(program: &mut Program, counter: &mut Counter) {
-    for func in program.functions.values_mut() {
-        transform_mutable_in_loops_in_lines(&mut func.body, &program.const_arrays, counter, &BTreeSet::new());
+/// Reject any `range` / `parallel_range` loop that reassigns a mutable variable
+/// defined in an enclosing scope ("loop-carried mutable").
+fn check_no_loop_carried_mutables(program: &Program) -> Result<(), String> {
+    for func in program.functions.values() {
+        check_loop_carried_mutables_in_lines(&func.body, &program.const_arrays, &BTreeSet::new())?;
     }
+    Ok(())
 }
 
-fn transform_mutable_in_loops_in_lines(
-    lines: &mut Vec<Line>,
+fn check_loop_carried_mutables_in_lines(
+    lines: &[Line],
     const_arrays: &BTreeMap<String, ConstArrayValue>,
-    counter: &mut Counter,
     outer_mut_vars: &BTreeSet<Var>,
-) {
+) -> Result<(), String> {
     let mut local_mut_vars = outer_mut_vars.clone();
-    let mut i = 0;
-    while i < lines.len() {
-        match &mut lines[i] {
-            Line::ForLoop { body, loop_kind, .. } if loop_kind.is_unroll() => {
-                transform_mutable_in_loops_in_lines(body, const_arrays, counter, &local_mut_vars);
-                i += 1;
-            }
+    for line in lines {
+        match line {
             Line::ForLoop {
-                iterator,
-                start,
-                end,
                 body,
-                loop_kind: loop_kind @ (LoopKind::Range | LoopKind::ParallelRange),
+                loop_kind: LoopKind::Range | LoopKind::ParallelRange,
                 location,
+                ..
             } => {
-                let loop_kind = loop_kind.clone();
-                transform_mutable_in_loops_in_lines(body, const_arrays, counter, &local_mut_vars);
+                check_loop_carried_mutables_in_lines(body, const_arrays, &local_mut_vars)?;
                 let modified_vars = find_modified_external_vars(body, const_arrays, &local_mut_vars);
-
-                if modified_vars.is_empty() {
-                    // No mutable variables modified, no transformation needed
-                    i += 1;
-                    continue;
+                if !modified_vars.is_empty() {
+                    return Err(format!(
+                        "loop at {location} reassigns enclosing-scope mutable(s) {modified_vars:?}; \
+                         loop-carried mutables are unsupported: use an explicit buffer (see zkDSL.md, \"For loops\")"
+                    ));
                 }
-
-                let suffix = counter.get_next();
-
-                // Generate the transformed code
-                let mut new_lines = Vec::new();
-
-                let location = *location;
-
-                // Create size variable: @loop_size_{suffix} = end - start
-                let size_var = format!("@loop_size_{suffix}");
-
-                new_lines.push(Line::Statement {
-                    targets: vec![AssignmentTarget::Var {
-                        var: size_var.clone(),
-                        is_mutable: false,
-                    }],
-                    value: Expression::MathExpr(MathOperation::Sub, vec![end.clone(), start.clone()]),
-                    location,
-                });
-
-                let mut var_to_buff: BTreeMap<Var, (Var, Var)> = BTreeMap::new(); // var -> (buff_name, body_name)
-
-                for var in &modified_vars {
-                    let buff_name = format!("@loop_buff_{var}_{suffix}");
-                    let body_name = format!("@loop_body_{var}_{suffix}");
-
-                    // buff = Array(size + 1)
-                    new_lines.push(Line::Statement {
-                        targets: vec![AssignmentTarget::Var {
-                            var: buff_name.clone(),
-                            is_mutable: false,
-                        }],
-                        value: Expression::FunctionCall {
-                            function_name: "Array".to_string(),
-                            args: vec![Expression::MathExpr(
-                                // TODO opti in case there is only one mutated var
-                                MathOperation::Add,
-                                vec![Expression::var(size_var.clone()), Expression::one()],
-                            )],
-                            location,
-                        },
-                        location,
-                    });
-
-                    // buff[0] = var (current value)
-                    new_lines.push(Line::Statement {
-                        targets: vec![AssignmentTarget::ArrayAccess {
-                            array: buff_name.clone().into(),
-                            index: Box::new(Expression::zero()),
-                        }],
-                        value: Expression::var(var.clone()),
-                        location,
-                    });
-
-                    var_to_buff.insert(var.clone(), (buff_name, body_name));
-                }
-
-                // Transform the loop body
-                let iterator = iterator.clone();
-                let mut new_body = Vec::new();
-
-                // buff_idx = i - start (or just i when start is zero)
-                let buff_idx_var = format!("@loop_buff_idx_{suffix}");
-
-                new_body.push(Line::Statement {
-                    targets: vec![AssignmentTarget::Var {
-                        var: buff_idx_var.clone(),
-                        is_mutable: false,
-                    }],
-                    value: Expression::MathExpr(
-                        MathOperation::Sub,
-                        vec![Expression::var(iterator.clone()), start.clone()],
-                    ),
-                    location,
-                });
-
-                // For each modified variable: mut body_var = buff[buff_idx]
-                for (var, (buff_name, body_name)) in &var_to_buff {
-                    new_body.push(Line::Statement {
-                        targets: vec![AssignmentTarget::Var {
-                            var: body_name.clone(),
-                            is_mutable: true,
-                        }],
-                        value: Expression::ArrayAccess {
-                            array: buff_name.clone().into(),
-                            index: vec![Expression::Value(
-                                VarOrConstMallocAccess::Var(buff_idx_var.clone()).into(),
-                            )],
-                        },
-                        location,
-                    });
-
-                    // Replace all references to var with body_name in the original body
-                    transform_vars_in_lines(body, &|v: &Var| {
-                        if v == var {
-                            VarTransform::Rename(body_name.clone())
-                        } else {
-                            VarTransform::Keep
-                        }
-                    });
-                }
-
-                // Add the original body (now modified to use body_vars)
-                new_body.append(body);
-
-                // next_idx = buff_idx + 1
-                let next_idx_var = format!("@loop_next_idx_{suffix}");
-                new_body.push(Line::Statement {
-                    targets: vec![AssignmentTarget::Var {
-                        var: next_idx_var.clone(),
-                        is_mutable: false,
-                    }],
-                    value: Expression::MathExpr(
-                        MathOperation::Add,
-                        vec![Expression::var(buff_idx_var.clone()), Expression::one()],
-                    ),
-                    location,
-                });
-
-                // For each modified variable: buff[next_idx] = body_var
-                for (buff_name, body_name) in var_to_buff.values() {
-                    new_body.push(Line::Statement {
-                        targets: vec![AssignmentTarget::ArrayAccess {
-                            array: buff_name.clone().into(),
-                            index: Expression::var(next_idx_var.clone()).into(),
-                        }],
-                        value: Expression::var(body_name.clone()),
-                        location,
-                    });
-                }
-
-                // Create the new loop
-                new_lines.push(Line::ForLoop {
-                    iterator: iterator.clone(),
-                    start: start.clone(),
-                    end: end.clone(),
-                    body: new_body,
-                    loop_kind,
-                    location,
-                });
-
-                // After the loop: var = buff[size]
-                for (var, (buff_name, _body_name)) in &var_to_buff {
-                    new_lines.push(Line::Statement {
-                        targets: vec![AssignmentTarget::Var {
-                            var: var.clone(),
-                            is_mutable: false,
-                        }],
-                        value: Expression::ArrayAccess {
-                            array: buff_name.clone().into(),
-                            index: vec![Expression::var(size_var.clone())],
-                        },
-                        location,
-                    });
-                }
-
-                // Replace the original loop with the new lines
-                let num_new = new_lines.len();
-                lines.splice(i..=i, new_lines);
-                i += num_new;
             }
-            line @ (Line::IfCondition { .. } | Line::Match { .. }) => {
-                for block in line.nested_blocks_mut() {
-                    transform_mutable_in_loops_in_lines(block, const_arrays, counter, &local_mut_vars);
+            Line::ForLoop { body, .. } => {
+                check_loop_carried_mutables_in_lines(body, const_arrays, &local_mut_vars)?;
+            }
+            Line::IfCondition { .. } | Line::Match { .. } => {
+                for block in line.nested_blocks() {
+                    check_loop_carried_mutables_in_lines(block, const_arrays, &local_mut_vars)?;
                 }
-                i += 1;
             }
             Line::Statement { targets, .. } => {
                 for target in targets {
@@ -1478,13 +1080,11 @@ fn transform_mutable_in_loops_in_lines(
                         local_mut_vars.insert(var.clone());
                     }
                 }
-                i += 1;
             }
-            _ => {
-                i += 1;
-            }
+            _ => {}
         }
     }
+    Ok(())
 }
 
 fn check_function_always_returns(func: &SimpleFunction) -> Result<(), String> {
@@ -1510,7 +1110,7 @@ fn check_block_always_returns(function_name: &String, instructions: &[SimpleLine
     Err(format!("Cannot prove that function always returns: {function_name}"))
 }
 
-fn check_program_scoping(program: &Program) {
+fn check_program_scoping(program: &Program) -> Result<(), String> {
     for function in program.functions.values() {
         let mut scope = Scope { vars: BTreeSet::new() };
         for arg in function.arguments.iter() {
@@ -1521,26 +1121,35 @@ fn check_program_scoping(program: &Program) {
             const_arrays: program.const_arrays.clone(),
         };
 
-        check_block_scoping(&function.body, &mut ctx);
+        check_block_scoping(&function.body, &mut ctx)?;
     }
+    Ok(())
 }
 
-fn check_block_scoping(block: &[Line], ctx: &mut Context) {
+fn check_block_scoping(block: &[Line], ctx: &mut Context) -> Result<(), String> {
     for line in block.iter() {
         match line {
             Line::ForwardDeclaration { var, .. } => {
+                if ctx.defines(var) {
+                    let in_current_scope = ctx.scopes.last().is_some_and(|s| s.vars.contains(var));
+                    return Err(if in_current_scope {
+                        format!("Variable '{var}' declared multiple times in the same scope")
+                    } else {
+                        format!("Declaration of '{var}' shadows a name visible in an enclosing scope")
+                    });
+                }
                 ctx.add_var(var);
             }
             Line::Match { value, arms, .. } => {
-                check_expr_scoping(value, ctx);
+                check_expr_scoping(value, ctx)?;
                 for (_, arm) in arms {
                     ctx.scopes.push(Scope { vars: BTreeSet::new() });
-                    check_block_scoping(arm, ctx);
+                    check_block_scoping(arm, ctx)?;
                     ctx.scopes.pop();
                 }
             }
             Line::Statement { targets, value, .. } => {
-                check_expr_scoping(value, ctx);
+                check_expr_scoping(value, ctx)?;
                 // First: add new variables to scope
                 for target in targets {
                     if let AssignmentTarget::Var { var, .. } = target
@@ -1549,15 +1158,16 @@ fn check_block_scoping(block: &[Line], ctx: &mut Context) {
                         ctx.add_var(var);
                     }
                 }
-                // Second pass: check array access targets
+                // Second pass: check array access targets (base + index)
                 for target in targets {
-                    if let AssignmentTarget::ArrayAccess { array: _, index } = target {
-                        check_expr_scoping(index, ctx);
+                    if let AssignmentTarget::ArrayAccess { array, index } = target {
+                        check_simple_expr_scoping(array, ctx)?;
+                        check_expr_scoping(index, ctx)?;
                     }
                 }
             }
             Line::Assert { boolean, .. } => {
-                check_boolean_scoping(boolean, ctx);
+                check_boolean_scoping(boolean, ctx)?;
             }
             Line::IfCondition {
                 condition,
@@ -1565,10 +1175,10 @@ fn check_block_scoping(block: &[Line], ctx: &mut Context) {
                 else_branch,
                 location: _,
             } => {
-                check_boolean_scoping(condition, ctx);
+                check_boolean_scoping(condition, ctx)?;
                 for branch in [then_branch, else_branch] {
                     ctx.scopes.push(Scope { vars: BTreeSet::new() });
-                    check_block_scoping(branch, ctx);
+                    check_block_scoping(branch, ctx)?;
                     ctx.scopes.pop();
                 }
             }
@@ -1577,222 +1187,80 @@ fn check_block_scoping(block: &[Line], ctx: &mut Context) {
                 start,
                 end,
                 body,
-                loop_kind,
+                loop_kind: _,
                 location: _,
             } => {
-                check_expr_scoping(start, ctx);
-                check_expr_scoping(end, ctx);
-                if let LoopKind::DynamicUnroll { n_bits } = loop_kind {
-                    check_expr_scoping(n_bits, ctx);
-                }
+                check_expr_scoping(start, ctx)?;
+                check_expr_scoping(end, ctx)?;
                 let mut new_scope_vars = BTreeSet::new();
                 new_scope_vars.insert(iterator.clone());
                 ctx.scopes.push(Scope { vars: new_scope_vars });
-                check_block_scoping(body, ctx);
+                check_block_scoping(body, ctx)?;
                 ctx.scopes.pop();
             }
             Line::FunctionRet { return_data } => {
                 for expr in return_data {
-                    check_expr_scoping(expr, ctx);
+                    check_expr_scoping(expr, ctx)?;
                 }
             }
             Line::Panic { .. } | Line::LocationReport { .. } => {}
-            Line::VecDeclaration { var, elements, .. } => {
-                // Check expressions in vec elements
-                check_vec_literal_scoping(elements, ctx);
-                // Add the vector variable to scope
-                ctx.add_var(var);
-            }
-            Line::Push {
-                vector,
-                indices,
-                element,
-                ..
-            } => {
-                // Check the vector variable is in scope
-                assert!(ctx.defines(vector), "Vector variable '{}' not in scope", vector);
-                // Check indices are in scope
-                for idx in indices {
-                    check_expr_scoping(idx, ctx);
-                }
-                // Check the pushed element
-                check_vec_literal_element_scoping(element, ctx);
-            }
-            Line::Pop { vector, indices, .. } => {
-                // Check the vector variable is in scope
-                assert!(ctx.defines(vector), "Vector variable '{}' not in scope", vector);
-                // Check indices are in scope
-                for idx in indices {
-                    check_expr_scoping(idx, ctx);
-                }
-            }
-        }
-    }
-}
-
-fn validate_program_vectors(program: &Program) -> Result<(), String> {
-    let inlined_functions = program.inlined_function_names();
-    for f in program.functions.values() {
-        validate_vectors(&f.body, &BTreeSet::new(), &inlined_functions, None)?;
-    }
-    Ok(())
-}
-
-fn validate_vectors(
-    lines: &[Line],
-    outer: &BTreeSet<Var>,
-    inlined: &BTreeSet<String>,
-    restrict: Option<SourceLocation>,
-) -> Result<(), String> {
-    let mut local: BTreeSet<Var> = BTreeSet::new();
-    macro_rules! all {
-        () => {
-            outer.union(&local).cloned().collect::<BTreeSet<Var>>()
-        };
-    }
-
-    for line in lines {
-        match line {
-            Line::VecDeclaration { var, elements, .. } => {
-                local.insert(var.clone());
-                validate_vec_lit(elements, &all!(), inlined)?;
-            }
-            Line::Push {
-                vector,
-                element,
-                location,
-                ..
-            } => {
-                if restrict.is_some() && outer.contains(vector) {
-                    return Err(format!("line {}: push to outer-scope vector '{}'", location, vector));
-                }
-                validate_vec_lit(std::slice::from_ref(element), &all!(), inlined)?;
-                if !local.contains(vector) && !outer.contains(vector) {
-                    return Err(format!("line {}: unknown vector '{}'", location, vector));
-                }
-            }
-            Line::Pop { vector, location, .. } => {
-                if restrict.is_some() && outer.contains(vector) {
-                    return Err(format!("line {}: pop from outer-scope vector '{}'", location, vector));
-                }
-                if !local.contains(vector) && !outer.contains(vector) {
-                    return Err(format!("line {}: unknown vector '{}'", location, vector));
-                }
-            }
-            Line::Statement { value, .. } => {
-                check_vec_in_call(value, &all!(), inlined)?;
-            }
-            Line::IfCondition {
-                then_branch,
-                else_branch,
-                location,
-                ..
-            } => {
-                validate_vectors(then_branch, &all!(), inlined, Some(*location))?;
-                validate_vectors(else_branch, &all!(), inlined, Some(*location))?;
-            }
-            Line::ForLoop {
-                body,
-                loop_kind,
-                location,
-                ..
-            } => {
-                validate_vectors(
-                    body,
-                    &all!(),
-                    inlined,
-                    if loop_kind.is_unroll() { None } else { Some(*location) },
-                )?;
-            }
-            Line::Match { arms, location, .. } => {
-                for (_, arm) in arms {
-                    validate_vectors(arm, &all!(), inlined, Some(*location))?;
-                }
-            }
-            _ => {}
         }
     }
     Ok(())
 }
 
-fn validate_vec_lit(elems: &[VecLiteral], vecs: &BTreeSet<Var>, inlined: &BTreeSet<String>) -> Result<(), String> {
-    for e in elems {
-        match e {
-            VecLiteral::Expr(expr) => check_vec_in_call(expr, vecs, inlined)?,
-            VecLiteral::Vec(inner) => validate_vec_lit(inner, vecs, inlined)?,
-        }
-    }
-    Ok(())
-}
-
-fn check_vec_in_call(expr: &Expression, vecs: &BTreeSet<Var>, inlined: &BTreeSet<String>) -> Result<(), String> {
-    if let Expression::FunctionCall {
-        function_name,
-        args,
-        location,
-    } = expr
-        && !inlined.contains(function_name)
-    {
-        for arg in args {
-            if let Expression::Value(SimpleExpr::Memory(VarOrConstMallocAccess::Var(v))) = arg
-                && vecs.contains(v)
-            {
+fn check_expr_scoping(expr: &Expression, ctx: &Context) -> Result<(), String> {
+    match expr {
+        Expression::Value(simple_expr) => check_simple_expr_scoping(simple_expr, ctx),
+        Expression::Lambda { param, body } => {
+            // Lambda binders cannot shadow enclosing names: later passes substitute by name only.
+            if ctx.defines(param) {
                 return Err(format!(
-                    "line {}: vector '{}' passed to function '{}'",
-                    location, v, function_name
+                    "Lambda parameter '{param}' shadows a name visible in an enclosing scope"
                 ));
             }
-        }
-    }
-    Ok(())
-}
-
-fn check_vec_literal_scoping(elements: &[VecLiteral], ctx: &Context) {
-    for elem in elements {
-        check_vec_literal_element_scoping(elem, ctx);
-    }
-}
-
-fn check_vec_literal_element_scoping(elem: &VecLiteral, ctx: &Context) {
-    match elem {
-        VecLiteral::Expr(expr) => check_expr_scoping(expr, ctx),
-        VecLiteral::Vec(inner) => check_vec_literal_scoping(inner, ctx),
-    }
-}
-
-fn check_expr_scoping(expr: &Expression, ctx: &Context) {
-    match expr {
-        Expression::Value(simple_expr) => {
-            check_simple_expr_scoping(simple_expr, ctx);
-        }
-        Expression::Lambda { param, body } => {
-            // Lambda parameters are in scope within the body
             let mut lambda_ctx = Context::new();
             lambda_ctx.scopes = ctx.scopes.clone();
             lambda_ctx.const_arrays = ctx.const_arrays.clone();
             lambda_ctx.add_var(param);
-            check_expr_scoping(body, &lambda_ctx);
+            check_expr_scoping(body, &lambda_ctx)
+        }
+        Expression::ArrayAccess { array, index } => {
+            for idx in index {
+                check_expr_scoping(idx, ctx)?;
+            }
+            if let Some(name) = array.as_var()
+                && !ctx.const_arrays.contains_key(name)
+                && !ctx.defines(name)
+            {
+                return Err(format!("Variable used but not defined: {name}"));
+            }
+            Ok(())
         }
         _ => {
             for inner_expr in expr.inner_exprs() {
-                check_expr_scoping(inner_expr, ctx);
+                check_expr_scoping(inner_expr, ctx)?;
             }
+            Ok(())
         }
     }
 }
 
-fn check_simple_expr_scoping(expr: &SimpleExpr, ctx: &Context) {
+fn check_simple_expr_scoping(expr: &SimpleExpr, ctx: &Context) -> Result<(), String> {
     match expr {
         SimpleExpr::Memory(VarOrConstMallocAccess::Var(v)) => {
-            assert!(ctx.defines(v), "Variable used but not defined: {v}");
+            if !ctx.defines(v) {
+                return Err(format!("Variable used but not defined: {v}"));
+            }
         }
         SimpleExpr::Memory(VarOrConstMallocAccess::ConstMallocAccess { .. }) | SimpleExpr::Constant(_) => {}
     }
+    Ok(())
 }
 
-fn check_boolean_scoping(boolean: &BooleanExpr<Expression>, ctx: &Context) {
-    check_expr_scoping(&boolean.left, ctx);
-    check_expr_scoping(&boolean.right, ctx);
+fn check_boolean_scoping(boolean: &BooleanExpr<Expression>, ctx: &Context) -> Result<(), String> {
+    check_expr_scoping(&boolean.left, ctx)?;
+    check_expr_scoping(&boolean.right, ctx)
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1816,7 +1284,6 @@ struct SimplifyState<'a> {
     counters: &'a mut Counters,
     array_manager: &'a mut ArrayManager,
     mut_tracker: &'a mut MutableVarTracker,
-    vec_tracker: &'a mut VectorTracker,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -2009,50 +1476,6 @@ impl ArrayManager {
     }
 }
 
-fn build_vector_value(
-    ctx: &SimplifyContext<'_>,
-    state: &mut SimplifyState<'_>,
-    const_malloc: &mut ConstMalloc,
-    elements: &[VecLiteral],
-    lines: &mut Vec<SimpleLine>,
-    location: SourceLocation,
-) -> Result<VectorValue, String> {
-    let mut vec_elements = Vec::new();
-
-    for elem in elements {
-        vec_elements.push(build_vector_value_from_element(
-            ctx,
-            state,
-            const_malloc,
-            elem,
-            lines,
-            location,
-        )?);
-    }
-
-    Ok(VectorValue::Vector(vec_elements))
-}
-
-fn build_vector_value_from_element(
-    ctx: &SimplifyContext<'_>,
-    state: &mut SimplifyState<'_>,
-    const_malloc: &mut ConstMalloc,
-    element: &VecLiteral,
-    lines: &mut Vec<SimpleLine>,
-    location: SourceLocation,
-) -> Result<VectorValue, String> {
-    match element {
-        VecLiteral::Vec(inner) => build_vector_value(ctx, state, const_malloc, inner, lines, location),
-        VecLiteral::Expr(expr) => {
-            // Scalar expression - create auxiliary variable and emit assignment
-            let aux_var = state.counters.aux_var();
-            let simplified_value = simplify_expr(ctx, state, const_malloc, expr, lines)?;
-            lines.push(SimpleLine::equality(aux_var.clone(), simplified_value));
-            Ok(VectorValue::Scalar(aux_var))
-        }
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 fn simplify_lines(
     ctx: &SimplifyContext<'_>,
@@ -2156,6 +1579,15 @@ fn simplify_lines(
                             Ok(var.clone())
                         }
                     };
+
+                for target in targets {
+                    if let AssignmentTarget::ArrayAccess { array, .. } = target
+                        && let Some(name) = array.as_var()
+                        && ctx.const_arrays.contains_key(name)
+                    {
+                        return Err(format!("cannot assign to const array '{name}', at {location}"));
+                    }
+                }
 
                 match value {
                     Expression::HintWitness { name: hint_name, ptr } => {
@@ -2270,18 +1702,32 @@ fn simplify_lines(
                             continue;
                         }
 
-                        // Special handling for poseidon16 precompile (4 variants)
+                        // Special handling for poseidon16 precompile (5 variants).
                         if ALL_POSEIDON16_NAMES.contains(&function_name.as_str()) {
                             if !targets.is_empty() {
                                 return Err(format!(
                                     "Precompile {function_name} should not return values, at {location}"
                                 ));
                             }
-                            let half_output = [POSEIDON16_HALF_NAME, POSEIDON16_HALF_HARDCODED_LEFT_NAME]
-                                .contains(&function_name.as_str());
-                            let is_hardcoded_left =
-                                [POSEIDON16_HARDCODED_LEFT_NAME, POSEIDON16_HALF_HARDCODED_LEFT_NAME]
-                                    .contains(&function_name.as_str());
+                            let permute = [
+                                POSEIDON16_PERMUTE_NAME,
+                                POSEIDON16_PERMUTE_HALF_NAME,
+                                POSEIDON16_PERMUTE_HALF_HARDCODED_LEFT_NAME,
+                            ]
+                            .contains(&function_name.as_str());
+                            let half_output = [
+                                POSEIDON16_QUARTER_NAME,
+                                POSEIDON16_QUARTER_HARDCODED_LEFT_NAME,
+                                POSEIDON16_PERMUTE_HALF_NAME,
+                                POSEIDON16_PERMUTE_HALF_HARDCODED_LEFT_NAME,
+                            ]
+                            .contains(&function_name.as_str());
+                            let is_hardcoded_left = [
+                                POSEIDON16_HARDCODED_LEFT_NAME,
+                                POSEIDON16_QUARTER_HARDCODED_LEFT_NAME,
+                                POSEIDON16_PERMUTE_HALF_HARDCODED_LEFT_NAME,
+                            ]
+                            .contains(&function_name.as_str());
                             let expected_args = if is_hardcoded_left { 4 } else { 3 };
                             if args.len() != expected_args {
                                 let signature = if is_hardcoded_left {
@@ -2314,6 +1760,7 @@ fn simplify_lines(
                                 data: PrecompileCompTimeArgs::Poseidon16 {
                                     half_output,
                                     hardcoded_offset_left,
+                                    permute,
                                 },
                             }));
                             continue;
@@ -2433,23 +1880,15 @@ fn simplify_lines(
                                         res.push(SimpleLine::equality(target_var, simplified_val));
                                     }
                                     Expression::ArrayAccess { array, index } => {
-                                        // Check if array is a vector (needs to be handled before simplifying indices)
-                                        let versioned_array = array.as_var().map(|n| state.mut_tracker.current_name(n));
-                                        if let Some(versioned_array) = &versioned_array
-                                            && state.vec_tracker.is_vector(versioned_array)
-                                        {
-                                            // Use simplify_expr which handles vectors correctly
-                                            let simplified_val = simplify_expr(
-                                                ctx,
-                                                state,
-                                                const_malloc,
-                                                &Expression::ArrayAccess {
-                                                    array: array.clone(),
-                                                    index: index.clone(),
-                                                },
-                                                &mut res,
-                                            )?;
+                                        if array.as_var().is_some_and(|n| ctx.const_arrays.contains_key(n)) {
+                                            let simplified_val =
+                                                simplify_expr(ctx, state, const_malloc, value, &mut res)?;
                                             let target_var = get_target_var_name(state, var, *is_mutable)?;
+                                            if state.mut_tracker.is_ssa_reassignment(var) {
+                                                res.push(SimpleLine::ForwardDeclaration {
+                                                    var: target_var.clone(),
+                                                });
+                                            }
                                             res.push(SimpleLine::equality(target_var, simplified_val));
                                         } else {
                                             // Pre-simplify indices before version update
@@ -2703,16 +2142,13 @@ fn simplify_lines(
 
                 // Snapshot state before processing branches
                 let mut_tracker_snapshot = state.mut_tracker.clone();
-                let vec_tracker_snapshot = state.vec_tracker.clone();
 
                 let mut array_manager_then = state.array_manager.clone();
                 let mut mut_tracker_then = state.mut_tracker.clone();
-                let mut vec_tracker_then = state.vec_tracker.clone();
                 let mut state_then = SimplifyState {
                     counters: state.counters,
                     array_manager: &mut array_manager_then,
                     mut_tracker: &mut mut_tracker_then,
-                    vec_tracker: &mut vec_tracker_then,
                 };
                 let then_branch_simplified = simplify_lines(
                     ctx,
@@ -2730,13 +2166,11 @@ fn simplify_lines(
 
                 // Restore state for else branch
                 let mut mut_tracker_else = mut_tracker_snapshot.clone();
-                let mut vec_tracker_else = vec_tracker_snapshot.clone();
 
                 let mut state_else = SimplifyState {
                     counters: state.counters,
                     array_manager: &mut array_manager_else,
                     mut_tracker: &mut mut_tracker_else,
-                    vec_tracker: &mut vec_tracker_else,
                 };
                 let else_branch_simplified = simplify_lines(
                     ctx,
@@ -2786,7 +2220,7 @@ fn simplify_lines(
             } => {
                 assert!(
                     matches!(loop_kind, LoopKind::Range | LoopKind::ParallelRange),
-                    "Unrolled/dynamic_unroll loops should have been handled already"
+                    "Unrolled loops should have been handled already"
                 );
 
                 let is_parallel = loop_kind.is_parallel();
@@ -2852,6 +2286,16 @@ fn simplify_lines(
                     }
                 }
 
+                res.push(SimpleLine::DebugAssert {
+                    expr: BooleanExpr {
+                        kind: Boolean::LessOrEqual,
+                        left: start_simplified.clone(),
+                        right: end_simplified.clone(),
+                    },
+                    location: *location,
+                    preceds_runtime_inequality: false,
+                });
+
                 // Create function arguments: iterator + external variables
                 let mut func_args = vec![iterator.clone()];
                 func_args.extend(external_vars.clone());
@@ -2905,41 +2349,6 @@ fn simplify_lines(
             Line::LocationReport { location } => {
                 res.push(SimpleLine::LocationReport { location: *location });
             }
-            Line::VecDeclaration {
-                var,
-                elements,
-                location,
-            } => {
-                let vector_value = build_vector_value(ctx, state, const_malloc, elements, &mut res, *location)?;
-                state.vec_tracker.register(var, vector_value);
-                // No SimpleLine for the variable itself - vector metadata is compile-time only
-            }
-            Line::Push {
-                vector,
-                indices,
-                element,
-                location,
-            } => {
-                let const_indices =
-                    simplify_const_indices(ctx, state, const_malloc, indices, &mut res, "push", *location)?;
-                let new_element =
-                    build_vector_value_from_element(ctx, state, const_malloc, element, &mut res, *location)?;
-                let target = navigate_vector_target_mut(state.vec_tracker, vector, &const_indices, "push", *location)?;
-                target.push(new_element);
-            }
-            Line::Pop {
-                vector,
-                indices,
-                location,
-            } => {
-                let const_indices =
-                    simplify_const_indices(ctx, state, const_malloc, indices, &mut res, "pop", *location)?;
-                let target = navigate_vector_target_mut(state.vec_tracker, vector, &const_indices, "pop", *location)?;
-                if target.len() == 0 {
-                    return Err(format!("pop on empty vector, at {}", location));
-                }
-                target.pop();
-            }
         }
     }
 
@@ -2977,9 +2386,11 @@ fn simplify_expr(
                     })
                     .collect::<Result<Vec<_>, String>>()?;
 
+                let navigated = arr
+                    .navigate(&simplified_index)
+                    .ok_or_else(|| format!("Const array index out of bounds for array '{name}'"))?;
                 return Ok(SimpleExpr::Constant(ConstExpression::scalar(
-                    arr.navigate(&simplified_index)
-                        .unwrap_or_else(|| panic!("Const array index out of bounds for array '{}'", name))
+                    navigated
                         .as_scalar()
                         .expect("Const array access should return a scalar"),
                 )));
@@ -2987,40 +2398,14 @@ fn simplify_expr(
 
             let versioned_array = array_var_name.map(|n| state.mut_tracker.current_name(n));
 
-            // Check for compile-time vector access
-            if let Some(versioned) = &versioned_array
-                && state.vec_tracker.is_vector(versioned)
-            {
-                // Vector access - indices must all be compile-time constant
-                // First, simplify all indices (this may mutate state)
-                let mut const_indices: Vec<usize> = Vec::new();
-                for idx in index {
-                    let simplified = simplify_expr(ctx, state, const_malloc, idx, lines)?;
-                    let SimpleExpr::Constant(const_expr) = simplified else {
-                        return Err("Vector index must be compile-time constant".to_string());
-                    };
-                    let val = const_expr
-                        .naive_eval()
-                        .ok_or_else(|| "Cannot evaluate vector index".to_string())?
-                        .to_usize();
-                    const_indices.push(val);
-                }
-
-                // Now we can borrow vec_tracker again
-                let vector_value = state.vec_tracker.get(versioned).unwrap();
-
-                // Navigate to the element
-                let element = vector_value
-                    .navigate(&const_indices)
-                    .ok_or_else(|| format!("Vector index out of bounds: {:?}", const_indices))?;
-
-                return match element {
-                    VectorValue::Scalar(var) => Ok(var.clone().into()),
-                    VectorValue::Vector(_) => Err("Cannot use nested vector as expression value".to_string()),
-                };
+            if index.len() != 1 {
+                return Err(format!(
+                    "Multidimensional indexing is only supported on compile-time const arrays; \
+                     `{}[..][..]` has {} indices",
+                    array_var_name.unwrap_or(&"<expr>".to_string()),
+                    index.len(),
+                ));
             }
-
-            assert_eq!(index.len(), 1);
             let index = index[0].clone();
 
             if let Some(name) = array_var_name
@@ -3088,7 +2473,7 @@ fn simplify_expr(
             let function = ctx
                 .functions
                 .get(function_name)
-                .unwrap_or_else(|| panic!("Function used but not defined: {function_name}"));
+                .ok_or_else(|| format!("Function used but not defined: {function_name}"))?;
             if function.n_returned_vars != 1 {
                 return Err(format!(
                     "Nested function calls must return exactly one value (function {function_name} returns {} values)",
@@ -3113,40 +2498,7 @@ fn simplify_expr(
 
             Ok(VarOrConstMallocAccess::Var(result_var).into())
         }
-        Expression::Len { array, indices } => {
-            // Check for compile-time vector len()
-            let versioned_array = state.mut_tracker.current_name(array);
-            if state.vec_tracker.is_vector(&versioned_array) {
-                // Evaluate indices at compile time - first simplify to avoid borrow issues
-                let mut const_indices: Vec<usize> = Vec::new();
-                for idx in indices {
-                    let simplified = simplify_expr(ctx, state, const_malloc, idx, lines)?;
-                    let SimpleExpr::Constant(const_expr) = simplified else {
-                        return Err("Vector len() index must be compile-time constant".to_string());
-                    };
-                    let val = const_expr
-                        .naive_eval()
-                        .ok_or_else(|| "Cannot evaluate len() index".to_string())?
-                        .to_usize();
-                    const_indices.push(val);
-                }
-
-                // Now we can borrow vec_tracker again
-                let vector_value = state.vec_tracker.get(&versioned_array).unwrap();
-
-                // Navigate and get length
-                let target = if const_indices.is_empty() {
-                    vector_value
-                } else {
-                    vector_value
-                        .navigate(&const_indices)
-                        .ok_or_else(|| "len() index out of bounds".to_string())?
-                };
-
-                return Ok(SimpleExpr::Constant(ConstExpression::from(target.len())));
-            }
-
-            // Fall through to const array handling (should be unreachable for vectors)
+        Expression::Len { .. } => {
             unreachable!("len() should have been resolved at parse time for const arrays")
         }
         Expression::Lambda { .. } => Err("Lambda expressions can only be used as arguments to match_range".to_string()),
@@ -3261,7 +2613,6 @@ pub fn find_variable_usage(
                 start,
                 end,
                 body,
-                loop_kind,
                 ..
             } => {
                 let (body_internal, body_external) = find_variable_usage(body, const_arrays);
@@ -3270,79 +2621,12 @@ pub fn find_variable_usage(
                 external_vars.extend(body_external.difference(&internal_vars).cloned());
                 on_new_expr(start, &internal_vars, &mut external_vars);
                 on_new_expr(end, &internal_vars, &mut external_vars);
-                if let LoopKind::DynamicUnroll { n_bits } = loop_kind {
-                    on_new_expr(n_bits, &internal_vars, &mut external_vars);
-                }
             }
             Line::Panic { .. } | Line::LocationReport { .. } => {}
-            Line::VecDeclaration { var, elements, .. } => {
-                // Process expressions in vec elements
-                process_vec_elements_usage(elements, &internal_vars, &mut external_vars, const_arrays);
-                // Add the vector variable to internal vars
-                internal_vars.insert(var.clone());
-            }
-            Line::Push {
-                vector,
-                indices,
-                element,
-                ..
-            } => {
-                // The vector variable is used
-                if !internal_vars.contains(vector) {
-                    external_vars.insert(vector.clone());
-                }
-                // Process index expressions
-                for idx in indices {
-                    on_new_expr(idx, &internal_vars, &mut external_vars);
-                }
-                // Process the pushed element
-                process_vec_element_usage(element, &internal_vars, &mut external_vars, const_arrays);
-            }
-            Line::Pop { vector, indices, .. } => {
-                // The vector variable is used
-                if !internal_vars.contains(vector) {
-                    external_vars.insert(vector.clone());
-                }
-                // Process index expressions
-                for idx in indices {
-                    on_new_expr(idx, &internal_vars, &mut external_vars);
-                }
-            }
         }
     }
 
     (internal_vars, external_vars)
-}
-
-fn process_vec_elements_usage(
-    elements: &[VecLiteral],
-    internal_vars: &BTreeSet<Var>,
-    external_vars: &mut BTreeSet<Var>,
-    const_arrays: &BTreeMap<String, ConstArrayValue>,
-) {
-    for elem in elements {
-        process_vec_element_usage(elem, internal_vars, external_vars, const_arrays);
-    }
-}
-
-fn process_vec_element_usage(
-    elem: &VecLiteral,
-    internal_vars: &BTreeSet<Var>,
-    external_vars: &mut BTreeSet<Var>,
-    const_arrays: &BTreeMap<String, ConstArrayValue>,
-) {
-    match elem {
-        VecLiteral::Expr(expr) => {
-            for var in vars_in_expression(expr, const_arrays) {
-                if !internal_vars.contains(&var) && !const_arrays.contains_key(&var) {
-                    external_vars.insert(var);
-                }
-            }
-        }
-        VecLiteral::Vec(inner) => {
-            process_vec_elements_usage(inner, internal_vars, external_vars, const_arrays);
-        }
-    }
 }
 
 enum VarTransform {
@@ -3430,15 +2714,6 @@ fn transform_vars_in_lines(lines: &mut [Line], transform: &impl Fn(&Var) -> VarT
             Line::ForLoop { iterator, .. } => {
                 transform(iterator).apply_to_var(iterator);
             }
-            Line::VecDeclaration { var, .. } => {
-                transform(var).apply_to_var(var);
-            }
-            Line::Push { vector, .. } => {
-                transform(vector).apply_to_var(vector);
-            }
-            Line::Pop { vector, .. } => {
-                transform(vector).apply_to_var(vector);
-            }
             _ => {}
         }
     }
@@ -3463,6 +2738,32 @@ fn inline_lines(
 
     transform_vars_in_lines(lines, &transform);
     replace_function_ret_in_lines(lines, res);
+}
+
+fn check_inline_returns(body: &[Line], func_name: &str) -> Result<(), String> {
+    fn count_returns(lines: &[Line]) -> usize {
+        lines
+            .iter()
+            .map(|line| {
+                usize::from(matches!(line, Line::FunctionRet { .. }))
+                    + line.nested_blocks().iter().map(|b| count_returns(b)).sum::<usize>()
+            })
+            .sum()
+    }
+
+    let nested_returns: usize = body
+        .iter()
+        .flat_map(Line::nested_blocks)
+        .map(|b| count_returns(b))
+        .sum();
+
+    if nested_returns > 0 || count_returns(body) > 1 {
+        return Err(format!(
+            "Inline function `{func_name}` has an unsupported `return`. Inline functions support \
+             exactly one `return`, placed at the end of the function's body"
+        ));
+    }
+    Ok(())
 }
 
 fn replace_function_ret_in_lines(lines: &mut Vec<Line>, res: &[AssignmentTarget]) {
@@ -3685,202 +2986,7 @@ fn replace_vars_for_unroll(
     transform_vars_in_lines(lines, &transform);
 }
 
-/// Chunk size threshold for splitting large unrolls into hybrid loops.
-/// Bits k where 2^k > CHUNK_SIZE will use a runtime outer loop with CHUNK_SIZE inner unroll.
-const DYNAMIC_UNROLL_CHUNK_SIZE: usize = 1 << 9; // 512
-
-/// Expands `for idx in dynamic_unroll(start, a, n_bits): body` into:
-/// 1. Bit decomposition of `a - start` (with constraints)
-/// 2. Conditional execution of `body` for each index start..a
-///
-/// Computes `n_iters = end - start_val`, decomposes into bits, and offsets
-/// each iterator value by the compile-time `start_val`.
-///
-/// The expansion template is written in zkDSL for readability, then parsed
-/// and post-processed (variable renaming, body splicing, location fixup).
-fn expand_dynamic_unroll(
-    iterator: &Var,
-    runtime_end: &Expression,
-    n_bits: usize,
-    start_val: usize,
-    body: &[Line],
-    location: SourceLocation,
-    unroll_counter: &mut Counter,
-) -> Vec<Line> {
-    let id = unroll_counter.get_next();
-    let pfx = format!("@du{id}");
-    let ps_len = n_bits + 1;
-
-    // The template is the zkDSL expansion of dynamic_unroll, with `end` as the
-    // runtime bound and `__iter` as a placeholder for the iterator assignment.
-    //
-    // Bits are stored in big-endian order: bits[0] is the most significant bit
-    // (weight 2^(n_bits-1)), bits[n_bits-1] is the least significant (weight 2^0).
-    // ps has n_bits+1 elements: ps[0]=0, ps[k+1] = ps[k] + bits[k]*2^(n_bits-1-k).
-    // So ps[k] is the offset (number of indices below bit k), and ps[n_bits] == n_iters.
-    //
-    // For large bits (block_size > CHUNK_SIZE), we split into chunks to reduce bytecode size:
-    // - outer runtime loop over n_chunks = block_size / CHUNK_SIZE
-    // - inner unroll over CHUNK_SIZE iterations
-    // For small bits, the range loop has minimal overhead.
-
-    // Build the template with per-bit chunking logic.
-    // Pre-compute __base_k = start_val + ps[k] once per activated bit,
-    // so the inner loop stays at 1 ADD per iteration.
-    let mut loop_body = String::new();
-    for k in 0..n_bits {
-        let block_size = 1usize << (n_bits - 1 - k);
-        if block_size <= DYNAMIC_UNROLL_CHUNK_SIZE {
-            // Small block: fully unroll
-            loop_body.push_str(&format!(
-                r#"
-    if bits[{k}] == 1:
-        __base_{k} = {start_val} + ps[{k}]
-        for j in unroll(0, {block_size}):
-            __iter = __base_{k} + j
-"#
-            ));
-        } else {
-            // Large block: hybrid loop (runtime outer, unroll inner)
-            // Use an offset variable to avoid MUL per iteration
-            let n_chunks = block_size / DYNAMIC_UNROLL_CHUNK_SIZE;
-            loop_body.push_str(&format!(
-                r#"
-    if bits[{k}] == 1:
-        __offset_{k}: Mut = {start_val} + ps[{k}]
-        for chunk in range(0, {n_chunks}):
-            for j in unroll(0, {DYNAMIC_UNROLL_CHUNK_SIZE}):
-                __iter = __offset_{k} + j
-            __offset_{k} = __offset_{k} + {DYNAMIC_UNROLL_CHUNK_SIZE}
-"#
-            ));
-        }
-    }
-    let template = format!(
-        r#"
-def __dynamic_unroll_template(end):
-    n_iters = end - {start_val}
-    bits = Array({n_bits})
-    hint_decompose_bits(n_iters, bits, {n_bits})
-    ps = Array({ps_len})
-    ps[0] = 0
-    for k in unroll(0, {n_bits}):
-        b = bits[k]
-        assert b * (1 - b) == 0
-        ps[k + 1] = ps[k] + b * 2**({n_bits} - 1 - k)
-    assert n_iters == ps[{n_bits}]
-{loop_body}
-    return
-"#
-    );
-
-    let program = parse_program(&crate::ProgramSource::Raw(template), CompilationFlags::default()).unwrap();
-    assert_eq!(program.functions.len(), 1);
-    let func = program.functions.values().next().unwrap();
-    let mut lines = func.body.clone();
-
-    // Strip trailing return + its LocationReport
-    while matches!(
-        lines.last(),
-        Some(Line::FunctionRet { .. } | Line::LocationReport { .. })
-    ) {
-        lines.pop();
-    }
-    // Strip LocationReport lines (they carry template line numbers, not the real ones)
-    strip_location_reports(&mut lines);
-
-    // Rename all internal variables with @du{id}_ prefix.
-    // __iter is renamed directly to the user's iterator variable.
-    let internals: BTreeSet<String> = ["bits", "ps", "k", "j", "b", "chunk", "n_iters"]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-    transform_vars_in_lines(&mut lines, &|var: &Var| {
-        if var == "__iter" {
-            VarTransform::Rename(iterator.clone())
-        } else if var == "end" || internals.contains(var) || var.starts_with("__offset_") || var.starts_with("__base_")
-        {
-            VarTransform::Rename(format!("{pfx}_{var}"))
-        } else {
-            VarTransform::Keep
-        }
-    });
-
-    // Prepend: @du{id}_end = runtime_end
-    lines.insert(
-        0,
-        Line::Statement {
-            targets: vec![AssignmentTarget::Var {
-                var: format!("{pfx}_end"),
-                is_mutable: false,
-            }],
-            value: runtime_end.clone(),
-            location,
-        },
-    );
-
-    // Insert body after every `{iterator} = ...` assignment (the renamed __iter lines)
-    insert_body_after_var(&mut lines, iterator, body);
-
-    // Fix all source locations to point to the actual dynamic_unroll call site
-    set_locations_recursive(&mut lines, location);
-
-    lines
-}
-
-fn strip_location_reports(lines: &mut Vec<Line>) {
-    lines.retain(|l| !matches!(l, Line::LocationReport { .. }));
-    for line in lines.iter_mut() {
-        for block in line.nested_blocks_mut() {
-            strip_location_reports(block);
-        }
-    }
-}
-
-/// In every nested block, insert `body` lines after each statement that assigns to `var`.
-fn insert_body_after_var(lines: &mut [Line], var: &str, body: &[Line]) {
-    for line in lines.iter_mut() {
-        for block in line.nested_blocks_mut() {
-            let mut i = 0;
-            while i < block.len() {
-                if matches!(&block[i], Line::Statement { targets, .. }
-                    if targets.iter().any(|t| matches!(t, AssignmentTarget::Var { var: v, .. } if v == var)))
-                {
-                    let insert_pos = i + 1;
-                    for (j, body_line) in body.iter().enumerate() {
-                        block.insert(insert_pos + j, body_line.clone());
-                    }
-                    i += 1 + body.len();
-                } else {
-                    i += 1;
-                }
-            }
-            insert_body_after_var(block, var, body);
-        }
-    }
-}
-
-fn set_locations_recursive(lines: &mut [Line], location: SourceLocation) {
-    for line in lines {
-        match line {
-            Line::Statement { location: loc, .. }
-            | Line::Assert { location: loc, .. }
-            | Line::IfCondition { location: loc, .. }
-            | Line::ForLoop { location: loc, .. }
-            | Line::Match { location: loc, .. }
-            | Line::LocationReport { location: loc }
-            | Line::VecDeclaration { location: loc, .. }
-            | Line::Push { location: loc, .. }
-            | Line::Pop { location: loc, .. } => *loc = location,
-            Line::ForwardDeclaration { .. } | Line::FunctionRet { .. } | Line::Panic { .. } => {}
-        }
-        for block in line.nested_blocks_mut() {
-            set_locations_recursive(block, location);
-        }
-    }
-}
-
-fn replace_vars_by_const_in_expr(expr: &mut Expression, map: &BTreeMap<Var, F>) {
+fn replace_vars_by_const_in_expr(expr: &mut Expression, map: &BTreeMap<Var, F>) -> Result<(), String> {
     match expr {
         Expression::Value(value) => match &value {
             SimpleExpr::Memory(VarOrConstMallocAccess::Var(var)) => {
@@ -3894,51 +3000,57 @@ fn replace_vars_by_const_in_expr(expr: &mut Expression, map: &BTreeMap<Var, F>) 
             SimpleExpr::Constant(_) => {}
         },
         Expression::ArrayAccess { array, index } => {
-            if let Some(name) = array.as_var() {
-                assert!(!map.contains_key(name), "Array {name} is a constant");
+            if let Some(name) = array.as_var()
+                && map.contains_key(name)
+            {
+                return Err(format!("Array {name} is a constant"));
             }
             for index in index {
-                replace_vars_by_const_in_expr(index, map);
+                replace_vars_by_const_in_expr(index, map)?;
             }
         }
         Expression::MathExpr(_, args) => {
             for arg in args {
-                replace_vars_by_const_in_expr(arg, map);
+                replace_vars_by_const_in_expr(arg, map)?;
             }
         }
         Expression::FunctionCall { args, .. } => {
             for arg in args {
-                replace_vars_by_const_in_expr(arg, map);
+                replace_vars_by_const_in_expr(arg, map)?;
             }
         }
         Expression::Len { indices, .. } => {
             for idx in indices {
-                replace_vars_by_const_in_expr(idx, map);
+                replace_vars_by_const_in_expr(idx, map)?;
             }
         }
         Expression::Lambda { body, .. } => {
-            replace_vars_by_const_in_expr(body, map);
+            replace_vars_by_const_in_expr(body, map)?;
         }
         Expression::HintWitness { .. } => {}
     }
+    Ok(())
 }
 
-fn replace_vars_by_const_in_lines(lines: &mut [Line], map: &BTreeMap<Var, F>) {
+fn replace_vars_by_const_in_lines(lines: &mut [Line], map: &BTreeMap<Var, F>) -> Result<(), String> {
     for line in lines {
-        // Debug: assert target vars are not const-replaced
         match line {
-            Line::ForwardDeclaration { var, .. } => {
-                assert!(!map.contains_key(var), "Variable {var} is a constant");
+            Line::ForwardDeclaration { var, .. } if map.contains_key(var) => {
+                return Err(format!("Variable {var} is a constant"));
             }
             Line::Statement { targets, .. } => {
                 for target in targets.iter() {
                     match target {
                         AssignmentTarget::Var { var, .. } => {
-                            assert!(!map.contains_key(var), "Variable {var} is a constant");
+                            if map.contains_key(var) {
+                                return Err(format!("Variable {var} is a constant"));
+                            }
                         }
                         AssignmentTarget::ArrayAccess { array, .. } => {
-                            if let Some(name) = array.as_var() {
-                                assert!(!map.contains_key(name), "Array {name} is a constant");
+                            if let Some(name) = array.as_var()
+                                && map.contains_key(name)
+                            {
+                                return Err(format!("Array {name} is a constant"));
                             }
                         }
                     }
@@ -3947,12 +3059,13 @@ fn replace_vars_by_const_in_lines(lines: &mut [Line], map: &BTreeMap<Var, F>) {
             _ => {}
         }
         for expr in line.expressions_mut() {
-            replace_vars_by_const_in_expr(expr, map);
+            replace_vars_by_const_in_expr(expr, map)?;
         }
         for block in line.nested_blocks_mut() {
-            replace_vars_by_const_in_lines(block, map);
+            replace_vars_by_const_in_lines(block, map)?;
         }
     }
+    Ok(())
 }
 
 impl Display for SimpleLine {

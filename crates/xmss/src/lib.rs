@@ -1,6 +1,5 @@
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
-use backend::PrimeCharacteristicRing;
-use backend::{DIGEST_LEN_FE, KoalaBear, POSEIDON1_WIDTH};
+use backend::{DIGEST_LEN_FE, KoalaBear, POSEIDON1_WIDTH, PrimeCharacteristicRing, poseidon16_compress};
 
 pub mod signers_cache;
 mod wots;
@@ -22,6 +21,7 @@ pub const W: usize = 3;
 pub const CHAIN_LENGTH: usize = 1 << W;
 pub const NUM_CHAIN_HASHES: usize = 110;
 pub const TARGET_SUM: usize = V * (CHAIN_LENGTH - 1) - NUM_CHAIN_HASHES;
+pub const NUM_ENCODING_FE: usize = V.div_ceil(24 / W);
 pub const RANDOMNESS_LEN_FE: usize = 6;
 pub const MESSAGE_LEN_FE: usize = 8;
 pub const PUBLIC_PARAM_LEN_FE: usize = 4;
@@ -38,6 +38,31 @@ pub const TWEAK_TYPE_MERKLE: usize = 2;
 pub const TWEAK_TYPE_ENCODING: usize = 3;
 
 const _: () = assert!(V.is_multiple_of(2)); // For efficiency of the snark (we can batch chains in pairs)
+
+pub(crate) const PRF_DOMAINSEP_WOTS_SECRET_KEY: u32 = 1000;
+pub(crate) const PRF_DOMAINSEP_PUBLIC_PARAM: u32 = 1001;
+pub(crate) const PRF_DOMAINSEP_RANDOM_NODE: u32 = 1002;
+
+pub(crate) fn poseidon_prf(domain: u32, seed: &[u8; 32], indices: [usize; 2]) -> [F; DIGEST_LEN_FE] {
+    let mut input = [F::ZERO; 16];
+    input[0] = F::from_u32(domain);
+    let mask: usize = (1 << 30) - 1;
+    let mut high_bits = 0usize;
+    for (i, word) in seed.chunks_exact(4).enumerate() {
+        let w = u32::from_le_bytes(word.try_into().unwrap()) as usize;
+        input[1 + i] = F::from_usize(w & mask);
+        high_bits |= (w >> 30) << (2 * i);
+    }
+    input[9] = F::from_usize(high_bits);
+
+    for (i, &idx) in indices.iter().enumerate() {
+        assert!(idx < 1 << 60);
+        input[10 + 2 * i] = F::from_usize(idx & mask);
+        input[11 + 2 * i] = F::from_usize(idx >> 30);
+    }
+
+    poseidon16_compress(input)
+}
 
 /// index = slot or node_index in Merkle tree
 pub fn make_tweak(tweak_type: usize, sub_position: usize, index: u32) -> [F; TWEAK_LEN] {

@@ -4,8 +4,8 @@ use poly::*;
 
 #[derive(Debug)]
 pub struct ConstraintFolderPacked<'a, IF, EF: ExtensionField<PF<EF>>, ExtraData: AlphaPowers<EF>> {
-    pub up: &'a [IF],
-    pub down: &'a [IF],
+    pub flat: &'a [IF],
+    pub shift: &'a [IF],
     pub extra_data: &'a ExtraData,
     pub accumulator: EFPacking<EF>,
     pub constraint_index: usize,
@@ -21,10 +21,10 @@ where
     EFPacking<EF>: PrimeCharacteristicRing,
     ExtraData: AlphaPowers<EF>,
 {
-    pub fn new(up: &'a [IF], down: &'a [IF], extra_data: &'a ExtraData) -> Self {
+    pub fn new(flat: &'a [IF], shift: &'a [IF], extra_data: &'a ExtraData) -> Self {
         Self {
-            up,
-            down,
+            flat,
+            shift,
             extra_data,
             accumulator: EFPacking::<EF>::ZERO,
             constraint_index: 0,
@@ -48,30 +48,30 @@ where
     type EF = EFPacking<EF>;
 
     #[inline]
-    fn up(&self) -> &[Self::IF] {
-        self.up
+    fn flat(&self) -> &[Self::IF] {
+        self.flat
     }
 
     #[inline]
-    fn down(&self) -> &[Self::IF] {
-        self.down
+    fn shift(&self) -> &[Self::IF] {
+        self.shift
     }
 
-    #[inline]
+    #[inline(always)]
     fn assert_zero(&mut self, x: IF) {
         let alpha_power = self.extra_data.alpha_powers()[self.constraint_index];
         self.accumulator += EFPacking::<EF>::from(alpha_power) * x;
         self.constraint_index += 1;
     }
 
-    #[inline]
+    #[inline(always)]
     fn assert_zero_ef(&mut self, x: EFPacking<EF>) {
         let alpha_power = self.extra_data.alpha_powers()[self.constraint_index];
         self.accumulator += EFPacking::<EF>::from(alpha_power) * x;
         self.constraint_index += 1;
     }
 
-    #[inline]
+    #[inline(always)]
     fn assert_eq_low(&mut self, x: IF, y: IF) {
         let alpha_power = self.extra_data.alpha_powers()[self.constraint_index];
         let contrib = EFPacking::<EF>::from(alpha_power) * (x - y);
@@ -80,7 +80,7 @@ where
         self.constraint_index += 1;
     }
 
-    #[inline]
+    #[inline(always)]
     fn low_degree_block<F>(&mut self, state: &mut [IF], block: F)
     where
         F: FnOnce(&mut Self, &mut [IF]),

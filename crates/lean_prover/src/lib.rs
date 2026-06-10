@@ -2,17 +2,12 @@
 
 use std::fmt::Display;
 
-use backend::*;
-use lean_vm::{
-    EF, F, MAX_WHIR_LOG_INV_RATE, MIN_LOG_N_ROWS_PER_TABLE, MIN_WHIR_LOG_INV_RATE, RunnerError, Table, TableT,
-};
-use utils::*;
-
-mod trace_gen;
-
 pub mod prove_execution;
+mod trace_gen;
 pub mod verify_execution;
 
+use backend::*;
+use lean_vm::*;
 #[cfg(test)]
 mod test_zkvm;
 
@@ -30,6 +25,10 @@ pub const RS_DOMAIN_INITIAL_REDUCTION_FACTOR: usize = 5;
 pub const SNARK_DOMAIN_SEP: [F; 8] = F::new_array([
     130704175, 1303721200, 493664240, 1035493700, 2063844858, 1410214009, 1938905908, 1696767928,
 ]);
+
+pub fn fiat_shamir_domain_sep(bytecode: &Bytecode) -> [F; 8] {
+    poseidon16_compress_pair(&bytecode.hash, &SNARK_DOMAIN_SEP)
+}
 
 pub fn default_whir_config(starting_log_inv_rate: usize) -> WhirConfigBuilder {
     assert!(0 < starting_log_inv_rate);
@@ -61,8 +60,7 @@ pub(crate) fn check_rate(log_inv_rate: usize) -> Result<(), ProofError> {
 pub enum ProverError {
     TooBigTable(TooBigTableError),
     Runner(RunnerError),
-    UnknownMessage,
-    MultipleMessages,
+    InvalidRate,
 }
 
 impl From<TooBigTableError> for ProverError {
@@ -82,24 +80,25 @@ impl Display for ProverError {
         match self {
             Self::TooBigTable(e) => write!(f, "{}", e),
             Self::Runner(e) => write!(f, "{}", e),
-            Self::UnknownMessage => write!(f, "Unknown message, not part of the type2"),
-            Self::MultipleMessages => write!(f, "Multiple common messages in the type2"),
+            Self::InvalidRate => write!(
+                f,
+                "LeanVM supports rate 1/2, 1/4, 1/8 and 1/16 (log_inv_rate in {{1, 2, 3, 4}})"
+            ),
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use backend::{PrimeCharacteristicRing, default_koalabear_poseidon1_16, hash_slice};
+    use backend::{PrimeCharacteristicRing, default_koalabear_poseidon1_16, hash_slice_rtl, poseidon16_compress_pair};
     use lean_vm::F;
     use rec_aggregation::{get_aggregation_bytecode, init_aggregation_bytecode};
-    use utils::poseidon16_compress_pair;
 
     #[test]
     fn compute_snark_domain_sep() {
         init_aggregation_bytecode();
         let recursion_bytecode_hash = get_aggregation_bytecode().hash;
-        let name_fe = "leanMultisig-0.6.0"
+        let name_fe = "leanVM-0.6.0"
             .as_bytes()
             .iter()
             .map(|b| F::from_u8(*b))
@@ -112,7 +111,7 @@ mod tests {
         }
         prefix_free_name_fe.push(F::from_u64(len as u64));
         let comp = default_koalabear_poseidon1_16();
-        let name_hash = hash_slice::<_, _, _, 8, 8>(&comp, &prefix_free_name_fe);
+        let name_hash = hash_slice_rtl::<_, _, _, 8, 8>(&comp, &prefix_free_name_fe);
 
         // We incorporate the recursion program hash, containing all the verifier logic, into fiat shamir domain separator
         // (likely not necessary but why not, is there a cleaner approach?)

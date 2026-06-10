@@ -1,6 +1,27 @@
-include!(concat!(env!("OUT_DIR"), "/info.rs"));
+use std::sync::OnceLock;
 
 const _: () = assert!(usize::BITS == 64, "this project requires a 64-bit target (for now)");
+
+#[must_use]
+pub fn num_threads() -> usize {
+    static CACHE: OnceLock<usize> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        std::thread::available_parallelism()
+            .expect("failed to detect available parallelism")
+            .get()
+    })
+}
+
+#[must_use]
+pub fn l1_cache_size() -> usize {
+    static CACHE: OnceLock<usize> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        detect_l1_cache_size().unwrap_or_else(|| {
+            eprintln!("Warning: failed to detect L1 cache size, defaulting to 32 KB");
+            32 * 1024
+        })
+    })
+}
 
 pub fn peak_rss_bytes() -> u64 {
     let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
@@ -10,35 +31,31 @@ pub fn peak_rss_bytes() -> u64 {
     if cfg!(target_os = "macos") { max } else { max * 1024 }
 }
 
-/// Number of jobs [`flush_rayon`] pushes. Must exceed
-/// `crossbeam_deque::deque::BLOCK_CAP` (currently 63 —
-/// `crossbeam-deque-0.8.6/src/deque.rs:1191`).
-const RAYON_FLUSH_JOBS: usize = 256;
-
-/// Drain rayon's internal queues so they release any storage allocated during the
-/// previous phase.
-///
-/// Rayon's global pool owns a `crossbeam_deque::Injector`, internally a linked list
-/// of fixed-size blocks (`Block` and `Injector::push` —
-/// `crossbeam-deque-0.8.6/src/deque.rs:1219` and `:1371`). A block is freed only
-/// once its last slot has been consumed.
-///
-/// `rayon::join` from a non-worker thread reaches that injector via
-/// `join` (`rayon-core-1.13.0/src/join/mod.rs:132`) ->
-/// `registry::in_worker` (`registry.rs:946`) ->
-/// `Registry::in_worker_cold` (`:517`) ->
-/// `Registry::inject` (`:428`) -> `Injector::push`.
-///
-/// Under an arena allocator that recycles memory between phases (e.g. `zk-alloc`),
-/// a block allocated *during* a phase points into a slab the next `begin_phase()`
-/// will reuse. The next push then writes a `JobRef` straight through whatever the
-/// application has placed on top, silently corrupting it.
-///
-/// Pushing more than `BLOCK_CAP` jobs while the arena is off forces the Injector                                        
-/// to allocate a fresh tail block (which lands in System), and forces workers to                                      
-/// steal the last slot of every preceding block (which destroys them).
-pub fn flush_rayon() {
-    for _ in 0..RAYON_FLUSH_JOBS {
-        rayon::join(|| {}, || {});
+#[cfg(target_os = "linux")]
+fn detect_l1_cache_size() -> Option<usize> {
+    // /sys reports e.g. "32K\n", "48K\n", "1M\n".
+    let s = std::fs::read_to_string("/sys/devices/system/cpu/cpu0/cache/index0/size").ok()?;
+    let s = s.trim();
+    let last = s.chars().last()?;
+    match last {
+        'K' | 'k' => s[..s.len() - 1].parse::<usize>().ok().map(|n| n * 1024),
+        'M' | 'm' => s[..s.len() - 1].parse::<usize>().ok().map(|n| n * 1024 * 1024),
+        c if c.is_ascii_digit() => s.parse().ok(),
+        _ => None,
     }
+}
+
+#[cfg(target_os = "macos")]
+fn detect_l1_cache_size() -> Option<usize> {
+    // `hw.l1dcachesize` returns the E-core value on Apple Silicon; prefer the P-core size.
+    let read_sysctl = |key: &str| -> Option<usize> {
+        let out = std::process::Command::new("sysctl").args(["-n", key]).output().ok()?;
+        std::str::from_utf8(&out.stdout).ok()?.trim().parse().ok()
+    };
+    read_sysctl("hw.perflevel0.l1dcachesize").or_else(|| read_sysctl("hw.l1dcachesize"))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn detect_l1_cache_size() -> Option<usize> {
+    None
 }

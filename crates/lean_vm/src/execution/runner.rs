@@ -1,18 +1,20 @@
 //! VM execution runner
 
-use crate::core::{DIMENSION, F};
+use backend::ArenaVec;
+
+use crate::core::{DIMENSION, F, PUBLIC_INPUT_LEN};
 use crate::diagnostics::{ExecutionMetadata, ExecutionResult, RunnerError};
 use crate::execution::memory::MemoryAccess;
 use crate::execution::{ExecutionHistory, Memory};
 use crate::isa::Bytecode;
-use crate::isa::hint::{DiagnosticState, Hint, HintState, NamedHintCursor};
+use crate::isa::hint::{DiagnosticState, Hint, HintState};
 use crate::isa::instruction::{InstructionContext, InstructionCounts};
 use crate::{
-    ALL_TABLES, CodeAddress, ENDING_PC, HintExecutionContext, MemOrConstant, N_TABLES, STARTING_PC, Table, TableTrace,
+    ALL_TABLES, CodeAddress, HintExecutionContext, MAX_LOG_MEMORY_SIZE, MemOrConstant, N_TABLES, STARTING_PC, Table,
+    TableTrace,
 };
 use backend::*;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
-use utils::{ToUsize, padd_with_zero_to_next_power_of_two};
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::memory::SegmentMemory;
 
@@ -22,12 +24,41 @@ pub struct ExecutionWitness {
     /// memory and runtime memory that the runner leaves unset, that is filled
     /// manually by the program at startup.
     pub preamble_memory_len: usize,
-    pub hints: HashMap<String, Vec<Vec<F>>>,
+    pub hints: Hints,
+    /// testing purpose
+    pub min_table_log_n_rows: BTreeMap<Table, usize>,
+}
+
+#[derive(Debug, Default)]
+pub struct HintData {
+    pub name: &'static str,
+    pub entries: ArenaVec<ArenaVec<F>>,
+}
+
+#[derive(Debug, Default)]
+pub struct Hints(Vec<HintData>);
+
+impl Hints {
+    pub fn insert(&mut self, bytecode: &Bytecode, name: &'static str, entries: ArenaVec<ArenaVec<F>>) {
+        let slot = bytecode.hint_slot(name);
+        if slot >= self.0.len() {
+            self.0.resize_with(slot + 1, HintData::default);
+        }
+        self.0[slot] = HintData { name, entries };
+    }
+
+    pub fn entries(&self, slot: usize) -> &[ArenaVec<F>] {
+        self.0.get(slot).map_or(&[], |h| &h.entries)
+    }
+
+    pub fn name(&self, slot: usize) -> &str {
+        self.0.get(slot).map_or("", |h| h.name)
+    }
 }
 
 pub fn try_execute_bytecode(
     bytecode: &Bytecode,
-    public_input: &[F],
+    public_input: &[F; PUBLIC_INPUT_LEN],
     witness: &ExecutionWitness,
     profiling: bool,
 ) -> Result<ExecutionResult, RunnerError> {
@@ -58,7 +89,7 @@ pub fn try_execute_bytecode(
 
 pub fn execute_bytecode(
     bytecode: &Bytecode,
-    public_input: &[F],
+    public_input: &[F; PUBLIC_INPUT_LEN],
     witness: &ExecutionWitness,
     profiling: bool,
 ) -> ExecutionResult {
@@ -67,8 +98,8 @@ pub fn execute_bytecode(
 }
 
 struct Trace {
-    pcs: Vec<usize>,
-    fps: Vec<usize>,
+    pcs: ArenaVec<usize>,
+    fps: ArenaVec<usize>,
     tables: BTreeMap<Table, TableTrace>,
     counts: InstructionCounts,
     pending_deref_hints: Vec<(usize, usize)>, // (target_addr, src_addr) constraints to resolve at end
@@ -77,8 +108,8 @@ struct Trace {
 impl Trace {
     fn new() -> Self {
         Self {
-            pcs: Vec::new(),
-            fps: Vec::new(),
+            pcs: ArenaVec::new(),
+            fps: ArenaVec::new(),
             tables: BTreeMap::from_iter((0..N_TABLES).map(|i| (ALL_TABLES[i], TableTrace::new(&ALL_TABLES[i])))),
             counts: InstructionCounts::default(),
             pending_deref_hints: Vec::new(),
@@ -86,14 +117,14 @@ impl Trace {
     }
 
     fn merge(&mut self, other: Self) {
-        self.pcs.extend(other.pcs);
-        self.fps.extend(other.fps);
+        self.pcs.extend_from_slice(&other.pcs);
+        self.fps.extend_from_slice(&other.fps);
         self.counts += other.counts;
         self.pending_deref_hints.extend(other.pending_deref_hints);
         for (table, other_t) in other.tables {
             let mine = self.tables.get_mut(&table).unwrap();
-            for (col, new_data) in mine.columns.iter_mut().zip(other_t.columns) {
-                col.extend(new_data);
+            for (col, new_data) in mine.columns.iter_mut().zip(&other_t.columns) {
+                col.extend_from_slice(new_data);
             }
         }
     }
@@ -114,7 +145,7 @@ struct ParallelBatchInfo {
     /// Per-name cursor indices at the moment iteration 0 started consuming
     /// hints. Diffed against the post-iteration-0 state to learn per-name
     /// consumption.
-    hint_indices_at_start: HashMap<String, usize>,
+    hint_indices_at_start: Vec<usize>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -125,13 +156,14 @@ fn run_loop<M: MemoryAccess>(
     pc: &mut usize,
     fp: &mut usize,
     ap: &mut usize,
-    hints: &mut HintState<'_, '_>,
+    hints: &mut HintState<'_>,
+    hint_data: &Hints,
     stop_pc: Option<usize>,
 ) -> Result<LoopExit, RunnerError> {
     let mut parallel_batch: Option<ParallelBatchInfo> = None;
 
     loop {
-        if *pc == ENDING_PC {
+        if *pc == bytecode.ending_pc {
             return Ok(LoopExit::Halted);
         }
         if *pc >= bytecode.code.len() {
@@ -154,17 +186,14 @@ fn run_loop<M: MemoryAccess>(
                         frame_size: *ap - *fp,
                         n_args: *n_args,
                         end_value: *end_value,
-                        hint_indices_at_start: hints
-                            .named_hints
-                            .iter()
-                            .map(|(name, cursor)| (name.clone(), cursor.index))
-                            .collect(),
+                        hint_indices_at_start: hints.indices.to_vec(),
                     });
                 }
                 continue;
             }
             let mut ctx = HintExecutionContext {
                 hints,
+                hint_data,
                 memory,
                 fp: *fp,
                 ap,
@@ -205,8 +234,7 @@ fn run_loop<M: MemoryAccess>(
 /// Each constraint has form: memory[target_addr] = memory[memory[src_addr]]
 /// Order matters because some src addresses might point to targets of other hints.
 /// We iteratively resolve constraints until no more progress, then fill remaining with 0.
-/// Assumption: every memory[src_addr] is defined (i.e. is Some(_)) (which is true when DEREFs come from range checks)
-fn resolve_deref_hints(memory: &mut Memory, pending: &[(usize, usize)]) {
+fn resolve_deref_hints(memory: &mut Memory, pending: &[(usize, usize)]) -> Result<(), RunnerError> {
     let mut resolved: BTreeSet<usize> = BTreeSet::new();
     loop {
         let mut made_progress = false;
@@ -214,11 +242,13 @@ fn resolve_deref_hints(memory: &mut Memory, pending: &[(usize, usize)]) {
             if resolved.contains(&target_addr) {
                 continue;
             }
-            let addr = memory.0[src_addr].unwrap();
+            let addr = memory
+                .get(src_addr)
+                .map_err(|_| RunnerError::ImpossibleDerefResolution)?;
             let Some(value) = memory.0.get(addr.to_usize()).copied().flatten() else {
                 continue;
             };
-            memory.set(target_addr, value).unwrap();
+            memory.set(target_addr, value)?;
             resolved.insert(target_addr);
             made_progress = true;
         }
@@ -229,29 +259,28 @@ fn resolve_deref_hints(memory: &mut Memory, pending: &[(usize, usize)]) {
     // Fill any remaining unresolved targets with 0 (this can happen in case of cycles)
     for &(target_addr, _src_addr) in pending {
         if !resolved.contains(&target_addr) {
-            memory.set(target_addr, F::ZERO).unwrap();
+            memory.set(target_addr, F::ZERO)?;
         }
     }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
 fn execute_bytecode_helper(
     bytecode: &Bytecode,
-    public_input: &[F],
+    public_input: &[F; PUBLIC_INPUT_LEN],
     witness: &ExecutionWitness,
     std_out: &mut String,
     instruction_history: &mut ExecutionHistory,
     profiling: bool,
 ) -> Result<ExecutionResult, (CodeAddress, RunnerError)> {
-    let mut named_hints: HashMap<String, NamedHintCursor<'_>> = witness
-        .hints
-        .iter()
-        .map(|(name, entries)| (name.clone(), NamedHintCursor::new(entries)))
-        .collect();
-    let public_memory = padd_with_zero_to_next_power_of_two(public_input);
-    let public_memory_size = public_memory.len();
+    let n_slots = bytecode.hint_name_to_index.len();
+    let hint_data = &witness.hints;
+    let mut hint_indices = vec![0usize; n_slots];
+
+    let public_memory = public_input.to_vec();
     let mut memory = Memory::new(public_memory);
-    let mut fp = public_memory_size + witness.preamble_memory_len;
+    let mut fp = PUBLIC_INPUT_LEN + witness.preamble_memory_len;
     fp = fp.next_multiple_of(DIMENSION);
     let initial_ap = fp + bytecode.starting_frame_memory;
     let mut pc = STARTING_PC;
@@ -270,7 +299,7 @@ fn execute_bytecode_helper(
                 last_checkpoint_cpu_cycles: &mut last_checkpoint_cpu_cycles,
                 checkpoint_ap: &mut checkpoint_ap,
             }),
-            named_hints: &mut named_hints,
+            indices: &mut hint_indices,
         };
         match run_loop(
             bytecode,
@@ -280,6 +309,7 @@ fn execute_bytecode_helper(
             &mut fp,
             &mut ap,
             &mut hints,
+            hint_data,
             None,
         )
         .map_err(|e| (pc, e))?
@@ -290,7 +320,8 @@ fn execute_bytecode_helper(
                     bytecode,
                     &mut memory,
                     &mut trace,
-                    &mut named_hints,
+                    &mut hints,
+                    hint_data,
                     &mut pc,
                     &mut fp,
                     &mut ap,
@@ -302,16 +333,20 @@ fn execute_bytecode_helper(
         }
     }
 
-    resolve_deref_hints(&mut memory, &trace.pending_deref_hints);
-    assert_eq!(pc, ENDING_PC);
-    for (name, cursor) in &named_hints {
-        assert_eq!(
-            cursor.index,
-            cursor.entries.len(),
-            "Not all entries of named hint '{name}' were consumed ({} of {} used)",
-            cursor.index,
-            cursor.entries.len(),
-        );
+    resolve_deref_hints(&mut memory, &trace.pending_deref_hints).map_err(|e| (pc, e))?;
+    assert_eq!(pc, bytecode.ending_pc);
+    for (slot, hint) in hint_data.0.iter().enumerate() {
+        if hint_indices[slot] != hint.entries.len() {
+            return Err((
+                pc,
+                RunnerError::InvalidHintWitness(format!(
+                    "not all entries of named hint '{}' were consumed ({} of {} used)",
+                    hint.name,
+                    hint_indices[slot],
+                    hint.entries.len(),
+                )),
+            ));
+        }
     }
     trace.pcs.push(pc);
     trace.fps.push(fp);
@@ -325,15 +360,20 @@ fn execute_bytecode_helper(
     } else {
         None
     };
-    let runtime_memory_size = memory.0.len() - public_memory_size - witness.preamble_memory_len;
-    let used_memory_cells = memory.0.par_iter().filter(|&&x| x.is_some()).count();
+    let runtime_memory_size = memory.0.len() - PUBLIC_INPUT_LEN - witness.preamble_memory_len;
+    let used_memory_cells = parallel::map_reduce(
+        memory.0.len(),
+        || 0usize,
+        |i| usize::from(memory.0[i].is_some()),
+        |a, b| a + b,
+    );
     let metadata = ExecutionMetadata {
         cycles: trace.pcs.len(),
         memory: memory.0.len(),
         n_poseidons: trace.tables[&Table::poseidon16()].columns[0].len(),
         n_extension_ops: trace.tables[&Table::extension_op()].columns[0].len(),
         bytecode_size: bytecode.code.len(),
-        public_input_size: public_input.len(),
+        public_input_size: PUBLIC_INPUT_LEN,
         runtime_memory: runtime_memory_size,
         memory_usage_percent: used_memory_cells as f64 / memory.0.len() as f64 * 100.0,
         stdout: std::mem::take(std_out),
@@ -341,7 +381,6 @@ fn execute_bytecode_helper(
     };
     Ok(ExecutionResult {
         runtime_memory_size: no_vec_runtime_memory,
-        public_memory_size,
         memory,
         pcs: trace.pcs,
         fps: trace.fps,
@@ -372,7 +411,8 @@ fn handle_parallel_batch(
     bytecode: &Bytecode,
     memory: &mut Memory,
     trace: &mut Trace,
-    named_hints: &mut HashMap<String, NamedHintCursor<'_>>,
+    hints: &mut HintState<'_>,
+    hint_data: &Hints,
     pc: &mut usize,
     fp: &mut usize,
     ap: &mut usize,
@@ -380,23 +420,25 @@ fn handle_parallel_batch(
 ) -> Result<(), RunnerError> {
     let start_value = memory.get(batch.batch_fp + 2)?.to_usize();
     let end_value = batch.end_value.read_value(memory, batch.batch_fp)?.to_usize();
-    let n_iters = end_value - start_value;
-
-    if n_iters == 1 {
+    let n_iters = end_value.saturating_sub(start_value);
+    if n_iters <= 1 {
         return Ok(());
     }
 
     let stride = *fp - batch.batch_fp;
     let return_pc = memory.get(*fp)?.to_usize();
+    let saved_fp = memory.get(*fp + 1)?.to_usize();
     let args: Vec<F> = (0..batch.n_args)
         .map(|i| memory.get(batch.batch_fp + 2 + i).unwrap())
         .collect();
 
-    // Per-name deltas for named hints (measured from iteration 0).
-    let named_per_iter: HashMap<String, usize> = named_hints
+    let named_per_iter: Vec<usize> = hints
+        .indices
         .iter()
-        .map(|(name, cursor)| (name.clone(), cursor.index - batch.hint_indices_at_start[name]))
+        .enumerate()
+        .map(|(slot, &index)| index - batch.hint_indices_at_start[slot])
         .collect();
+    let base_indices: Vec<usize> = hints.indices.to_vec();
 
     for i in 1..=n_iters {
         let iter_val = if i < n_iters { start_value + i } else { end_value };
@@ -404,13 +446,16 @@ fn handle_parallel_batch(
             memory,
             batch.batch_fp + i * stride,
             return_pc,
-            batch.batch_fp + (i - 1) * stride,
+            saved_fp,
             iter_val,
             &args,
         )?;
     }
 
     let max_addr = batch.batch_fp + (n_iters + 1) * stride;
+    if max_addr > 1 << MAX_LOG_MEMORY_SIZE {
+        return Err(RunnerError::OutOfMemory);
+    }
     if max_addr > memory.0.len() {
         memory.0.resize(max_addr, None);
     }
@@ -423,44 +468,59 @@ fn handle_parallel_batch(
     let split_at = batch.batch_fp + stride; // end of iteration 0's frame
     let (left, right) = memory.0.split_at_mut(split_at);
     let shared: &[Option<F>] = &*left;
-    let segment_slices: Vec<&mut [Option<F>]> = right.chunks_mut(stride).take(n_par).collect();
+    let mut segment_slices: Vec<&mut [Option<F>]> = right.chunks_mut(stride).take(n_par).collect();
 
     type SegResult = Result<(Trace, Vec<(usize, F)>), RunnerError>;
-    let results: Vec<SegResult> = segment_slices
-        .into_par_iter()
-        .enumerate()
-        .map(|(i, seg_slice)| {
-            let seg_start = split_at + i * stride;
-            let mut seg_mem = SegmentMemory::new(shared, seg_slice, seg_start);
-            let fp_i = batch.batch_fp + (i + 1) * stride;
-            let mut seg_trace = Trace::new();
-            let mut seg_pc = batch.batch_pc;
-            let mut seg_fp = fp_i;
-            let mut seg_ap = fp_i + batch.frame_size;
-            let mut seg_named_hints = named_hints.clone();
-            for (name, delta) in &named_per_iter {
-                if let Some(cursor) = seg_named_hints.get_mut(name) {
-                    cursor.index += i * delta;
-                }
-            }
-            let mut hints = HintState {
-                diagnostics: None,
-                named_hints: &mut seg_named_hints,
-            };
-            run_loop(
-                bytecode,
-                &mut seg_mem,
-                &mut seg_trace,
-                &mut seg_pc,
-                &mut seg_fp,
-                &mut seg_ap,
-                &mut hints,
-                Some(batch.batch_pc),
-            )?;
-            let deferred = seg_mem.into_deferred_writes();
-            Ok((seg_trace, deferred))
-        })
+
+    let seg_info: Vec<(parallel::SendPtr<Option<F>>, usize)> = segment_slices
+        .iter_mut()
+        .map(|s| (parallel::SendPtr(s.as_mut_ptr()), s.len()))
         .collect();
+    drop(segment_slices);
+
+    let results: Vec<SegResult> = parallel::par_map_collect(n_par, |i| {
+        let (seg_ptr, seg_len) = &seg_info[i];
+        let seg_slice: &mut [Option<F>] = unsafe { std::slice::from_raw_parts_mut(seg_ptr.0, *seg_len) };
+        let seg_start = split_at + i * stride;
+        let mut seg_mem = SegmentMemory::new(shared, seg_slice, seg_start);
+        let fp_i = batch.batch_fp + (i + 1) * stride;
+        let mut seg_trace = Trace::new();
+        let mut seg_pc = batch.batch_pc;
+        let mut seg_fp = fp_i;
+        let mut seg_ap = fp_i + batch.frame_size;
+        let mut seg_indices = base_indices.clone();
+        for (slot, index) in seg_indices.iter_mut().enumerate() {
+            *index += i * named_per_iter[slot];
+        }
+        let mut seg_hints = HintState {
+            diagnostics: None,
+            indices: &mut seg_indices,
+        };
+        run_loop(
+            bytecode,
+            &mut seg_mem,
+            &mut seg_trace,
+            &mut seg_pc,
+            &mut seg_fp,
+            &mut seg_ap,
+            &mut seg_hints,
+            hint_data,
+            Some(batch.batch_pc),
+        )?;
+        for slot in 0..seg_indices.len() {
+            let delta = named_per_iter[slot];
+            // Before `run_loop` this segment was at `base_indices[slot] + i*delta`.
+            let consumed = seg_indices[slot] - (base_indices[slot] + i * delta);
+            if consumed != delta {
+                let name = hint_data.name(slot);
+                return Err(RunnerError::InvalidHintWitness(format!(
+                    "hint '{name}' consumed {consumed} entries in a parallel iteration but {delta} in iteration 0; parallel iterations must consume hints uniformly"
+                )));
+            }
+        }
+        let deferred = seg_mem.into_deferred_writes();
+        Ok((seg_trace, deferred))
+    });
 
     for (idx, result) in results.into_iter().enumerate() {
         let (seg_trace, deferred) = result.map_err(|e| RunnerError::ParallelSegmentFailed(idx + 1, Box::new(e)))?;
@@ -470,10 +530,8 @@ fn handle_parallel_batch(
         }
     }
 
-    for (name, delta) in &named_per_iter {
-        if let Some(cursor) = named_hints.get_mut(name) {
-            cursor.index += n_par * delta;
-        }
+    for (slot, &delta) in named_per_iter.iter().enumerate() {
+        hints.indices[slot] += n_par * delta;
     }
 
     *pc = batch.batch_pc;

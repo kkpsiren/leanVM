@@ -1,0 +1,165 @@
+use tracing::instrument;
+
+use crate::{
+    F,
+    tables::{Poseidon1Cols16, WIDTH},
+};
+use backend::*;
+
+#[instrument(name = "generate Poseidon16 AIR trace", skip_all)]
+pub fn fill_trace_poseidon_16(trace: &mut [ArenaVec<F>]) {
+    let n = trace.iter().map(|col| col.len()).max().unwrap();
+    for col in trace.iter_mut() {
+        if col.len() != n {
+            col.resize(n, F::ZERO);
+        }
+    }
+
+    let m = n - (n % packing_width::<F>());
+    let trace_packed: Vec<_> = trace.iter().map(|col| FPacking::<F>::pack_slice(&col[..m])).collect();
+
+    const N_COLS: usize = super::num_cols_poseidon_16();
+
+    // fill the packed rows. Bind a fixed-size array ref so the per-row `array::from_fn`
+    // indexing elides bounds checks (one length check here, none in the hot loop).
+    let cols: &[&[FPacking<F>]; N_COLS] = (&trace_packed[..N_COLS]).try_into().unwrap();
+    parallel::for_each_index(m / packing_width::<F>(), |i| {
+        let ptrs: [*mut FPacking<F>; N_COLS] =
+            std::array::from_fn(|c| unsafe { (cols[c].as_ptr() as *mut FPacking<F>).add(i) });
+        let perm: &mut Poseidon1Cols16<&mut FPacking<F>> =
+            unsafe { &mut *(ptrs.as_ptr() as *mut Poseidon1Cols16<&mut FPacking<F>>) };
+
+        generate_trace_rows_for_perm(perm);
+    });
+
+    // fill the remaining rows (non packed)
+    let cols: &[ArenaVec<F>; N_COLS] = (&trace[..N_COLS]).try_into().unwrap();
+    for i in m..n {
+        let ptrs: [*mut F; N_COLS] = std::array::from_fn(|c| unsafe { (cols[c].as_ptr() as *mut F).add(i) });
+        let perm: &mut Poseidon1Cols16<&mut F> = unsafe { &mut *(ptrs.as_ptr() as *mut Poseidon1Cols16<&mut F>) };
+        generate_trace_rows_for_perm(perm);
+    }
+}
+
+pub(super) fn generate_trace_rows_for_perm<F: Algebra<KoalaBear> + Copy>(perm: &mut Poseidon1Cols16<&mut F>) {
+    let inputs: [F; WIDTH] = std::array::from_fn(|i| *perm.inputs[i]);
+    let mut state = inputs;
+
+    // No initial linear layer for Poseidon1 (unlike Poseidon2)
+
+    for (full_round, constants) in perm
+        .beginning_full_rounds
+        .iter_mut()
+        .zip(poseidon1_initial_constants().chunks_exact(2))
+    {
+        generate_2_full_round(&mut state, full_round, &constants[0], &constants[1]);
+    }
+
+    // --- Sparse partial rounds ---
+    // Transition: add first-round constants, multiply by m_i
+    let frc = poseidon1_sparse_first_round_constants();
+    for (s, &c) in state.iter_mut().zip(frc.iter()) {
+        *s += c;
+    }
+    let m_i = poseidon1_sparse_m_i();
+    let input_for_mi = state;
+    for i in 0..WIDTH {
+        let row: [F; WIDTH] = m_i[i].map(F::from);
+        state[i] = F::dot_product(&input_for_mi, &row);
+    }
+
+    let first_rows = poseidon1_sparse_first_row();
+    let v_vecs = poseidon1_sparse_v();
+    let scalar_rc = poseidon1_sparse_scalar_round_constants();
+    let n_partial = perm.partial_rounds.len();
+    for round in 0..n_partial {
+        // S-box on state[0]
+        state[0] = state[0].cube();
+        *perm.partial_rounds[round] = state[0];
+        // Scalar round constant (not on last round)
+        if round < n_partial - 1 {
+            state[0] += scalar_rc[round];
+        }
+        // Sparse matrix
+        let old_s0 = state[0];
+        let row: [F; WIDTH] = first_rows[round].map(F::from);
+        let new_s0 = F::dot_product(&state, &row);
+        state[0] = new_s0;
+        for i in 1..WIDTH {
+            state[i] += old_s0 * v_vecs[round][i - 1];
+        }
+    }
+
+    let n_ending_full_rounds = perm.ending_full_rounds.len();
+    for (full_round, constants) in perm
+        .ending_full_rounds
+        .iter_mut()
+        .zip(poseidon1_final_constants().chunks_exact(2))
+    {
+        generate_2_full_round(&mut state, full_round, &constants[0], &constants[1]);
+    }
+
+    let flag_permute = *perm.flag_permute;
+    generate_last_2_full_rounds(
+        &mut state,
+        &inputs,
+        &mut perm.out_lo,
+        &mut perm.out_hi,
+        flag_permute,
+        &poseidon1_final_constants()[2 * n_ending_full_rounds],
+        &poseidon1_final_constants()[2 * n_ending_full_rounds + 1],
+    );
+}
+
+#[inline]
+fn generate_2_full_round<F: Algebra<KoalaBear> + Copy>(
+    state: &mut [F; WIDTH],
+    post_full_round: &mut [&mut F; WIDTH],
+    round_constants_1: &[KoalaBear; WIDTH],
+    round_constants_2: &[KoalaBear; WIDTH],
+) {
+    for (state_i, const_i) in state.iter_mut().zip(round_constants_1) {
+        *state_i += *const_i;
+        *state_i = state_i.cube();
+    }
+    mds_circ_16(state);
+
+    for (state_i, const_i) in state.iter_mut().zip(round_constants_2.iter()) {
+        *state_i += *const_i;
+        *state_i = state_i.cube();
+    }
+    mds_circ_16(state);
+
+    post_full_round.iter_mut().zip(*state).for_each(|(post, x)| {
+        **post = x;
+    });
+}
+
+#[inline]
+fn generate_last_2_full_rounds<F: Algebra<KoalaBear> + Copy>(
+    state: &mut [F; WIDTH],
+    inputs: &[F; WIDTH],
+    out_lo: &mut [&mut F; WIDTH / 2],
+    out_hi: &mut [&mut F; WIDTH / 2],
+    flag_permute: F,
+    round_constants_1: &[KoalaBear; WIDTH],
+    round_constants_2: &[KoalaBear; WIDTH],
+) {
+    for (state_i, const_i) in state.iter_mut().zip(round_constants_1) {
+        *state_i += *const_i;
+        *state_i = state_i.cube();
+    }
+    mds_circ_16(state);
+
+    for (state_i, const_i) in state.iter_mut().zip(round_constants_2.iter()) {
+        *state_i += *const_i;
+        *state_i = state_i.cube();
+    }
+    mds_circ_16(state);
+
+    for i in 0..(WIDTH / 2) {
+        let compression_value = state[i] + inputs[i];
+        *out_lo[i] = (F::ONE - flag_permute) * compression_value + flag_permute * state[i];
+        *out_hi[i] = flag_permute * state[i + WIDTH / 2];
+    }
+}

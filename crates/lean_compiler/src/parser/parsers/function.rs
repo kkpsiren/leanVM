@@ -15,13 +15,14 @@ pub const RESERVED_FUNCTION_NAMES: &[&str] = &[
     // Built-in functions
     "print",
     "Array",
-    "DynArray",
-    "push", // Compile-time vector push
+    "hint_witness",
     // Compile-time only functions
     "len",
     "log2_ceil",
     "next_multiple_of",
     "saturating_sub",
+    "div_ceil",
+    "div_floor",
     "range",
     "parallel_range",
     "match_range",
@@ -70,7 +71,7 @@ impl Parse<Function> for FunctionParser {
             return Err(SemanticError::new(format!("Cannot define function with reserved name '{name}'")).into());
         }
 
-        let mut arguments = Vec::new();
+        let mut arguments: Vec<FunctionArg> = Vec::new();
         let mut body = Vec::new();
 
         for pair in inner {
@@ -78,7 +79,15 @@ impl Parse<Function> for FunctionParser {
                 Rule::parameter_list => {
                     for param in pair.into_inner() {
                         if param.as_rule() == Rule::parameter {
-                            arguments.push(ParameterParser.parse(param, ctx)?);
+                            let arg = ParameterParser.parse(param, ctx)?;
+                            if arguments.iter().any(|a| a.name == arg.name) {
+                                return Err(SemanticError::new(format!(
+                                    "Function '{name}': duplicate parameter name '{}'",
+                                    arg.name,
+                                ))
+                                .into());
+                            }
+                            arguments.push(arg);
                         }
                     }
                 }
@@ -137,26 +146,36 @@ impl FunctionParser {
 pub struct ParameterParser;
 
 impl Parse<FunctionArg> for ParameterParser {
-    fn parse(&self, pair: ParsePair<'_>, _ctx: &mut ParseContext) -> ParseResult<FunctionArg> {
+    fn parse(&self, pair: ParsePair<'_>, ctx: &mut ParseContext) -> ParseResult<FunctionArg> {
         let mut inner = pair.into_inner();
         let name = next_inner_pair(&mut inner, "parameter name")?.as_str().to_string();
 
-        // Check for optional type annotation (: Const or : Mut)
-        let (is_const, is_mutable) = if let Some(annotation) = inner.next() {
+        // Reject parameter names that shadow a top-level constant or const array.
+        if ctx.get_const_array(&name).is_some() || ctx.get_constant(&name).is_some() {
+            return Err(SemanticError::new(format!(
+                "Parameter '{name}' shadows a top-level constant of the same name"
+            ))
+            .into());
+        }
+
+        // Check for optional type annotation (: Const). ': Mut' parameters are forbidden.
+        let is_const = if let Some(annotation) = inner.next() {
             match annotation.as_str().trim() {
-                ": Const" => (true, false),
-                ": Mut" => (false, true),
+                ": Const" => true,
+                ": Mut" => {
+                    return Err(SemanticError::new(format!(
+                        "Parameter '{name}' cannot be declared ': Mut'. Mutable parameters are not allowed; \
+                         introduce a local '{name}_mut: Mut = {name}' instead."
+                    ))
+                    .into());
+                }
                 other => return Err(SemanticError::new(format!("Invalid parameter annotation: {other}")).into()),
             }
         } else {
-            (false, false)
+            false
         };
 
-        Ok(FunctionArg {
-            name,
-            is_const,
-            is_mutable,
-        })
+        Ok(FunctionArg { name, is_const })
     }
 }
 

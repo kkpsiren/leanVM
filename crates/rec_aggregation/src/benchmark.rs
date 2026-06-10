@@ -1,14 +1,16 @@
+use backend::ansi as s;
 use backend::*;
 use lean_vm::*;
 use serde::{Deserialize, Serialize};
 use std::io::{self, Write};
 use std::time::Instant;
-use utils::ansi as s;
 use xmss::signers_cache::{BENCHMARK_SLOT, get_benchmark_signatures, message_for_benchmark};
 use xmss::{XmssPublicKey, XmssSignature};
 
 use crate::compilation::{get_aggregation_bytecode, init_aggregation_bytecode};
-use crate::type_1_aggregation::{TypeOneMultiSignature, aggregate_type_1, verify_type_1};
+use crate::single_message_aggregation::{
+    SingleMessageAggregateSignature, aggregate_single_message_signatures, verify_single_message_aggregate,
+};
 
 #[derive(Debug, Clone)]
 pub struct AggregationTopology {
@@ -351,13 +353,13 @@ fn build_aggregation(
     tracing: bool,
     is_root: bool,
     repeat: usize,
-) -> TypeOneMultiSignature {
+) -> SingleMessageAggregateSignature {
     let raw_count = topology.raw_xmss;
     let raw_xmss: Vec<(XmssPublicKey, XmssSignature)> = (0..raw_count)
         .map(|i| (pub_keys[i].clone(), signatures[i].clone()))
         .collect();
 
-    let mut children: Vec<TypeOneMultiSignature> = vec![];
+    let mut children: Vec<SingleMessageAggregateSignature> = vec![];
     let mut child_start = raw_count;
     let mut child_display_index = display_index;
     for (child_idx, child) in topology.children.iter().enumerate() {
@@ -385,21 +387,18 @@ fn build_aggregation(
     }
 
     if tracing && is_root {
-        utils::init_tracing();
+        init_tracing();
     }
 
     assert!(repeat > 0);
     let is_leaf = topology.children.is_empty();
     let n_xmss_opt = is_leaf.then_some(topology.raw_xmss);
     let mut times = Vec::with_capacity(repeat);
-    let mut last_result: Option<TypeOneMultiSignature> = None;
+    let mut last_result: Option<SingleMessageAggregateSignature> = None;
     let own_display_index = display_index + count_nodes(topology) - 1;
     for _ in 0..repeat {
-        #[cfg(not(feature = "standard-alloc"))]
-        zk_alloc::begin_phase();
-
         let time = Instant::now();
-        let result = aggregate_type_1(
+        let result = aggregate_single_message_signatures(
             &children,
             raw_xmss.clone(),
             message_for_benchmark(),
@@ -408,13 +407,6 @@ fn build_aggregation(
         )
         .unwrap();
         let elapsed = time.elapsed();
-
-        // Clone the outputs out of the arena before the next phase resets its slabs.
-        #[cfg(not(feature = "standard-alloc"))]
-        let result = {
-            zk_alloc::end_phase();
-            result.clone()
-        };
 
         times.push(elapsed.as_secs_f64());
         last_result = Some(result);
@@ -512,7 +504,7 @@ pub fn run_aggregation_benchmark(
     if !silent {
         println!(
             "Aggregation program: {} instructions\n",
-            pretty_integer(get_aggregation_bytecode().code.len())
+            pretty_integer(get_aggregation_bytecode().unpadded_size)
         );
     }
 
@@ -541,7 +533,7 @@ pub fn run_aggregation_benchmark(
         repeat,
     );
 
-    verify_type_1(&aggregated).expect("root type-1 proof failed to verify");
+    verify_single_message_aggregate(&aggregated).expect("root single-message proof failed to verify");
 
     BenchmarkReport { nodes }
 }

@@ -2,21 +2,27 @@
 pub mod benchmark;
 mod bytecode_claims;
 mod compilation;
-mod type_1_aggregation;
-mod type_2_aggregation;
+mod error;
+mod multi_message_aggregation;
+mod single_message_aggregation;
 
-use backend::{Evaluation, Proof, ProofError, RawProof};
+use backend::{Evaluation, Proof, ProofError, RawProof, poseidon_hash_slice};
 pub use compilation::{
     MAX_RECURSIONS, MAX_XMSS_AGGREGATED, MAX_XMSS_DUPLICATES, NUM_REPEATED_ONES, PREAMBLE_MEMORY_LEN, ZERO_VEC_LEN,
     get_aggregation_bytecode, init_aggregation_bytecode,
 };
+pub use error::AggregationError;
+pub use lean_prover::ProverError;
 use lean_prover::verify_execution::verify_execution;
 use lean_vm::{DIGEST_LEN, EF, F};
-pub use type_1_aggregation::{TypeOneInfo, TypeOneMultiSignature, aggregate_type_1, verify_type_1};
-pub use type_2_aggregation::{
-    TypeTwoMultiSignature, merge_many_type_1, split_type_2, split_type_2_by_msg, verify_type_2,
+pub use multi_message_aggregation::{
+    MultiMessageAggregateSignature, merge_single_message_aggregates, split_multi_message_aggregate,
+    split_multi_message_aggregate_by_message, verify_multi_message_aggregate,
 };
-use utils::poseidon_compress_slice;
+pub use single_message_aggregation::{
+    SingleMessageAggregateSignature, SingleMessageInfo, aggregate_single_message_signatures,
+    verify_single_message_aggregate,
+};
 
 #[allow(missing_debug_implementations)]
 pub struct InnerVerified {
@@ -24,10 +30,11 @@ pub struct InnerVerified {
     pub input_data_hash: [F; DIGEST_LEN],
     pub bytecode_evaluation: Evaluation<EF>,
     pub raw_proof: RawProof<F>,
+    pub sorted_table_perm: Vec<usize>,
 }
 
 pub(crate) fn verify_inner(input_data: Vec<F>, proof: Proof<F>) -> Result<InnerVerified, ProofError> {
-    let input_data_hash = poseidon_compress_slice(&input_data, true);
+    let input_data_hash = poseidon_hash_slice(&input_data);
     let bytecode = get_aggregation_bytecode();
     let (verif, raw_proof) = verify_execution(bytecode, &input_data_hash, proof)?;
     Ok(InnerVerified {
@@ -35,5 +42,6 @@ pub(crate) fn verify_inner(input_data: Vec<F>, proof: Proof<F>) -> Result<InnerV
         input_data_hash,
         bytecode_evaluation: verif.bytecode_evaluation,
         raw_proof,
+        sorted_table_perm: verif.sorted_table_perm,
     })
 }

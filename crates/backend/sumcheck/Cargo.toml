@@ -1,15 +1,16 @@
 [package]
-name = "mt-sumcheck"
+name = "sumcheck"
 version.workspace = true
 edition.workspace = true
 
 [dependencies]
-field = { path = "../field", package = "mt-field" }
-air = { path = "../air", package = "mt-air" }
-poly = { path = "../poly", package = "mt-poly" }
-fiat-shamir = { path = "../fiat-shamir", package = "mt-fiat-shamir" }
+field = { path = "../field", package = "field" }
+air = { path = "../air", package = "air" }
+poly = { path = "../poly", package = "poly" }
+zk-alloc.workspace = true
+fiat-shamir = { path = "../fiat-shamir", package = "fiat-shamir" }
+parallel.workspace = true
 tracing.workspace = true
-rayon.workspace = true
 
 [dev-dependencies]
-koala-bear = { path = "../koala-bear", package = "mt-koala-bear" }
+koala-bear = { path = "../koala-bear", package = "koala-bear" }

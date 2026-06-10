@@ -1,13 +1,12 @@
+use backend::ansi::Colorize;
 use backend::*;
 use lean_vm::{
-    ALL_TABLES, COL_PC, CommittedStatements, ENDING_PC, MIN_LOG_MEMORY_SIZE, MIN_LOG_N_ROWS_PER_TABLE,
+    ALL_TABLES, ColIndex, CommittedStatements, EXEC_COL_PC, MIN_LOG_MEMORY_SIZE, MIN_LOG_N_ROWS_PER_TABLE,
     N_INSTRUCTION_COLUMNS, STARTING_PC, sort_tables_by_height,
 };
 use lean_vm::{EF, F, Table, TableT, TableTrace};
 use std::collections::BTreeMap;
 use tracing::instrument;
-use utils::VarCount;
-use utils::ansi::Colorize;
 
 /*
 Stacking of various (multilinear) polynomials into a single -big- (multilinear) polynomial, which is committed via WHIR.
@@ -41,6 +40,7 @@ pub fn stacked_pcs_global_statements(
     stacked_n_vars: VarCount,
     memory_n_vars: VarCount,
     bytecode_n_vars: VarCount,
+    ending_pc: usize,
     previous_statements: Vec<SparseStatement<EF>>,
     tables_heights: &BTreeMap<Table, VarCount>,
     committed_statements: &CommittedStatements,
@@ -48,25 +48,30 @@ pub fn stacked_pcs_global_statements(
     assert_eq!(tables_heights.len(), committed_statements.len());
 
     let tables_heights_sorted = sort_tables_by_height(tables_heights);
+    let max_table_n_vars = tables_heights_sorted[0].1;
+
+    let mut table_offsets: BTreeMap<Table, usize> = BTreeMap::new();
+    let mut layout_offset = (2 << memory_n_vars) + (1 << bytecode_n_vars.max(max_table_n_vars));
+    for (table, n_vars) in &tables_heights_sorted {
+        table_offsets.insert(*table, layout_offset);
+        layout_offset += table.n_columns() << n_vars;
+    }
 
     let mut global_statements = previous_statements;
-    let mut offset = 2 << memory_n_vars; // memory + memory_acc
-
-    let max_table_n_vars = tables_heights_sorted[0].1;
-    offset += 1 << bytecode_n_vars.max(max_table_n_vars); // bytecode acc
-
-    for (table, n_vars) in tables_heights_sorted {
+    for table in ALL_TABLES {
+        let n_vars = tables_heights[&table];
+        let offset = table_offsets[&table];
         if table.is_execution_table() {
             // Important: ensure both initial and final PC conditions are correct
             global_statements.push(SparseStatement::unique_value(
                 stacked_n_vars,
-                offset + (COL_PC << n_vars),
+                offset + (EXEC_COL_PC << n_vars),
                 EF::from_usize(STARTING_PC),
             ));
             global_statements.push(SparseStatement::unique_value(
                 stacked_n_vars,
-                offset + ((COL_PC + 1) << n_vars) - 1,
-                EF::from_usize(ENDING_PC),
+                offset + ((EXEC_COL_PC + 1) << n_vars) - 1,
+                EF::from_usize(ending_pc),
             ));
         }
         for (point, eq_values, next_values) in &committed_statements[&table] {
@@ -89,7 +94,6 @@ pub fn stacked_pcs_global_statements(
                     .collect(),
             ));
         }
-        offset += table.n_columns() << n_vars;
     }
     global_statements
 }
@@ -106,15 +110,15 @@ pub fn stack_polynomials_and_commit(
     assert_eq!(memory.len(), memory_acc.len());
     let tables_heights = traces.iter().map(|(table, trace)| (*table, trace.log_n_rows)).collect();
     let tables_heights_sorted = sort_tables_by_height(&tables_heights);
-    assert!(log2_strict_usize(memory.len()) >= tables_heights[&Table::execution()]); // memory must be at least as large as the number of cycles (TODO add some padding when this is not the case)
-    assert!(tables_heights[&Table::execution()] >= tables_heights_sorted[0].1); // execution table must be the largest table (TODO add some padding when this is not the case)
+    // Memory must be at least as large as the largest table.
+    assert!(log2_strict_usize(memory.len()) >= tables_heights_sorted[0].1);
 
     let stacked_n_vars = compute_stacked_n_vars(
         log2_strict_usize(memory.len()),
         log2_strict_usize(bytecode_acc.len()),
         &tables_heights_sorted.iter().cloned().collect(),
     );
-    let mut global_polynomial = F::zero_vec(1 << stacked_n_vars); // TODO avoid cloning all witness data
+    let mut global_polynomial = unsafe { ArenaVec::<F>::zeroed(1 << stacked_n_vars) };
     global_polynomial[..memory.len()].copy_from_slice(memory);
     let mut offset = memory.len();
     global_polynomial[offset..][..memory_acc.len()].copy_from_slice(memory_acc);
@@ -162,11 +166,8 @@ pub fn stacked_pcs_parse_commitment(
     log_bytecode: usize,
     tables_heights: &BTreeMap<Table, VarCount>,
 ) -> Result<ParsedCommitment<F, EF>, ProofError> {
-    if log_memory < tables_heights[&Table::execution()]
-        || tables_heights[&Table::execution()] < tables_heights.values().copied().max().unwrap()
-    {
-        // memory must be at least as large as the number of cycles
-        // execution table must be the largest table
+    if log_memory < *tables_heights.values().max().unwrap() {
+        // memory must be at least as large as the largest table
         return Err(ProofError::InvalidProof);
     }
 
@@ -207,11 +208,15 @@ pub fn total_whir_statements() -> usize {
      + ALL_TABLES
         .iter()
         .map(|table| {
-            // AIR
-            table.n_columns()
-            + table.n_down_columns()
-            // Lookups into memory
-            + table.lookups().iter().map(|lookup| 1 + lookup.values.len()).sum::<usize>()
+            let mut seen_cols = std::collections::HashSet::<ColIndex>::new();
+            for bus in table.bus_interactions().iter().filter(|b| b.is_memory_lookup()) {
+                for entry in &bus.data {
+                    if let Some(col) = entry.column() {
+                        seen_cols.insert(col);
+                    }
+                }
+            }
+            table.n_columns() + table.n_shift_columns() + seen_cols.len()
         })
         .sum::<usize>()
         // bytecode lookup

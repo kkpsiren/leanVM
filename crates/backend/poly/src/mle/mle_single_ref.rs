@@ -2,6 +2,7 @@ use crate::*;
 use ::utils::log2_strict_usize;
 use field::ExtensionField;
 use field::PackedValue;
+use zk_alloc::ArenaVec;
 
 #[derive(Debug)]
 pub enum MleRef<'a, EF: ExtensionField<PF<EF>>> {
@@ -104,28 +105,26 @@ impl<'a, EF: ExtensionField<PF<EF>>> MleRef<'a, EF> {
         }
     }
 
-    pub fn pack_if(&self, cond: bool) -> Mle<'a, EF> {
-        if cond { self.pack() } else { Mle::Ref(self.soft_clone()) }
-    }
-
     pub fn clone_to_owned(&self) -> MleOwned<EF> {
         match self {
-            Self::Base(v) => MleOwned::Base(v.to_vec()),
-            Self::Extension(v) => MleOwned::Extension(v.to_vec()),
-            Self::BasePacked(pb) => MleOwned::BasePacked(pb.to_vec()),
-            Self::ExtensionPacked(ep) => MleOwned::ExtensionPacked(ep.to_vec()),
+            Self::Base(v) => MleOwned::Base(ArenaVec::from_slice(v)),
+            Self::Extension(v) => MleOwned::Extension(ArenaVec::from_slice(v)),
+            Self::BasePacked(pb) => MleOwned::BasePacked(ArenaVec::from_slice(pb)),
+            Self::ExtensionPacked(ep) => MleOwned::ExtensionPacked(ArenaVec::from_slice(ep)),
         }
     }
 
     pub fn fold(&self, alpha: EF) -> MleOwned<EF> {
         match self {
-            Self::Base(pols) => MleOwned::Extension(fold_multilinear(pols, alpha, &|a, b| b * a)),
-            Self::Extension(pols) => MleOwned::Extension(fold_multilinear(pols, alpha, &|a, b| b * a)),
+            Self::Base(pols) => MleOwned::Extension(fold_multilinear(pols, alpha, &|a, b| b * a, false)),
+            Self::Extension(pols) => MleOwned::Extension(fold_multilinear(pols, alpha, &|a, b| b * a, false)),
             Self::BasePacked(pols) => {
                 let alpha_packed = EFPacking::<EF>::from(alpha);
-                MleOwned::ExtensionPacked(fold_multilinear(pols, alpha_packed, &|a, b| b * a))
+                MleOwned::ExtensionPacked(fold_multilinear(pols, alpha_packed, &|a, b| b * a, false))
             }
-            Self::ExtensionPacked(pols) => MleOwned::ExtensionPacked(fold_multilinear(pols, alpha, &|a, b| a * b)),
+            Self::ExtensionPacked(pols) => {
+                MleOwned::ExtensionPacked(fold_multilinear(pols, alpha, &|a, b| a * b, false))
+            }
         }
     }
 }

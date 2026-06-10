@@ -1,20 +1,20 @@
 [package]
-name = "mt-whir"
+name = "whir"
 version.workspace = true
 edition.workspace = true
 
 [dependencies]
-field = { path = "../backend/field", package = "mt-field" }
-koala-bear = { path = "../backend/koala-bear", package = "mt-koala-bear" }
-poly = { path = "../backend/poly", package = "mt-poly" }
-sumcheck = { path = "../backend/sumcheck", package = "mt-sumcheck" }
-fiat-shamir = { path = "../backend/fiat-shamir", package = "mt-fiat-shamir" }
-utils = { path = "../backend/utils", package = "mt-utils" }
-symetric = { path = "../backend/symetric", package = "mt-symetric" }
+field = { path = "../backend/field", package = "field" }
+koala-bear = { path = "../backend/koala-bear", package = "koala-bear" }
+poly = { path = "../backend/poly", package = "poly" }
+sumcheck = { path = "../backend/sumcheck", package = "sumcheck" }
+zk-alloc.workspace = true
+fiat-shamir = { path = "../backend/fiat-shamir", package = "fiat-shamir" }
+utils = { path = "../backend/utils", package = "utils" }
+symetric = { path = "../backend/symetric", package = "symetric" }
 system-info.workspace = true
 
-itertools.workspace = true
-rayon.workspace = true
+parallel.workspace = true
 rand.workspace = true
 tracing.workspace = true
 

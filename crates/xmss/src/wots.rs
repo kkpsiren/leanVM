@@ -1,7 +1,6 @@
 use backend::*;
 use rand::{CryptoRng, RngExt};
 use serde::{Deserialize, Serialize};
-use utils::{ToUsize, poseidon16_compress_pair};
 
 use crate::*;
 
@@ -48,9 +47,9 @@ impl WotsSecretKey {
         slot: u32,
         xmss_pub_key: &XmssPublicKey,
         randomness: Randomness,
-    ) -> WotsSignature {
-        let encoding = wots_encode(message, slot, xmss_pub_key, &randomness).unwrap();
-        self.sign_with_encoding(randomness, &encoding, xmss_pub_key.public_param, slot)
+    ) -> Option<WotsSignature> {
+        let encoding = wots_encode(message, slot, xmss_pub_key, &randomness)?;
+        Some(self.sign_with_encoding(randomness, &encoding, xmss_pub_key.public_param, slot))
     }
 
     fn sign_with_encoding(
@@ -75,9 +74,8 @@ impl WotsSignature {
         message: &[F; MESSAGE_LEN_FE],
         slot: u32,
         xmss_pub_key: &XmssPublicKey,
-        signature: &Self,
     ) -> Option<WotsPublicKey> {
-        let encoding = wots_encode(message, slot, xmss_pub_key, &signature.randomness)?;
+        let encoding = wots_encode(message, slot, xmss_pub_key, &self.randomness)?;
         Some(WotsPublicKey(std::array::from_fn(|i| {
             iterate_hash(
                 &self.chain_tips[i],
@@ -92,25 +90,19 @@ impl WotsSignature {
 }
 
 impl WotsPublicKey {
-    // We use a T-Sponge with replacement, i.e. we use Poseidon in compression mode + replace (instead of modular addition) when ingesting 8 new field elements.
+    // Overwrite-sponge
     pub fn hash(&self, public_param: PublicParam, slot: u32) -> Digest {
-        // IV: [tweak(2) | 00 | pp(4)]
-        let tweak = make_tweak(TWEAK_TYPE_WOTS_PK, 0, slot);
-        let mut state = [F::default(); 8];
-        state[..TWEAK_LEN].copy_from_slice(&tweak);
-        // state[2..4] = 00 (default)
+        // state[0..8] = IV [tweak(2) | 00 | pp(4)]; state[8..16] = 0.
+        let mut state = [F::ZERO; WIDTH];
+        state[..TWEAK_LEN].copy_from_slice(&make_tweak(TWEAK_TYPE_WOTS_PK, 0, slot));
         state[4..4 + PUBLIC_PARAM_LEN_FE].copy_from_slice(&public_param);
-
-        let zeros = [F::ZERO; 8]; // for snark-friendliless (not necessary for security)
-        state = poseidon16_compress_pair(&state, &zeros);
-
+        state = poseidon16_permute(state);
         for i in (0..V).step_by(2) {
-            let mut chunk = [F::default(); 8];
-            chunk[..XMSS_DIGEST_LEN].copy_from_slice(&self.0[i]);
-            chunk[XMSS_DIGEST_LEN..].copy_from_slice(&self.0[i + 1]);
-            state = poseidon16_compress_pair(&state, &chunk);
+            state[8..][..XMSS_DIGEST_LEN].copy_from_slice(&self.0[i]);
+            state[8 + XMSS_DIGEST_LEN..].copy_from_slice(&self.0[i + 1]);
+            state = poseidon16_permute(state);
         }
-        state[..XMSS_DIGEST_LEN].try_into().unwrap()
+        state[CAPACITY..][..XMSS_DIGEST_LEN].try_into().unwrap()
     }
 }
 
@@ -165,11 +157,11 @@ pub fn wots_encode(
     second_input_right[..PUBLIC_PARAM_LEN_FE].copy_from_slice(&xmss_pub_key.public_param);
     let compressed = poseidon16_compress_pair(&pre_compressed, &second_input_right);
 
-    if compressed.iter().any(|&kb| kb == -F::ONE) {
+    if compressed[..NUM_ENCODING_FE].iter().any(|&kb| kb == -F::ONE) {
         // ensures uniformity of encoding
         return None;
     }
-    let all_indices: Vec<_> = compressed
+    let all_indices: Vec<_> = compressed[..NUM_ENCODING_FE]
         .iter()
         .flat_map(|kb| to_little_endian_bits(kb.to_usize(), 24))
         .collect::<Vec<_>>()

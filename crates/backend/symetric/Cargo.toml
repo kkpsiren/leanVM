@@ -1,9 +1,10 @@
 [package]
-name = "mt-symetric"
+name = "symetric"
 version.workspace = true
 edition.workspace = true
 
 [dependencies]
-koala-bear = { path = "../koala-bear", package = "mt-koala-bear" }
-field = { path = "../field", package = "mt-field" }
-rayon.workspace = true
+koala-bear = { path = "../koala-bear", package = "koala-bear" }
+field = { path = "../field", package = "field" }
+parallel.workspace = true
+zk-alloc.workspace = true

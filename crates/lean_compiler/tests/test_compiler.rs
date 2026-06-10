@@ -1,30 +1,9 @@
 use std::time::Instant;
 
-use backend::BasedVectorSpace;
+use backend::{ArenaVec, BasedVectorSpace, PrimeCharacteristicRing, arena_vec};
 use lean_compiler::*;
 use lean_vm::*;
 use rand::{RngExt, SeedableRng, rngs::StdRng};
-use utils::poseidon16_compress;
-
-#[test]
-fn test_poseidon() {
-    let program = r#"
-def main():
-    a = 0
-    b = a + 8
-    c = Array(8)
-    poseidon16_compress(a, b, c)
-
-    for i in range(0, 8):
-        cc = c[i]
-        print(cc)
-    return
-   "#;
-    let public_input: [F; 16] = (0..16).map(F::new).collect::<Vec<F>>().try_into().unwrap();
-    compile_and_run(&ProgramSource::Raw(program.to_string()), &public_input, false);
-
-    let _ = dbg!(poseidon16_compress(public_input));
-}
 
 #[test]
 fn test_div_extension_field() {
@@ -32,13 +11,16 @@ fn test_div_extension_field() {
 DIM = 5
 
 def main():
-    n = 0
-    d = n + DIM
-    q = n + 2 * DIM
+    nd = Array(2 * DIM)
+    hint_witness("nd", nd)
+    n = nd
+    d = nd + DIM
+    expected_q = Array(DIM)
+    hint_witness("q", expected_q)
     computed_q_1 = div_ext_1(n, d)
     computed_q_2 = div_ext_2(n, d)
-    assert_eq_ext(computed_q_2, q)
-    assert_eq_ext(computed_q_1, q)
+    assert_eq_ext(computed_q_2, expected_q)
+    assert_eq_ext(computed_q_1, expected_q)
     return
 
 def assert_eq_ext(x, y):
@@ -61,11 +43,19 @@ def div_ext_2(n, d):
     let n: EF = rng.random();
     let d: EF = rng.random();
     let q = n / d;
-    let mut public_input = vec![];
-    public_input.extend(n.as_basis_coefficients_slice());
-    public_input.extend(d.as_basis_coefficients_slice());
-    public_input.extend(q.as_basis_coefficients_slice());
-    compile_and_run(&ProgramSource::Raw(program.to_string()), &public_input, false);
+    let mut nd_buf: ArenaVec<F> = ArenaVec::new();
+    nd_buf.extend_from_slice(n.as_basis_coefficients_slice());
+    nd_buf.extend_from_slice(d.as_basis_coefficients_slice());
+    let q_buf = ArenaVec::from_slice(q.as_basis_coefficients_slice());
+    let bytecode = compile_program(&ProgramSource::Raw(program.to_string()));
+    let mut hints = Hints::default();
+    hints.insert(&bytecode, "nd", arena_vec![nd_buf]);
+    hints.insert(&bytecode, "q", arena_vec![q_buf]);
+    let witness = ExecutionWitness {
+        hints,
+        ..ExecutionWitness::default()
+    };
+    try_execute_bytecode(&bytecode, &Default::default(), &witness, false).unwrap();
 }
 
 fn test_data_dir() -> String {
@@ -109,9 +99,30 @@ fn test_all_errors() {
     println!("Found {} test error programs", paths.len());
 
     for path in paths {
-        let result = try_compile_and_run(&ProgramSource::Filepath(path.clone()), &[], false);
+        let result = try_compile_and_run(&ProgramSource::Filepath(path.clone()), &[F::ZERO; DIGEST_LEN], false);
         assert!(result.is_err(), "Expected error for {}, but it succeeded", path);
     }
+}
+
+#[test]
+fn test_placeholder_replacement_respects_identifier_boundaries() {
+    let program = r#"
+def main():
+    x1 = 5
+    xPLACEHOLDER = 7
+    assert x1 == 5
+    assert xPLACEHOLDER == 7
+    assert PLACEHOLDER == 1
+    return
+"#;
+    let mut replacements = std::collections::BTreeMap::new();
+    replacements.insert("PLACEHOLDER".to_string(), "1".to_string());
+    let bytecode = try_compile_program_with_flags(
+        &ProgramSource::Raw(program.to_string()),
+        CompilationFlags { replacements },
+    )
+    .unwrap();
+    try_execute_bytecode(&bytecode, &Default::default(), &ExecutionWitness::default(), false).unwrap();
 }
 
 #[test]
@@ -123,7 +134,7 @@ fn test_all_programs() {
     println!("Found {} test programs", paths.len());
 
     // Reserve a 5-cell preamble for the programs that materialize a local
-    // ONE_EF_PTR (program_15, program_166, program_179).
+    // ONE_EF_PTR (program_15, program_179).
     let witness = ExecutionWitness {
         preamble_memory_len: 5,
         ..ExecutionWitness::default()
@@ -133,7 +144,7 @@ fn test_all_programs() {
             Ok(b) => b,
             Err(err) => panic!("Program {} failed to compile: {:?}", path, err),
         };
-        if let Err(err) = try_execute_bytecode(&bytecode, &[], &witness, false) {
+        if let Err(err) = try_execute_bytecode(&bytecode, &Default::default(), &witness, false) {
             panic!("Program {} failed with error: {:?}", path, err);
         }
     }
@@ -144,49 +155,9 @@ fn test_reserved_function_names() {
     for name in RESERVED_FUNCTION_NAMES {
         let program = format!("def main():\n    return\ndef {name}():\n    return");
         assert!(
-            try_compile_and_run(&ProgramSource::Raw(program), &[], false).is_err(),
+            try_compile_and_run(&ProgramSource::Raw(program), &[F::ZERO; DIGEST_LEN], false).is_err(),
             "Expected error when defining function with reserved name '{name}', but it succeeded"
         );
-    }
-}
-
-#[test]
-fn test_dynamic_unroll_cycles() {
-    // Verify that dynamic_unroll costs ~2 cycles per iteration
-    for start in [0u32, 5, 50] {
-        let program = format!(
-            r#"
-def main():
-    a = 0
-    end = a[0]
-    expected = a[1]
-    acc: Mut = 0
-    for i in dynamic_unroll({start}, end, 13):
-        acc = acc + i
-    assert acc == expected
-    return
-"#
-        );
-        let bytecode = compile_program(&ProgramSource::Raw(program));
-
-        let run = |end_val: u32| -> usize {
-            let expected_sum = (start..end_val).map(|i| i as u64).sum::<u64>() as u32;
-            let public_input = [F::new(end_val), F::new(expected_sum)];
-            let result = try_execute_bytecode(&bytecode, &public_input, &ExecutionWitness::default(), false).unwrap();
-            result.pcs.len()
-        };
-
-        let n_iters_a = 2000u32;
-        let n_iters_b = 4000u32;
-        let cycles_a = run(start + n_iters_a);
-        let cycles_b = run(start + n_iters_b);
-        let delta = cycles_b - cycles_a;
-        let extra_iters = n_iters_b - n_iters_a;
-        let expected_delta = 2 * extra_iters as usize;
-        // Allow 5% tolerance for fixed overhead per activated bit
-        let lo = expected_delta * 95 / 100;
-        let hi = expected_delta * 105 / 100;
-        assert!(delta >= lo && delta <= hi,);
     }
 }
 
@@ -194,7 +165,7 @@ def main():
 fn debug_file_program() {
     let index = 167;
     let path = format!("{}/program_{}.py", test_data_dir(), index);
-    compile_and_run(&ProgramSource::Filepath(path), &[], false);
+    compile_and_run(&ProgramSource::Filepath(path), &[F::ZERO; DIGEST_LEN], false);
 }
 
 #[test]
@@ -211,11 +182,11 @@ def main():
 
 @inline
 def func(a, b):
-    poseidon16_compress(a, a, b)
+    poseidon16_compress_half(a, a, b)
     return
    "#;
     let bytecode = compile_program(&ProgramSource::Raw(program.to_string()));
-    let n_cycles = execute_bytecode(&bytecode, &[], &ExecutionWitness::default(), false).n_cycles();
+    let n_cycles = execute_bytecode(&bytecode, &Default::default(), &ExecutionWitness::default(), false).n_cycles();
     assert!(n_cycles < 1100);
 }
 
@@ -227,10 +198,11 @@ def main():
     res = Array(n)
     for i in loop(0, n):
         res[i] = factorial(10000)
-    sum: Mut = 0
+    sum_buf = Array(n + 1)
+    sum_buf[0] = 0
     for i in range(0, n):
-        sum = sum + res[i]
-    print(sum)
+        sum_buf[i + 1] = sum_buf[i] + res[i]
+    print(sum_buf[n])
     return
 
 def factorial(n):
@@ -244,10 +216,20 @@ def factorial(n):
     let compiled_parallel = compile_program(&ProgramSource::Raw(program.replace("loop", "parallel_range")));
 
     let time_sequential = Instant::now();
-    let exec_seq = execute_bytecode(&compiled_sequencial, &[], &ExecutionWitness::default(), false);
+    let exec_seq = execute_bytecode(
+        &compiled_sequencial,
+        &Default::default(),
+        &ExecutionWitness::default(),
+        false,
+    );
     let duration_sequential = time_sequential.elapsed();
     let time_parallel = Instant::now();
-    let exec_par = execute_bytecode(&compiled_parallel, &[], &ExecutionWitness::default(), false);
+    let exec_par = execute_bytecode(
+        &compiled_parallel,
+        &Default::default(),
+        &ExecutionWitness::default(),
+        false,
+    );
     let duration_parallel = time_parallel.elapsed();
 
     assert_eq!(exec_seq.metadata.stdout, exec_par.metadata.stdout);
@@ -287,9 +269,7 @@ def checked_decompose_bits_small_value_const(to_decompose, n_bits: Const):
     return bits
 
    "#;
-    let bytecode = compile_program(&ProgramSource::Raw(program.to_string()));
-    try_execute_bytecode(&bytecode, &[], &ExecutionWitness::default(), false).unwrap();
-    println!("{}", bytecode.pretty_print());
+    compile_and_run(&ProgramSource::Raw(program.to_string()), &[F::ZERO; DIGEST_LEN], false);
 }
 
 #[test]
@@ -305,7 +285,13 @@ fn test_soundness_suite() {
         ("soundness_5", &[3, 4, 7, 19, 49, 28, 1, 3],  &[(0, 4), (1, 5), (2, 8), (3, 20), (4, 50), (5, 29), (6, 0), (6, 2), (7, 4)]),
     ];
 
-    let to_input = |v: &[u32]| v.iter().copied().map(F::new).collect::<Vec<_>>();
+    let to_input = |v: &[u32]| -> [F; PUBLIC_INPUT_LEN] {
+        let mut out = [F::ZERO; PUBLIC_INPUT_LEN];
+        for (slot, &x) in out.iter_mut().zip(v) {
+            *slot = F::new(x);
+        }
+        out
+    };
 
     for &(name, valid, perturbations) in cases {
         let path = format!("{}/{}.py", test_data_dir(), name);
