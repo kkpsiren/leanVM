@@ -802,6 +802,24 @@ fn eval_air_binary_op(
     }
 }
 
+/// cargo test --release -p rec_aggregation display_aggregation_intermediate_zkdsl -- --ignored --nocapture
+#[test]
+#[ignore]
+fn display_aggregation_intermediate_zkdsl() {
+    let bytecode = compile_main_program_self_referential();
+    let replacements = build_replacements(bytecode.log_size(), bytecode.instructions_multilinear()[0]);
+    let source = ProgramSource::Embedded {
+        entry: "main.py".to_string(),
+        dir: &EMBEDDED_ZK_DSL,
+    };
+    let intermediate =
+        lean_compiler::try_compile_to_intermediate_source(&source, CompilationFlags { replacements }).unwrap();
+
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/aggregation_intermediate.py");
+    std::fs::write(path, &intermediate).unwrap();
+    println!("intermediate zkDSL written to {path}",);
+}
+
 #[test]
 fn display_all_air_evals_in_zk_dsl() {
     println!("{}", all_air_evals_in_zk_dsl());

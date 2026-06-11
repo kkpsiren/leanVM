@@ -2,10 +2,9 @@ use backend::*;
 
 use super::expression::ExpressionParser;
 use super::{ConstArrayValue, Parse, ParseContext, ParsedConstant, next_inner_pair};
-use crate::a_simplify_lang::VarOrConstMallocAccess;
 use crate::{
     F,
-    lang::{ConstExpression, ConstantValue, SimpleExpr},
+    lang::{ConstExpression, ConstantValue, SimpleExpr, VarOrConstMallocAccess},
     parser::{
         error::{ParseResult, SemanticError},
         grammar::{ParsePair, Rule},

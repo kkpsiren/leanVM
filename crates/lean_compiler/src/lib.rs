@@ -4,13 +4,20 @@ use std::fmt;
 use lean_vm::*;
 
 use crate::{
-    a_simplify_lang::simplify_program, b_compile_intermediate::compile_to_intermediate_bytecode,
-    c_compile_final::compile_to_low_level_bytecode, parser::parse_program,
+    a_compile_to_intermediate::{compile_to_intermediate_program, intermediate_program_to_source},
+    b_simplify_intermediate::simplify_intermediate_program,
+    c_compile_intermediate_bytecode::compile_to_intermediate_bytecode,
+    d_compile_final::compile_to_low_level_bytecode,
+    intermediate_program::IntermediateProgram,
+    parser::parse_program,
 };
 
-mod a_simplify_lang;
-mod b_compile_intermediate;
-mod c_compile_final;
+mod a_compile_to_intermediate;
+mod ast_passes;
+mod b_simplify_intermediate;
+mod c_compile_intermediate_bytecode;
+mod d_compile_final;
+mod intermediate_program;
 pub mod ir;
 mod lang;
 mod parser;
@@ -141,22 +148,49 @@ fn apply_replacements(source: &str, replacements: &BTreeMap<String, String>) -> 
 
 #[derive(Debug, Clone, Default)]
 pub struct CompilationFlags {
-    /// useful for placeholder replacements in source code
+    /// placeholder replacements applied to the source
     pub replacements: BTreeMap<String, String>,
 }
 
+/// First stage: compile a zkDSL program down to the intermediate zkDSL,
+/// returned as self-contained `.py` source (consumed by
+/// [`try_compile_intermediate_source`]).
+pub fn try_compile_to_intermediate_source(
+    input: &ProgramSource,
+    flags: CompilationFlags,
+) -> Result<String, CompileError> {
+    let parsed_program = parse_program(input, flags)?;
+    let intermediate_program = compile_to_intermediate_program(parsed_program)?;
+    Ok(intermediate_program_to_source(&intermediate_program))
+}
+
+/// Second stage: compile intermediate zkDSL source down to leanVM bytecode.
+/// Programs outside the subset are rejected when constructing the
+/// [`IntermediateProgram`].
+pub fn try_compile_intermediate_source(intermediate_source: &str) -> Result<Bytecode, CompileError> {
+    let source = ProgramSource::Raw(intermediate_source.to_string());
+    let parsed_program = parse_program(&source, CompilationFlags::default())?;
+    let intermediate_program = IntermediateProgram::from_parsed(parsed_program)?;
+    let simple_program = simplify_intermediate_program(&intermediate_program)?;
+    let intermediate_bytecode = compile_to_intermediate_bytecode(simple_program)?;
+    let IntermediateProgram {
+        function_locations,
+        source_code,
+        filepaths,
+        ..
+    } = intermediate_program;
+    let bytecode = compile_to_low_level_bytecode(intermediate_bytecode, function_locations, source_code, filepaths)?;
+    Ok(bytecode)
+}
+
+/// Full pipeline: the two stages are decoupled through `.py` source, so a
+/// dumped intermediate program is exactly what stage 2 consumes.
 pub fn try_compile_program_with_flags(
     input: &ProgramSource,
     flags: CompilationFlags,
 ) -> Result<Bytecode, CompileError> {
-    let parsed_program = parse_program(input, flags)?;
-    let function_locations = parsed_program.function_locations.clone();
-    let source_code = parsed_program.source_code.clone();
-    let filepaths = parsed_program.filepaths.clone();
-    let simple_program = simplify_program(parsed_program)?;
-    let intermediate_bytecode = compile_to_intermediate_bytecode(simple_program)?;
-    let bytecode = compile_to_low_level_bytecode(intermediate_bytecode, function_locations, source_code, filepaths)?;
-    Ok(bytecode)
+    let intermediate_source = try_compile_to_intermediate_source(input, flags)?;
+    try_compile_intermediate_source(&intermediate_source)
 }
 
 pub fn compile_program_with_flags(input: &ProgramSource, flags: CompilationFlags) -> Bytecode {

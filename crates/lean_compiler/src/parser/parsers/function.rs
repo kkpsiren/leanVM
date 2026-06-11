@@ -1,8 +1,10 @@
 use super::expression::ExpressionParser;
 use super::{Parse, ParseContext, next_inner_pair, push_statement_with_location};
 use crate::{
-    a_simplify_lang::VarOrConstMallocAccess,
-    lang::{AssignmentTarget, Expression, Function, FunctionArg, Line, MathOperation, SimpleExpr, SourceLocation},
+    lang::{
+        AssignmentTarget, Expression, Function, FunctionArg, Line, MathOperation, SimpleExpr, SourceLocation,
+        VarOrConstMallocAccess,
+    },
     parser::{
         error::{ParseResult, SemanticError},
         grammar::{ParsePair, Rule},
@@ -112,13 +114,15 @@ impl Parse<Function> for FunctionParser {
 
 impl FunctionParser {
     /// Infer the number of return values from return statements in the function body.
-    /// All return statements must return the same number of values.
+    /// All return statements must return the same number of values. A function
+    /// without any `return` returns nothing (it must end in a panic on every
+    /// path, which is checked at compile time).
     fn infer_return_count(func_name: &str, body: &[Line]) -> ParseResult<usize> {
         let mut return_counts: Vec<usize> = Vec::new();
         Self::collect_return_counts(body, &mut return_counts);
 
         match return_counts.as_slice() {
-            [] => Err(SemanticError::new(format!("Function '{func_name}' has no return statements")).into()),
+            [] => Ok(0),
             [first, rest @ ..] => {
                 if rest.iter().any(|&count| count != *first) {
                     return Err(
@@ -398,7 +402,7 @@ impl AssignmentParser {
         expr: Expression,
     ) -> ParseResult<Line> {
         match &expr {
-            // Function calls (print, precompiles, custom hints) are resolved in a_simplify_lang.rs
+            // Function calls (print, precompiles, custom hints) are resolved in b_simplify_intermediate
             Expression::FunctionCall { .. } => {}
             Expression::HintWitness { .. } => {
                 if !targets.is_empty() {

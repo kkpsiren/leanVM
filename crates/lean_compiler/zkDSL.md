@@ -134,9 +134,9 @@ def main():
     return
 ```
 
-Every function must contain at least one `return`. The compiler infers the number
-of returned values from the `return` statements; all `return`s in a function must
-agree. A function that "returns nothing" uses a bare `return`.
+The compiler infers the number of returned values from the `return` statements
+(they must all agree); a bare `return` returns nothing. Every execution path
+must end with a `return` or an `assert False`.
 
 
 ### Parameter types
@@ -180,6 +180,8 @@ Constraints on inline functions (compiler limitations): Exactly one `return`, pl
 | `x: Mut = 10` | mutable    | reassignable                                   |
 | `x: Imm`      | immutable  | forward declaration; assign exactly once later |
 | `x: Mut`      | mutable    | forward declaration; reassignable later        |
+
+Identifiers starting with `__` are reserved for the compiler.
 
 ### Forward declarations
 

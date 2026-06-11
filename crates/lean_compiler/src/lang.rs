@@ -3,9 +3,53 @@ use lean_vm::*;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{Display, Formatter};
 
-use crate::a_simplify_lang::VarOrConstMallocAccess;
 use crate::{F, parser::ConstArrayValue};
 pub use lean_vm::{FileId, FunctionName, SourceLocation};
+
+/// A plain variable, or a direct access into a compile-time-known allocation
+/// (`ConstMalloc`). The latter only appears in stage 2 (intermediate -> bytecode).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum VarOrConstMallocAccess {
+    Var(Var),
+    ConstMallocAccess {
+        malloc_label: ConstMallocLabel,
+        offset: ConstExpression,
+    },
+}
+
+impl From<VarOrConstMallocAccess> for SimpleExpr {
+    fn from(var_or_const: VarOrConstMallocAccess) -> Self {
+        Self::Memory(var_or_const)
+    }
+}
+
+impl TryInto<VarOrConstMallocAccess> for SimpleExpr {
+    type Error = ();
+
+    fn try_into(self) -> Result<VarOrConstMallocAccess, Self::Error> {
+        match self {
+            Self::Memory(var_or_const) => Ok(var_or_const),
+            _ => Err(()),
+        }
+    }
+}
+
+impl From<Var> for VarOrConstMallocAccess {
+    fn from(var: Var) -> Self {
+        Self::Var(var)
+    }
+}
+
+impl Display for VarOrConstMallocAccess {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Var(var) => write!(f, "{var}"),
+            Self::ConstMallocAccess { malloc_label, offset } => {
+                write!(f, "ConstMallocAccess({malloc_label}, {offset})")
+            }
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct Program {
@@ -749,6 +793,27 @@ impl Line {
             | Self::FunctionRet { .. }
             | Self::Panic { .. }
             | Self::LocationReport { .. } => vec![],
+        }
+    }
+
+    /// Immutable counterpart of `expressions_mut` (excludes nested blocks).
+    pub fn expressions(&self) -> Vec<&Expression> {
+        match self {
+            Self::Match { value, .. } => vec![value],
+            Self::Statement { targets, value, .. } => {
+                let mut exprs = vec![value];
+                for target in targets {
+                    if let AssignmentTarget::ArrayAccess { index, .. } = target {
+                        exprs.push(index);
+                    }
+                }
+                exprs
+            }
+            Self::Assert { boolean, .. } => vec![&boolean.left, &boolean.right],
+            Self::IfCondition { condition, .. } => vec![&condition.left, &condition.right],
+            Self::ForLoop { start, end, .. } => vec![start, end],
+            Self::FunctionRet { return_data } => return_data.iter().collect(),
+            Self::ForwardDeclaration { .. } | Self::Panic { .. } | Self::LocationReport { .. } => vec![],
         }
     }
 

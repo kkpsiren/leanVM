@@ -44,7 +44,9 @@ simple_statement = {
     assignment
 }
 
-return_statement = { "return" ~ (("(" ~ tuple_expression ~ ")") | tuple_expression)? }
+// The plain tuple comes first: a parenthesized first element (`return (a + b), c`)
+// must not commit the PEG choice to the `return ( tuple )` form.
+return_statement = { "return" ~ (tuple_expression | ("(" ~ tuple_expression ~ ")"))? }
 
 
 mut_keyword = @{ "mut" ~ !(ASCII_ALPHANUMERIC | "_") }

@@ -83,7 +83,10 @@ fn find_files(dir: &str, prefix: &str, suffix: &str) -> Vec<String> {
 
 #[test]
 fn test_num_files() {
-    let expected_num_files = 3; // program_2.py imports foo.py and bar.py
+    // The bytecode is compiled from the (single-file) intermediate program,
+    // even when the original program spans several files (program_2.py
+    // imports foo.py and bar.py).
+    let expected_num_files = 1;
     let path = format!("{}/program_2.py", test_data_dir());
     let bytecode = compile_program(&ProgramSource::Filepath(path));
     assert_eq!(bytecode.debug_info().filepaths.len(), expected_num_files);

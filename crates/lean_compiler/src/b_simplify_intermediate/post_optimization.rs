@@ -2,12 +2,11 @@ use std::collections::{BTreeMap, BTreeSet, btree_map::Entry};
 
 use backend::PrimeCharacteristicRing;
 
-use crate::{F, a_simplify_lang::*, lang::ConstExpression};
+use crate::{F, b_simplify_intermediate::*, lang::ConstExpression};
 
 pub fn propagate_copies(program: &mut SimpleProgram) {
     for func in program.functions.values_mut() {
-        // Pass 1: copy propagation. `var = mem_expr + 0` with `var`
-        // single-defined ⇒ rewrite uses with `mem_expr`, drop the assignment.
+        // Copy propagation: `var = mem + 0` (var single-defined) ⇒ rewrite uses with `mem`.
         let refs = get_var_refs(&func.instructions);
         let mut subst = BTreeMap::<Var, SimpleExpr>::new();
         build_substitutions(&func.instructions, &refs, &mut subst);
@@ -15,20 +14,17 @@ pub fn propagate_copies(program: &mut SimpleProgram) {
             apply_substitutions(&mut func.instructions, &subst);
         }
 
-        // Pass 2: fold `v_inner = K + base; v_ptr = arr + v_inner; res = m[v_ptr + 0]`
-        // into `v_ptr = arr + base; res = m[v_ptr + K]`.
         let refs = get_var_refs(&func.instructions);
         fold_const_offset_into_deref(&mut func.instructions, &refs);
 
-        // Pass 3: Dedup Add/Mul/Sub/Div with same operands
         let refs = get_var_refs(&func.instructions);
         dedup_arithmetic_operations(&mut func.instructions, &refs);
 
-        // Pass 4: Fuse `v = m[ptr+s]; assert v == x` ⇒ `x = m[ptr+s]`.
+        // Fuse `v = m[ptr+s]; assert v == x` ⇒ `x = m[ptr+s]`.
         let refs = get_var_refs(&func.instructions);
         fuse_raw_asserts(&mut func.instructions, &refs);
 
-        // Pass 5: fuse `Assignment + AssertEq`('c = 0`and 'c = a * b` => `0 = a * b`).
+        // Fuse `c = a * b; assert c == 0` ⇒ `0 = a * b`.
         let refs = get_var_refs(&func.instructions);
         fuse_assign_asserts(&mut func.instructions, &refs);
     }
@@ -61,7 +57,7 @@ fn get_var_refs(lines: &[SimpleLine]) -> BTreeMap<Var, VarRefs> {
                 }
                 _ => {}
             }
-            // Reads only (skip `RawAccess.res`)
+            // Reads only: `RawAccess.res` is a write target, not a read.
             let reads: Vec<&SimpleExpr> = match line {
                 SimpleLine::RawAccess { index, .. } => vec![index],
                 _ => line.operand_exprs(),
@@ -270,15 +266,10 @@ fn fuse_assign_asserts(lines: &mut Vec<SimpleLine>, refs: &BTreeMap<Var, VarRefs
     apply_fusions(lines, fusions);
 }
 
-/// The simplifier lowers `arr[base + K]` (runtime `base`, compile-time const `K`)
-/// to three lines: compute `K + base`, add `arr`, then DEREF with shift = 0. But DEREF
-/// already takes a constant shift, so we can absorb K there and skip the inner add:
-///
-///   v_inner = K + base                       v_ptr = arr + base
-///   v_ptr   = arr + v_inner            ==>   res   = memory[v_ptr + K]
-///   res     = memory[v_ptr + 0]
-///
-/// Soundness: `v_inner` and `v_ptr` must each be uniquely defined and uniquely used
+/// Absorb a constant offset into a DEREF's shift, skipping the inner add:
+///   `v_inner = K + base; v_ptr = arr + v_inner; res = m[v_ptr + 0]`
+///   ⇒ `v_ptr = arr + base; res = m[v_ptr + K]`.
+/// Soundness: `v_inner` and `v_ptr` must each be uniquely defined and used.
 fn fold_const_offset_into_deref(lines: &mut Vec<SimpleLine>, refs: &BTreeMap<Var, VarRefs>) {
     for line in lines.iter_mut() {
         for block in line.nested_blocks_mut() {
@@ -302,8 +293,7 @@ fn fold_const_offset_into_deref(lines: &mut Vec<SimpleLine>, refs: &BTreeMap<Var
 
     let one_use = |v: &Var| matches!(refs.get(v), Some(r) if r.definitions == 1 && r.uses == 1);
 
-    // Phase 1: collect (raw_access_idx, v_ptr_def_idx, arg_pos, mem_part, K, v_inner_def_idx, v_inner_var).
-    // (note the uses==1 on both v_ptr and v_inner)
+    // Phase 1: collect rewrites (requires uses==1 on both v_ptr and v_inner).
     let mut work: Vec<(usize, usize, usize, SimpleExpr, ConstExpression, usize, Var)> = Vec::new();
     for (i, line) in lines.iter().enumerate() {
         let SimpleLine::RawAccess { index, shift, .. } = line else {
