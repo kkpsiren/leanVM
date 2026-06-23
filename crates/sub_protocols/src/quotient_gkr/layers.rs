@@ -2,6 +2,8 @@ use backend::PackedValue;
 
 use backend::*;
 
+// logup* product term `prods = num_l·num_r`, set aside when a layer is built from
+// its (finer) child. The finest `Initial` layer is the input and carries none.
 pub(super) enum LayerStorage<'a, EF: ExtensionField<PF<EF>>> {
     Initial {
         nums: ArenaCow<'a, PFPacking<EF>>,
@@ -11,36 +13,49 @@ pub(super) enum LayerStorage<'a, EF: ExtensionField<PF<EF>>> {
     PackedBr {
         nums: ArenaCow<'a, EFPacking<EF>>,
         dens: ArenaCow<'a, EFPacking<EF>>,
+        prods: ArenaCow<'a, EFPacking<EF>>,
         chunk_log: usize,
     },
     Natural {
         nums: ArenaCow<'a, EF>,
         dens: ArenaCow<'a, EF>,
+        prods: ArenaCow<'a, EF>,
     },
 }
 
 impl<'a, EF: ExtensionField<PF<EF>>> LayerStorage<'a, EF> {
     pub(super) fn convert_to_natural(&self) -> Self {
         match self {
+            // `Initial` carries no `prods` and is never the top / converted in practice
+            // (`chunk_log = pivot > w`), so an empty `prods` here is unused.
             Self::Initial { nums, dens, chunk_log } => {
                 let n_nat_base: ArenaVec<EF> = unpack_base_and_unreverse_active::<EF>(nums.as_ref(), *chunk_log);
                 let d_nat = unpack_and_unreverse_active::<EF>(dens.as_ref(), *chunk_log);
                 Self::Natural {
                     nums: ArenaCow::Owned(n_nat_base),
                     dens: ArenaCow::Owned(d_nat),
+                    prods: ArenaCow::Owned(ArenaVec::new()),
                 }
             }
-            Self::PackedBr { nums, dens, chunk_log } => {
+            Self::PackedBr {
+                nums,
+                dens,
+                prods,
+                chunk_log,
+            } => {
                 let n_nat = unpack_and_unreverse_active::<EF>(nums.as_ref(), *chunk_log);
                 let d_nat = unpack_and_unreverse_active::<EF>(dens.as_ref(), *chunk_log);
+                let p_nat = unpack_and_unreverse_active::<EF>(prods.as_ref(), *chunk_log);
                 Self::Natural {
                     nums: ArenaCow::Owned(n_nat),
                     dens: ArenaCow::Owned(d_nat),
+                    prods: ArenaCow::Owned(p_nat),
                 }
             }
-            Self::Natural { nums, dens } => Self::Natural {
+            Self::Natural { nums, dens, prods } => Self::Natural {
                 nums: ArenaCow::Owned(ArenaVec::from_slice(nums.as_ref())),
                 dens: ArenaCow::Owned(ArenaVec::from_slice(dens.as_ref())),
+                prods: ArenaCow::Owned(ArenaVec::from_slice(prods.as_ref())),
             },
         }
     }
@@ -48,28 +63,33 @@ impl<'a, EF: ExtensionField<PF<EF>>> LayerStorage<'a, EF> {
     pub(super) fn sum_quotients_2_by_2(&self) -> Self {
         match self {
             Self::Initial { nums, dens, chunk_log } => {
-                let (new_nums, new_dens) =
+                let (new_nums, new_dens, new_prods) =
                     sum_quotients_2_by_2_packed_br::<EF, _>(nums.as_ref(), dens.as_ref(), *chunk_log);
                 Self::PackedBr {
                     nums: ArenaCow::Owned(new_nums),
                     dens: ArenaCow::Owned(new_dens),
+                    prods: ArenaCow::Owned(new_prods),
                     chunk_log: *chunk_log - 1,
                 }
             }
-            Self::PackedBr { nums, dens, chunk_log } => {
-                let (new_nums, new_dens) =
+            Self::PackedBr {
+                nums, dens, chunk_log, ..
+            } => {
+                let (new_nums, new_dens, new_prods) =
                     sum_quotients_2_by_2_packed_br::<EF, _>(nums.as_ref(), dens.as_ref(), *chunk_log);
                 Self::PackedBr {
                     nums: ArenaCow::Owned(new_nums),
                     dens: ArenaCow::Owned(new_dens),
+                    prods: ArenaCow::Owned(new_prods),
                     chunk_log: *chunk_log - 1,
                 }
             }
-            Self::Natural { nums, dens } => {
-                let (nn, nd) = sum_quotients_2_by_2(nums.as_ref(), dens.as_ref());
+            Self::Natural { nums, dens, .. } => {
+                let (nn, nd, np) = sum_quotients_2_by_2(nums.as_ref(), dens.as_ref());
                 Self::Natural {
                     nums: ArenaCow::Owned(nn),
                     dens: ArenaCow::Owned(nd),
+                    prods: ArenaCow::Owned(np),
                 }
             }
         }
@@ -83,20 +103,25 @@ impl<'a, EF: ExtensionField<PF<EF>>> LayerStorage<'a, EF> {
         }
     }
 
-    pub fn materialise_in_full(self) -> (ArenaVec<EF>, ArenaVec<EF>) {
+    /// Materialises the (coarsest) layer in full natural order, padding to a power of
+    /// two. Returns `(nums, dens, prods)`; `prods` is the layer's set-aside `a·c` term,
+    /// evaluated by the prover to seed the first product claim.
+    pub fn materialise_in_full(self) -> (ArenaVec<EF>, ArenaVec<EF>, ArenaVec<EF>) {
         let natural = match self {
             Self::Natural { .. } => self,
             other => other.convert_to_natural(),
         };
-        let Self::Natural { nums, dens } = natural else {
+        let Self::Natural { nums, dens, prods } = natural else {
             unreachable!()
         };
         let mut n = nums.into_owned();
         let mut d = dens.into_owned();
+        let mut p = prods.into_owned();
         let full = n.len().next_power_of_two();
         n.resize(full, EF::ZERO);
         d.resize(full, EF::ONE);
-        (n, d)
+        p.resize(full, EF::ZERO);
+        (n, d, p)
     }
 }
 
@@ -119,7 +144,11 @@ pub(super) fn bit_reverse_chunks<T: Copy + Send + Sync>(v: &[T], chunk_log: usiz
     out
 }
 
-fn sum_quotients_2_by_2<EF: ExtensionField<PF<EF>>>(nums: &[EF], dens: &[EF]) -> (ArenaVec<EF>, ArenaVec<EF>) {
+#[allow(clippy::type_complexity)]
+fn sum_quotients_2_by_2<EF: ExtensionField<PF<EF>>>(
+    nums: &[EF],
+    dens: &[EF],
+) -> (ArenaVec<EF>, ArenaVec<EF>, ArenaVec<EF>) {
     assert_eq!(nums.len(), dens.len());
     let active_len = nums.len();
     let new_active = active_len.div_ceil(2);
@@ -127,7 +156,9 @@ fn sum_quotients_2_by_2<EF: ExtensionField<PF<EF>>>(nums: &[EF], dens: &[EF]) ->
 
     let mut new_nums: ArenaVec<EF> = unsafe { ArenaVec::uninitialized(new_active) };
     let mut new_dens: ArenaVec<EF> = unsafe { ArenaVec::uninitialized(new_active) };
+    let mut new_prods: ArenaVec<EF> = unsafe { ArenaVec::uninitialized(new_active) };
 
+    let pp = parallel::SendPtr(new_prods.as_mut_ptr());
     parallel::par_for_each_mut2(
         &mut new_nums[..full_pairs],
         &mut new_dens[..full_pairs],
@@ -138,25 +169,33 @@ fn sum_quotients_2_by_2<EF: ExtensionField<PF<EF>>>(nums: &[EF], dens: &[EF]) ->
             let d1 = dens[2 * i + 1];
             *num = d1 * n0 + d0 * n1;
             *den = d0 * d1;
+            // logup* term `a·c`.
+            unsafe { *pp.add(i) = n0 * n1 };
         },
     );
 
-    // Boundary (at most one pair: a/b + 0/1 = a/b).
+    // Boundary (at most one pair: a/b + 0/1 = a/b, so a·c = a·0 = 0).
     if full_pairs < new_active {
         new_nums[full_pairs] = nums[2 * full_pairs];
         new_dens[full_pairs] = dens[2 * full_pairs];
+        new_prods[full_pairs] = EF::ZERO;
     }
 
-    (new_nums, new_dens)
+    (new_nums, new_dens, new_prods)
 }
 
+#[allow(clippy::type_complexity)]
 fn sum_quotients_2_by_2_packed_br<EF: ExtensionField<PF<EF>>, N>(
     nums: &[N],
     dens: &[EFPacking<EF>],
     chunk_log: usize,
-) -> (ArenaVec<EFPacking<EF>>, ArenaVec<EFPacking<EF>>)
+) -> (
+    ArenaVec<EFPacking<EF>>,
+    ArenaVec<EFPacking<EF>>,
+    ArenaVec<EFPacking<EF>>,
+)
 where
-    N: Copy + Send + Sync,
+    N: Copy + Send + Sync + core::ops::Mul<Output = N>,
     EFPacking<EF>: Algebra<N>,
 {
     let w = packing_log_width::<EF>();
@@ -169,7 +208,9 @@ where
 
     let mut new_nums: ArenaVec<EFPacking<EF>> = unsafe { ArenaVec::uninitialized(nums.len() >> 1) };
     let mut new_dens: ArenaVec<EFPacking<EF>> = unsafe { ArenaVec::uninitialized(nums.len() >> 1) };
+    let mut new_prods: ArenaVec<EFPacking<EF>> = unsafe { ArenaVec::uninitialized(nums.len() >> 1) };
 
+    let pp = parallel::SendPtr(new_prods.as_mut_ptr());
     parallel::par_for_each_mut2(&mut new_nums, &mut new_dens, |new_j, num_out, den_out| {
         let i_hi = new_j >> bit;
         let i_lo = new_j & lo_mask;
@@ -177,9 +218,11 @@ where
         let i1 = i0 | stride;
         *num_out = dens[i1] * nums[i0] + dens[i0] * nums[i1];
         *den_out = dens[i0] * dens[i1];
+        // logup* term `a·c` (base·base for the first layer; embedded into the extension).
+        unsafe { *pp.add(new_j) = EFPacking::<EF>::from(nums[i0] * nums[i1]) };
     });
 
-    (new_nums, new_dens)
+    (new_nums, new_dens, new_prods)
 }
 
 pub(super) fn unpack_and_unreverse_active<EF: ExtensionField<PF<EF>>>(

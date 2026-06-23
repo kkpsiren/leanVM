@@ -647,24 +647,30 @@ def verify_gkr_quotient(prev_fs, n_vars):
 
 def verify_gkr_quotient_step(prev_fs, n_vars, point, claim_num, claim_den):
     fs: Mut = prev_fs
+    # logup* product optimization: the prover sends the product claim `a*c`, then
+    # the three claims (den, num, prod) are folded with powers of `g`, so the
+    # sumcheck reduces to a single product `(den_l + g*num_l)*(den_r + g*num_r)`.
+    fs, claim_prod = fs_receive_ef_inlined(fs, 1)
     fs = fs_duplex(fs)
-    fs, alpha = fs_sample_ef(fs)
-    alpha_mul_claim_den = mul_extension_ret(alpha, claim_den)
-    num_plus_alpha_mul_claim_den = add_extension_ret(claim_num, alpha_mul_claim_den)
+    fs, g = fs_sample_ef(fs)
+    # expected = claim_den + g*claim_num + g^2*claim_prod
+    g_mul_claim_num = mul_extension_ret(g, claim_num)
+    g_squared = mul_extension_ret(g, g)
+    g_squared_mul_claim_prod = mul_extension_ret(g_squared, claim_prod)
+    expected_sum = add_extension_ret(claim_den, add_extension_ret(g_mul_claim_num, g_squared_mul_claim_prod))
     postponed_point = Array((n_vars + 1) * DIM)
-    fs, postponed_value = sumcheck_verify_reversed_helper(
-        fs, n_vars, num_plus_alpha_mul_claim_den, 3, postponed_point
-    )
+    fs, postponed_value = sumcheck_verify_reversed_helper(fs, n_vars, expected_sum, 3, postponed_point)
     fs, inner_evals = fs_receive_ef_inlined(fs, 4)
     a_num = inner_evals
     b_num = inner_evals + DIM
     a_den = inner_evals + 2 * DIM
     b_den = inner_evals + 3 * DIM
-    sum_num, sum_den = sum_2_ef_fractions(a_num, a_den, b_num, b_den)
-    sum_den_mul_alpha = mul_extension_ret(sum_den, alpha)
-    sum_num_plus_sum_den_mul_alpha = add_extension_ret(sum_num, sum_den_mul_alpha)
+    # comb_l = den_l + g*num_l, comb_r = den_r + g*num_r; constraints = comb_l*comb_r
+    comb_l = add_extension_ret(a_den, mul_extension_ret(g, a_num))
+    comb_r = add_extension_ret(b_den, mul_extension_ret(g, b_num))
+    constraints_eval = mul_extension_ret(comb_l, comb_r)
     eq_factor = poly_eq_extension_dynamic_ret(point, postponed_point, n_vars)
-    mul_extension(sum_num_plus_sum_den_mul_alpha, eq_factor, postponed_value)
+    mul_extension(constraints_eval, eq_factor, postponed_value)
 
     fs, beta = fs_sample_ef(fs)
 

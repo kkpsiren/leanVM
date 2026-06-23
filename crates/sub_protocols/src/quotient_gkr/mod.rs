@@ -6,7 +6,8 @@ use crate::{
     quotient_gkr::{
         layers::LayerStorage,
         sumcheck_utils::{
-            even_odd_split, quotient_sumcheck_prove_packed_br_base, run_phase1_sumcheck, run_phase2_sumcheck,
+            LayerEvals, even_odd_split, form_comb_base, form_comb_ext, quotient_sumcheck_prove_packed_br_base,
+            run_phase1_sumcheck, run_phase2_sumcheck,
         },
     },
 };
@@ -59,7 +60,7 @@ pub fn prove_gkr_quotient<'a, EF: ExtensionField<PF<EF>>>(
         current_n_vars -= 1;
     }
 
-    let (top_nums, top_dens) = layers.pop().unwrap().materialise_in_full();
+    let (top_nums, top_dens, top_prods) = layers.pop().unwrap().materialise_in_full();
     prover_state.add_extension_scalars(&top_nums);
     prover_state.add_extension_scalars(&top_dens);
     let quotient = compute_quotient(&top_nums, &top_dens).expect("prover produced a zero denominator"); // completeness error, happens with proba arround 1/2^128
@@ -67,9 +68,13 @@ pub fn prove_gkr_quotient<'a, EF: ExtensionField<PF<EF>>>(
     let mut point = MultilinearPoint(prover_state.sample_vec(N_VARS_TO_SEND_GKR_COEFFS));
     let mut claim_num = top_nums.evaluate(&point);
     let mut claim_den = top_dens.evaluate(&point);
+    // logup* product claim seeded from the top layer's set-aside `a·c` term; subsequent
+    // layers obtain it for free by folding their `prods` polynomial.
+    let mut claim_prod = top_prods.evaluate(&point);
 
     for layer in layers.iter().rev() {
-        (point, claim_num, claim_den) = prove_gkr_layer(prover_state, layer, &point, claim_num, claim_den);
+        (point, claim_num, claim_den, claim_prod) =
+            prove_gkr_layer(prover_state, layer, &point, claim_num, claim_den, claim_prod);
     }
 
     (quotient, point)
@@ -81,61 +86,101 @@ fn prove_gkr_layer<EF: ExtensionField<PF<EF>>>(
     claim_point: &MultilinearPoint<EF>, // K coords, natural order
     claim_num: EF,
     claim_den: EF,
-) -> (MultilinearPoint<EF>, EF, EF) {
+    claim_prod: EF,
+) -> (MultilinearPoint<EF>, EF, EF, EF) {
+    // The product claim `a·c` is sent to the verifier and folded with num/den; for
+    // this layer it was produced for free by the previous (coarser) layer's fold.
+    prover_state.add_extension_scalar(claim_prod);
     prover_state.duplex();
-    let alpha = prover_state.sample();
-    let expected_sum = claim_num + alpha * claim_den;
+    let g = prover_state.sample();
+    let expected_sum = claim_den + g * claim_num + g * g * claim_prod;
 
-    let (mut q_natural, inner_evals) = match layer {
-        LayerStorage::Initial { nums, dens, chunk_log } => quotient_sumcheck_prove_packed_br_base(
-            prover_state,
-            nums.as_ref(),
-            dens.as_ref(),
-            *chunk_log,
-            &claim_point.0,
-            alpha,
-            expected_sum,
-        ),
-        LayerStorage::PackedBr { nums, dens, chunk_log } => run_phase1_sumcheck(
-            prover_state,
-            nums.as_ref().into(),
-            dens.as_ref().into(),
-            *chunk_log,
-            claim_point.0.to_vec(),
-            vec![],
-            alpha,
-            expected_sum,
-            EF::ONE,
-            None,
-            None,
-        ),
-        LayerStorage::Natural { nums, dens } => {
+    // Sumcheck of `Σ eq · comb_l · comb_r` with `comb = den + g·num`. Returns the
+    // final evaluations of num/comb, plus the folded `prods` halves (`ac_*`) which
+    // give the next layer's product claim for free.
+    let (mut q_natural, evals) = match layer {
+        LayerStorage::Initial { nums, dens, chunk_log } => {
+            let comb = form_comb_base::<EF>(nums.as_ref(), dens.as_ref(), g);
+            quotient_sumcheck_prove_packed_br_base(
+                prover_state,
+                nums.as_ref(),
+                &comb,
+                None,
+                *chunk_log,
+                &claim_point.0,
+                expected_sum,
+            )
+        }
+        LayerStorage::PackedBr {
+            nums,
+            dens,
+            prods,
+            chunk_log,
+        } => {
+            let comb = form_comb_ext::<EF>(nums.as_ref(), dens.as_ref(), g);
+            run_phase1_sumcheck(
+                prover_state,
+                nums.as_ref().into(),
+                ArenaCow::Owned(comb),
+                Some(prods.as_ref().into()),
+                *chunk_log,
+                claim_point.0.to_vec(),
+                vec![],
+                expected_sum,
+                EF::ONE,
+                None,
+                None,
+            )
+        }
+        LayerStorage::Natural { nums, dens, prods } => {
             let (num_l, num_r) = even_odd_split(nums);
             let (den_l, den_r) = even_odd_split(dens);
+            let comb_l: ArenaVec<EF> = num_l.iter().zip(&den_l).map(|(&n, &d)| d + g * n).collect();
+            let comb_r: ArenaVec<EF> = num_r.iter().zip(&den_r).map(|(&n, &d)| d + g * n).collect();
+            let ac = Some(even_odd_split(prods));
             run_phase2_sumcheck(
                 prover_state,
                 num_l,
                 num_r,
-                den_l,
-                den_r,
+                comb_l,
+                comb_r,
+                ac,
                 claim_point.0.to_vec(),
                 vec![],
-                alpha,
                 expected_sum,
                 EF::ONE,
             )
         }
     };
 
+    // Recover den evals: `den = comb − g·num`, then emit num/den claims for the
+    // next layer (random linear combination by `beta`).
+    let LayerEvals {
+        num_l,
+        num_r,
+        comb_l,
+        comb_r,
+        ac_l,
+        ac_r,
+    } = evals;
+    let dl_q = comb_l - g * num_l;
+    let dr_q = comb_r - g * num_r;
+    let inner_evals = [num_l, num_r, dl_q, dr_q];
+
     prover_state.add_extension_scalars(&inner_evals);
     let beta = prover_state.sample();
-    let [nl_q, nr_q, dl_q, dr_q] = inner_evals;
     let one_minus_beta = EF::ONE - beta;
-    let next_num = one_minus_beta * nl_q + beta * nr_q;
+    let next_num = one_minus_beta * num_l + beta * num_r;
     let next_den = one_minus_beta * dl_q + beta * dr_q;
+    // Next layer's product claim, folded for free from this layer's `prods` (unused
+    // for the finest `Initial` layer, which carries no `prods`).
+    let next_prod = match (ac_l, ac_r) {
+        (Some(l), Some(r)) => one_minus_beta * l + beta * r,
+        _ => EF::ZERO,
+    };
 
     q_natural.push(beta);
-    (MultilinearPoint(q_natural), next_num, next_den)
+    (MultilinearPoint(q_natural), next_num, next_den, next_prod)
 }
 
 fn compute_quotient<EF: ExtensionField<PF<EF>>>(numerators: &[EF], denominators: &[EF]) -> Option<EF> {
@@ -171,15 +216,18 @@ fn verify_gkr_quotient_step<EF: ExtensionField<PF<EF>>>(
     claims_num: EF,
     claims_den: EF,
 ) -> Result<(MultilinearPoint<EF>, EF, EF), ProofError> {
+    let claim_prod = verifier_state.next_extension_scalar()?;
     verifier_state.duplex();
-    let alpha = verifier_state.sample();
-    let expected_sum = claims_num + alpha * claims_den;
+    let g = verifier_state.sample();
+    let expected_sum = claims_den + g * claims_num + g * g * claim_prod;
     let eq_alphas_rev: Vec<EF> = point.0.iter().rev().copied().collect();
     let mut postponed = sumcheck_verify(verifier_state, n_vars, 3, expected_sum, Some(&eq_alphas_rev))?;
     postponed.point.0.reverse();
     let inner_evals = verifier_state.next_extension_scalars_vec(4)?;
-    let constraints_eval =
-        alpha * inner_evals[2] * inner_evals[3] + (inner_evals[0] * inner_evals[3] + inner_evals[1] * inner_evals[2]);
+    // inner_evals = [num_l, num_r, den_l, den_r]; comb = den + g·num.
+    let comb_l = inner_evals[2] + g * inner_evals[0];
+    let comb_r = inner_evals[3] + g * inner_evals[1];
+    let constraints_eval = comb_l * comb_r;
     if postponed.value != point.eq_poly_outside(&postponed.point) * constraints_eval {
         return Err(ProofError::InvalidProof);
     }

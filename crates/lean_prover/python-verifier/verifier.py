@@ -442,12 +442,15 @@ def verify_gkr_quotient(fiat_shamir: FiatShamir, n_vars: int) -> tuple[EF, list[
     claim_den = eval_multilinear_by_evals(dens, point)
 
     for layer_n_vars in range(N_VARS_TO_SEND_GKR_COEFFS, n_vars):
+        claim_prod = fiat_shamir.next_extension_scalars_vec(1)[0]
         fiat_shamir.duplex()
-        alpha = fiat_shamir.sample_ef()
-        sc_point, sc_value = verify_sumcheck(fiat_shamir, claim_num + alpha * claim_den, layer_n_vars, 3)
+        g = fiat_shamir.sample_ef()
+        sc_point, sc_value = verify_sumcheck(fiat_shamir, claim_den + g * claim_num + g * g * claim_prod, layer_n_vars, 3)  # fmt: skip
         sc_point = list(reversed(sc_point))
         nl, nr, dl, dr = fiat_shamir.next_extension_scalars_vec(4)
-        assert sc_value == eq_poly(point, sc_point) * (alpha * dl * dr + nl * dr + nr * dl), "GKR step: postponed value mismatch"  # fmt: skip
+        comb_l = dl + g * nl
+        comb_r = dr + g * nr
+        assert sc_value == eq_poly(point, sc_point) * (comb_l * comb_r), "GKR step: postponed value mismatch"
         beta = fiat_shamir.sample_ef()
         one_minus = ONE - beta
         claim_num = one_minus * nl + beta * nr
