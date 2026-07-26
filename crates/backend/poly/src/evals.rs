@@ -1,18 +1,28 @@
 use crate::*;
 use crate::{EFPacking, PF};
 use ::utils::log2_ceil_usize;
-use field::{ExtensionField, Field, PackedFieldExtension, PackedValue, PrimeCharacteristicRing};
+use field::{
+    ExtensionField, Field, HasExtensionPacking, HasPacking, PackedFieldExtension, PackedValue, PrimeCharacteristicRing,
+};
 use zk_alloc::ArenaVec;
-pub trait EvaluationsList<F: Field> {
+pub trait EvaluationsList<F: HasPacking> {
     fn num_variables(&self) -> usize;
     fn num_evals(&self) -> usize;
-    fn evaluate<EF: ExtensionField<F>>(&self, point: &MultilinearPoint<EF>) -> EF;
-    fn evaluate_sequential<EF: ExtensionField<F>>(&self, point: &MultilinearPoint<EF>) -> EF;
+    fn evaluate<EF: ExtensionField<F> + HasPacking + HasExtensionPacking<F>>(&self, point: &MultilinearPoint<EF>)
+    -> EF;
+    fn evaluate_sequential<EF: ExtensionField<F> + HasPacking + HasExtensionPacking<F>>(
+        &self,
+        point: &MultilinearPoint<EF>,
+    ) -> EF;
     fn as_constant(&self) -> F;
-    fn evaluate_sparse<EF: ExtensionField<F>>(&self, selector: usize, point: &MultilinearPoint<EF>) -> EF;
+    fn evaluate_sparse<EF: ExtensionField<F> + HasPacking + HasExtensionPacking<F>>(
+        &self,
+        selector: usize,
+        point: &MultilinearPoint<EF>,
+    ) -> EF;
 }
 
-impl<F: Field, EL: AsRef<[F]>> EvaluationsList<F> for EL {
+impl<F: HasPacking, EL: AsRef<[F]>> EvaluationsList<F> for EL {
     fn num_variables(&self) -> usize {
         self.as_ref().len().ilog2() as usize
     }
@@ -21,11 +31,17 @@ impl<F: Field, EL: AsRef<[F]>> EvaluationsList<F> for EL {
         self.as_ref().len()
     }
 
-    fn evaluate<EF: ExtensionField<F>>(&self, point: &MultilinearPoint<EF>) -> EF {
+    fn evaluate<EF: ExtensionField<F> + HasPacking + HasExtensionPacking<F>>(
+        &self,
+        point: &MultilinearPoint<EF>,
+    ) -> EF {
         eval_multilinear::<_, _, true>(self.as_ref(), point)
     }
 
-    fn evaluate_sequential<EF: ExtensionField<F>>(&self, point: &MultilinearPoint<EF>) -> EF {
+    fn evaluate_sequential<EF: ExtensionField<F> + HasPacking + HasExtensionPacking<F>>(
+        &self,
+        point: &MultilinearPoint<EF>,
+    ) -> EF {
         eval_multilinear_sequential(self.as_ref(), point)
     }
 
@@ -34,7 +50,11 @@ impl<F: Field, EL: AsRef<[F]>> EvaluationsList<F> for EL {
         self.as_ref()[0]
     }
 
-    fn evaluate_sparse<EF: ExtensionField<F>>(&self, selector: usize, point: &MultilinearPoint<EF>) -> EF {
+    fn evaluate_sparse<EF: ExtensionField<F> + HasPacking + HasExtensionPacking<F>>(
+        &self,
+        selector: usize,
+        point: &MultilinearPoint<EF>,
+    ) -> EF {
         (&self.as_ref()[selector << point.len()..][..(1 << point.len())]).evaluate(point)
     }
 }
@@ -69,8 +89,8 @@ pub fn bit_reverse_permutation<T>(data: &mut [T]) {
 /// prover-side paths are [`eval_base_packed`] / [`eval_packed`].
 pub fn eval_multilinear_sequential<F, EF>(evals: &[F], point: &[EF]) -> EF
 where
-    F: Field,
-    EF: ExtensionField<F>,
+    F: HasPacking,
+    EF: ExtensionField<F> + HasPacking + HasExtensionPacking<F>,
 {
     debug_assert_eq!(evals.len(), 1 << point.len());
     let mid = point.len() / 2;
@@ -105,8 +125,8 @@ fn seq_eq_table<EF: Field>(point: &[EF]) -> Vec<EF> {
 
 pub fn eval_multilinear_coeffs<F, EF>(coeffs: &[F], point: &[EF]) -> EF
 where
-    F: Field,
-    EF: ExtensionField<F>,
+    F: HasPacking,
+    EF: ExtensionField<F> + HasPacking + HasExtensionPacking<F>,
 {
     debug_assert_eq!(coeffs.len(), 1 << point.len());
     match point {
@@ -120,8 +140,8 @@ where
 
 fn eval_multilinear<F, EF, const PARALLEL: bool>(evals: &[F], point: &[EF]) -> EF
 where
-    F: Field,
-    EF: ExtensionField<F>,
+    F: HasPacking,
+    EF: ExtensionField<F> + HasPacking + HasExtensionPacking<F>,
 {
     eval_multilinear_generic::<_, _, _, _, _, _, PARALLEL>(
         evals,
@@ -223,7 +243,7 @@ fn eval_multilinear_generic<Coeffs, Point, Res, MCP, ARC, MRP, const PARALLEL: b
 ) -> Res
 where
     Coeffs: Copy + PrimeCharacteristicRing + Sync + Send,
-    Point: Field,
+    Point: HasPacking + HasExtensionPacking<Point>,
     Res: Copy + PrimeCharacteristicRing + From<Coeffs> + Sync + Send,
     MCP: Fn(Coeffs, Point) -> Res + Sync + Send,
     ARC: Fn(Res, Coeffs) -> Res + Sync + Send,

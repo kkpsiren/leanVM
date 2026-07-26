@@ -1,6 +1,7 @@
 use crate::challenger::Challenger;
 use crate::{MerklePaths, PrunedMerklePaths, *};
 use field::Field;
+use field::HasPacking;
 use field::PackedValue;
 use field::PrimeCharacteristicRing;
 use field::PrimeField64;
@@ -60,7 +61,7 @@ impl<EF: KoalaBearExtension, P: Permutation<[PF<EF>; WIDTH]>> ChallengeSampler<E
     }
 }
 
-impl<EF: KoalaBearExtension, P: Permutation<[PF<EF>; WIDTH]> + Permutation<[<PF<EF> as Field>::Packing; WIDTH]>>
+impl<EF: KoalaBearExtension, P: Permutation<[PF<EF>; WIDTH]> + Permutation<[<PF<EF> as HasPacking>::Packing; WIDTH]>>
     FSProver<EF> for ProverState<EF, P>
 {
     fn add_base_scalars(&mut self, scalars: &[PF<EF>]) {
@@ -118,7 +119,7 @@ impl<EF: KoalaBearExtension, P: Permutation<[PF<EF>; WIDTH]> + Permutation<[<PF<
 
         let time = Instant::now();
 
-        type Packed<EF> = <PF<EF> as Field>::Packing;
+        type Packed<EF> = <PF<EF> as HasPacking>::Packing;
         let lanes = Packed::<EF>::WIDTH;
 
         let witness_found = Mutex::<Option<PF<EF>>>::new(None);

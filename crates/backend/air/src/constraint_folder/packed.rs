@@ -4,7 +4,14 @@ use koala_bear::KoalaBear;
 use poly::*;
 
 #[derive(Debug)]
-pub struct ConstraintFolderPacked<'a, IF, EF: ExtensionField<PF<EF>>, ExtraData: AlphaPowers<EF>> {
+pub struct ConstraintFolderPacked<
+    'a,
+    IF,
+    EF: ExtensionField<PF<EF>> + HasExtensionPacking<PF<EF>>,
+    ExtraData: AlphaPowers<EF>,
+> where
+    PF<EF>: HasPacking,
+{
     pub flat: &'a [IF],
     pub shift: &'a [IF],
     pub extra_data: &'a ExtraData,
@@ -18,7 +25,8 @@ pub struct ConstraintFolderPacked<'a, IF, EF: ExtensionField<PF<EF>>, ExtraData:
 
 impl<'a, IF, EF, ExtraData> ConstraintFolderPacked<'a, IF, EF, ExtraData>
 where
-    EF: ExtensionField<PF<EF>>,
+    EF: ExtensionField<PF<EF>> + HasExtensionPacking<PF<EF>>,
+    PF<EF>: HasPacking,
     EFPacking<EF>: PrimeCharacteristicRing,
     ExtraData: AlphaPowers<EF>,
 {
@@ -40,7 +48,8 @@ where
 impl<'a, IF, EF, ExtraData> AirBuilder for ConstraintFolderPacked<'a, IF, EF, ExtraData>
 where
     IF: Algebra<PFPacking<EF>> + Algebra<KoalaBear> + 'static,
-    EF: Field + ExtensionField<PF<EF>>,
+    EF: Field + ExtensionField<PF<EF>> + HasExtensionPacking<PF<EF>>,
+    PF<EF>: HasPacking,
     EFPacking<EF>: PrimeCharacteristicRing + Mul<IF, Output = EFPacking<EF>> + Add<IF, Output = EFPacking<EF>>,
     ExtraData: AlphaPowers<EF>,
 {

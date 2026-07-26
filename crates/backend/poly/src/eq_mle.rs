@@ -40,7 +40,7 @@ fn par_eval_eq<In, Buf, Out>(
     seed: Buf,
     kernel: impl Fn(&[In], &mut [Out], Buf) + Sync,
 ) where
-    In: Field,
+    In: HasPacking,
     Buf: Algebra<In> + Copy + Send + Sync,
     Out: Send,
 {
@@ -136,8 +136,8 @@ where
 /// - true: the result is added to the `out` buffer
 pub fn compute_eval_eq<F, EF, const INITIALIZED: bool>(eval: &[EF], out: &mut [EF], scalar: EF)
 where
-    F: Field,
-    EF: ExtensionField<F>,
+    F: HasPacking,
+    EF: ExtensionField<F> + HasExtensionPacking<F> + HasPacking,
 {
     // `packing_width` may be 1 (e.g. Goldilocks on Neon, or without `target-cpu=native`),
     // so nothing here may assume it is > 1.
@@ -235,8 +235,8 @@ where
 /// - true: the result is added to the `out` buffer
 pub fn compute_eval_eq_base<F, EF, const INITIALIZED: bool>(eval: &[F], out: &mut [EF], scalar: EF)
 where
-    F: Field,
-    EF: ExtensionField<F>,
+    F: HasPacking,
+    EF: ExtensionField<F> + HasExtensionPacking<F> + HasPacking,
 {
     let log_packing_width = log2_strict_usize(F::Packing::WIDTH);
     debug_assert_eq!(out.len(), 1 << eval.len());
@@ -270,8 +270,8 @@ pub fn compute_eval_eq_base_packed<F, EF, const INITIALIZED: bool>(
     out: &mut [EF::ExtensionPacking],
     scalar: EF,
 ) where
-    F: Field,
-    EF: ExtensionField<F>,
+    F: HasPacking,
+    EF: ExtensionField<F> + HasExtensionPacking<F> + HasPacking,
 {
     let packing_width = F::Packing::WIDTH;
     let log_packing_width = log2_strict_usize(packing_width);
@@ -318,8 +318,8 @@ pub fn compute_eval_eq_base_packed_batched<F, EF>(
     out: &mut [EF::ExtensionPacking],
     scalars: &[EF],
 ) where
-    F: Field,
-    EF: ExtensionField<F>,
+    F: HasPacking,
+    EF: ExtensionField<F> + HasExtensionPacking<F> + HasPacking,
 {
     assert_eq!(evals.len(), scalars.len());
     if evals.is_empty() {
@@ -384,7 +384,7 @@ pub fn compute_eval_eq_base_packed_batched<F, EF>(
 #[inline(always)]
 fn fill_buffer<'a, F, A>(points: impl ExactSizeIterator<Item = &'a F>, buffer: &mut [A])
 where
-    F: Field,
+    F: HasPacking,
     A: Algebra<F> + Copy,
 {
     for (ind, &entry) in points.enumerate() {
@@ -446,7 +446,7 @@ where
 #[inline(always)]
 fn eval_eq_1<F, FP>(eval: &[F], scalar: FP) -> [FP; 2]
 where
-    F: Field,
+    F: HasPacking,
     FP: Algebra<F> + Copy,
 {
     assert_eq!(eval.len(), 1);
@@ -496,7 +496,7 @@ where
 #[inline(always)]
 fn eval_eq_2<F, FP>(eval: &[F], scalar: FP) -> [FP; 4]
 where
-    F: Field,
+    F: HasPacking,
     FP: Algebra<F> + Copy,
 {
     assert_eq!(eval.len(), 2);
@@ -553,7 +553,7 @@ where
 #[inline(always)]
 fn eval_eq_3<F, FP>(eval: &[F], scalar: FP) -> [FP; 8]
 where
-    F: Field,
+    F: HasPacking,
     FP: Algebra<F> + Copy,
 {
     assert_eq!(eval.len(), 3);
@@ -615,9 +615,9 @@ where
 #[inline]
 fn eval_eq_basic<F, IF, EF, const INITIALIZED: bool>(eval: &[IF], out: &mut [EF], scalar: EF)
 where
-    F: Field,
-    IF: Field,
-    EF: ExtensionField<F> + Algebra<IF>,
+    F: HasPacking,
+    IF: HasPacking,
+    EF: ExtensionField<F> + Algebra<IF> + HasExtensionPacking<F> + HasPacking,
 {
     // Ensure that the output buffer size is correct:
     // It should be of size `2^n`, where `n` is the number of variables.
@@ -692,7 +692,11 @@ where
 /// It then updates the output buffer `out` with the computed values by adding them in.
 #[allow(clippy::too_many_lines)]
 #[inline]
-fn eval_eq_with_packed_scalar<F: Field, EF: ExtensionField<F>, const INITIALIZED: bool>(
+fn eval_eq_with_packed_scalar<
+    F: HasPacking,
+    EF: ExtensionField<F> + HasExtensionPacking<F> + HasPacking,
+    const INITIALIZED: bool,
+>(
     eval: &[EF],
     out: &mut [EF],
     scalar: EF::ExtensionPacking,
@@ -781,7 +785,11 @@ fn eval_eq_with_packed_scalar<F: Field, EF: ExtensionField<F>, const INITIALIZED
 
 #[allow(clippy::too_many_lines)]
 #[inline]
-fn eval_eq_with_packed_output<F: Field, EF: ExtensionField<F>, const INITIALIZED: bool>(
+fn eval_eq_with_packed_output<
+    F: HasPacking,
+    EF: ExtensionField<F> + HasExtensionPacking<F> + HasPacking,
+    const INITIALIZED: bool,
+>(
     eval: &[EF],
     out: &mut [EF::ExtensionPacking],
     scalar: EF::ExtensionPacking,
@@ -835,7 +843,7 @@ fn eval_eq_with_packed_output<F: Field, EF: ExtensionField<F>, const INITIALIZED
 }
 
 #[inline]
-fn eval_eq_with_packed_output_dual<F: Field, EF: ExtensionField<F>>(
+fn eval_eq_with_packed_output_dual<F: HasPacking, EF: ExtensionField<F> + HasExtensionPacking<F> + HasPacking>(
     eval_a: &[EF],
     eval_b: &[EF],
     out: &mut [EF::ExtensionPacking],
@@ -958,8 +966,8 @@ fn base_eval_eq_packed<F, EF, const INITIALIZED: bool>(
     eq_evals: F::Packing,
     scalar: EF,
 ) where
-    F: Field,
-    EF: ExtensionField<F>,
+    F: HasPacking,
+    EF: ExtensionField<F> + HasExtensionPacking<F> + HasPacking,
 {
     // Ensure that the output buffer size is correct:
     // It should be of size `2^n`, where `n` is the number of variables.
@@ -1018,8 +1026,8 @@ fn base_eval_eq_packed_with_packed_output<F, EF, const INITIALIZED: bool>(
     eq_evals: F::Packing,
     packed_scalar: EF::ExtensionPacking, // repeated F::Packing::WIDTH times
 ) where
-    F: Field,
-    EF: ExtensionField<F>,
+    F: HasPacking,
+    EF: ExtensionField<F> + HasExtensionPacking<F> + HasPacking,
 {
     // Ensure that the output buffer size is correct:
     // It should be of size `2^n`, where `n` is the number of variables.
@@ -1076,7 +1084,7 @@ fn base_eval_eq_packed_with_packed_output<F, EF, const INITIALIZED: bool>(
 /// If the output buffer is already initialized, it adds the evaluations otherwise
 /// it copies the evaluations into the buffer directly.
 #[inline]
-fn add_or_set_f<F: Field, const INITIALIZED: bool>(out: &mut [F], evaluations: &[F]) {
+fn add_or_set_f<F: HasPacking, const INITIALIZED: bool>(out: &mut [F], evaluations: &[F]) {
     debug_assert_eq!(out.len(), evaluations.len());
     if INITIALIZED {
         F::add_slices(out, evaluations);
@@ -1101,7 +1109,11 @@ fn add_or_set_pf<F: PrimeCharacteristicRing + Copy, const INITIALIZED: bool>(out
 /// If the output buffer is already initialized, it adds the evaluations otherwise
 /// it copies the evaluations into the buffer directly.
 #[inline]
-fn scale_and_add<F: Field, EF: ExtensionField<F>, const INITIALIZED: bool>(
+fn scale_and_add<
+    F: HasPacking,
+    EF: ExtensionField<F> + HasExtensionPacking<F> + HasPacking,
+    const INITIALIZED: bool,
+>(
     out: &mut [EF],
     base_vals: &[F],
     scalar: EF,
@@ -1121,7 +1133,11 @@ fn scale_and_add<F: Field, EF: ExtensionField<F>, const INITIALIZED: bool>(
 }
 
 #[inline]
-fn scale_and_add_pf<F: Field, EF: ExtensionField<F>, const INITIALIZED: bool>(
+fn scale_and_add_pf<
+    F: HasPacking,
+    EF: ExtensionField<F> + HasExtensionPacking<F> + HasPacking,
+    const INITIALIZED: bool,
+>(
     out: &mut [EF::ExtensionPacking],
     base_vals: &[F::Packing],
     packed_scalar: EF::ExtensionPacking, // repeated F::Packing::WIDTH times
@@ -1148,7 +1164,10 @@ fn scale_and_add_pf<F: Field, EF: ExtensionField<F>, const INITIALIZED: bool>(
 /// The length of `eval` must be equal to the `log2` of `F::Packing::WIDTH`.
 #[allow(clippy::inline_always)] // Adding inline(always) seems to give a small performance boost.
 #[inline(always)]
-fn packed_eq_poly<F: Field, EF: ExtensionField<F>>(eval: &[EF], scalar: EF) -> EF::ExtensionPacking {
+fn packed_eq_poly<F: HasPacking, EF: ExtensionField<F> + HasExtensionPacking<F> + HasPacking>(
+    eval: &[EF],
+    scalar: EF,
+) -> EF::ExtensionPacking {
     // As this function is only available in this file, debug_assert should be fine here.
     // If this function becomes public, this should be changed to an assert.
     debug_assert_eq!(F::Packing::WIDTH, 1 << eval.len());
@@ -1243,7 +1262,7 @@ mod tests {
 
     #[test]
     fn test_packed_eval_eq() {
-        let packing_width = <F as Field>::Packing::WIDTH;
+        let packing_width = <F as HasPacking>::Packing::WIDTH;
         let log_packing_width = log2_strict_usize(packing_width);
         for n_vars in log_packing_width..20 {
             println!("\nn_vars = {}", n_vars);
@@ -1259,16 +1278,16 @@ mod tests {
                 compute_eval_eq::<F, EF, true>(&eval, &mut out_1, scalar);
                 println!("EXTENSION NOT PACKED: {:?}", time.elapsed());
 
-                let packing_width = <F as Field>::Packing::WIDTH;
+                let packing_width = <F as HasPacking>::Packing::WIDTH;
                 let log_packing_width = log2_strict_usize(packing_width);
                 let mut out_2 =
-                    <EF as ExtensionField<F>>::ExtensionPacking::zero_vec(1 << (n_vars - log_packing_width));
+                    <EF as HasExtensionPacking<F>>::ExtensionPacking::zero_vec(1 << (n_vars - log_packing_width));
                 let time = Instant::now();
                 compute_eval_eq_packed::<_, true>(&eval, &mut out_2, scalar);
                 println!("EXTENSION PACKED: {:?}", time.elapsed());
 
                 let unpacked_out_2: Vec<EF> =
-                    <EF as ExtensionField<F>>::ExtensionPacking::to_ext_iter_vec(out_2.clone());
+                    <EF as HasExtensionPacking<F>>::ExtensionPacking::to_ext_iter_vec(out_2.clone());
                 assert_eq!(out_1, unpacked_out_2);
 
                 let mut out_3 = EF::zero_vec(1 << n_vars);
@@ -1276,7 +1295,7 @@ mod tests {
                 compute_eval_eq::<F, EF, true>(&eval, &mut out_3, scalar);
                 let out_3_packed = out_3
                     .chunks_exact(packing_width)
-                    .map(<EF as ExtensionField<F>>::ExtensionPacking::from_ext_slice)
+                    .map(<EF as HasExtensionPacking<F>>::ExtensionPacking::from_ext_slice)
                     .collect::<Vec<_>>();
                 println!("EXTENSION PACKED AFTER: {:?}", time.elapsed());
 
@@ -1294,16 +1313,16 @@ mod tests {
                 compute_eval_eq_base::<F, EF, true>(&eval, &mut out_1, scalar);
                 println!("BASE NOT PACKED: {:?}", time.elapsed());
 
-                let packing_width = <F as Field>::Packing::WIDTH;
+                let packing_width = <F as HasPacking>::Packing::WIDTH;
                 let log_packing_width = log2_strict_usize(packing_width);
                 let mut out_2 =
-                    <EF as ExtensionField<F>>::ExtensionPacking::zero_vec(1 << (n_vars - log_packing_width));
+                    <EF as HasExtensionPacking<F>>::ExtensionPacking::zero_vec(1 << (n_vars - log_packing_width));
                 let time = Instant::now();
                 compute_eval_eq_base_packed::<F, _, true>(&eval, &mut out_2, scalar);
                 println!("BASE PACKED: {:?}", time.elapsed());
 
                 let unpacked_out_2: Vec<EF> =
-                    <EF as ExtensionField<F>>::ExtensionPacking::to_ext_iter_vec(out_2.clone());
+                    <EF as HasExtensionPacking<F>>::ExtensionPacking::to_ext_iter_vec(out_2.clone());
                 assert_eq!(out_1, unpacked_out_2);
 
                 let mut out_3 = EF::zero_vec(1 << n_vars);
@@ -1311,7 +1330,7 @@ mod tests {
                 compute_eval_eq_base::<F, EF, true>(&eval, &mut out_3, scalar);
                 let out_3_packed = out_3
                     .chunks_exact(packing_width)
-                    .map(<EF as ExtensionField<F>>::ExtensionPacking::from_ext_slice)
+                    .map(<EF as HasExtensionPacking<F>>::ExtensionPacking::from_ext_slice)
                     .collect::<Vec<_>>();
                 println!("BASE PACKED AFTER: {:?}", time.elapsed());
 
@@ -1322,7 +1341,7 @@ mod tests {
 
     #[test]
     fn test_compute_eval_eq_packed_dual() {
-        let packing_width = <F as Field>::Packing::WIDTH;
+        let packing_width = <F as HasPacking>::Packing::WIDTH;
         let log_packing_width = log2_strict_usize(packing_width);
         let mut rng = StdRng::seed_from_u64(42);
 

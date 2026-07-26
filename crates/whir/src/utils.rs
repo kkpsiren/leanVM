@@ -3,6 +3,7 @@
 use fiat_shamir::{ChallengeSampler, FSProver};
 use field::BasedVectorSpace;
 use field::Field;
+use field::HasPacking;
 use field::PackedValue;
 use field::PrimeCharacteristicRing;
 use field::TwoAdicField;
@@ -262,6 +263,6 @@ pub(crate) fn global_dft<F: Field>() -> Arc<EvalsDft<F>> {
         .unwrap()
 }
 
-pub fn precompute_dft_twiddles<F: TwoAdicField>(n: usize) {
+pub fn precompute_dft_twiddles<F: TwoAdicField + HasPacking>(n: usize) {
     global_dft::<F>().update_twiddles(n);
 }

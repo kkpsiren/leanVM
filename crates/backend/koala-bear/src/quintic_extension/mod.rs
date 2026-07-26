@@ -1,7 +1,7 @@
 // Credits: Plonky3 (https://github.com/Plonky3/Plonky3) (MIT and Apache-2.0 licenses).
 
 use crate::{MontyParameters, base_mul_packed, monty_add, monty_sub};
-use field::{Algebra, Field, PrimeCharacteristicRing, packed_mod_add, packed_mod_sub};
+use field::{Algebra, Field, HasPacking, PrimeCharacteristicRing, packed_mod_add, packed_mod_sub};
 
 use crate::packed_extension::PackedQuinticExtensionField;
 use crate::packing::quintic_mul_packed;
@@ -13,7 +13,7 @@ pub(crate) mod packed_extension;
 pub(crate) mod packing;
 
 pub type QuinticExtensionFieldKB = QuinticExtensionField<KoalaBear>;
-pub type PackedQuinticExtensionFieldKB = PackedQuinticExtensionField<KoalaBear, <KoalaBear as Field>::Packing>;
+pub type PackedQuinticExtensionFieldKB = PackedQuinticExtensionField<KoalaBear, <KoalaBear as HasPacking>::Packing>;
 
 impl QuinticExtendable for KoalaBear {
     const FROBENIUS_MATRIX: [[Self; 5]; 4] = [
@@ -93,7 +93,7 @@ impl QuinticExtendableAlgebra<KoalaBear> for KoalaBear {
 }
 
 /// Trait for fields that support binomial extension of the form: `F[X]/(X^5 + X^2 - 1)`
-pub trait QuinticExtendable: Field + QuinticExtendableAlgebra<Self> {
+pub trait QuinticExtendable: Field + HasPacking + QuinticExtendableAlgebra<Self> {
     const FROBENIUS_MATRIX: [[Self; 5]; 4];
 
     /// A generator for the extension field, expressed as a degree-`D` polynomial.

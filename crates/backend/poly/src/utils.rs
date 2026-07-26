@@ -3,7 +3,7 @@ use std::ops::{Add, Sub};
 use field::*;
 use zk_alloc::{ArenaVec, OwnedBuffer};
 
-use crate::{EFPacking, KoalaBearExtension, PFPacking};
+use crate::{EFPacking, KoalaBearExtension, PF, PFPacking};
 
 pub const PARALLEL_THRESHOLD: usize = 1 << 9;
 
@@ -62,15 +62,24 @@ pub fn unpack_extension<EF: KoalaBearExtension, B: OwnedBuffer<EF>>(vec: &[EFPac
     })
 }
 
-pub const fn packing_log_width<EF: Field>() -> usize {
+pub const fn packing_log_width<EF: Field>() -> usize
+where
+    PF<EF>: HasPacking,
+{
     packing_width::<EF>().ilog2() as usize
 }
 
-pub const fn packing_width<EF: Field>() -> usize {
+pub const fn packing_width<EF: Field>() -> usize
+where
+    PF<EF>: HasPacking,
+{
     PFPacking::<EF>::WIDTH
 }
 
-pub const fn must_unpack_multilinears<EF: Field>(n_vars: usize) -> bool {
+pub const fn must_unpack_multilinears<EF: Field>(n_vars: usize) -> bool
+where
+    PF<EF>: HasPacking,
+{
     n_vars <= 1 + packing_log_width::<EF>()
 }
 

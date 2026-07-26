@@ -633,9 +633,6 @@ pub trait Field:
     + Copy
     + Div<Self, Output = Self>
     + DivAssign
-    + Add<Self::Packing, Output = Self::Packing>
-    + Sub<Self::Packing, Output = Self::Packing>
-    + Mul<Self::Packing, Output = Self::Packing>
     + Eq
     + Hash
     + Send
@@ -644,8 +641,6 @@ pub trait Field:
     + Serialize
     + DeserializeOwned
 {
-    type Packing: PackedField<Scalar = Self>;
-
     /// A generator of this field's multiplicative group.
     const GENERATOR: Self;
 
@@ -677,33 +672,6 @@ pub trait Field:
     #[must_use]
     fn inverse(&self) -> Self {
         self.try_inverse().expect("Tried to invert zero")
-    }
-
-    /// Add two slices of field elements together, returning the result in the first slice.
-    ///
-    /// Makes use of packing to speed up the addition.
-    ///
-    /// This is optimal for cases where the two slices are small to medium length. E.g. between
-    /// `F::Packing::WIDTH` and roughly however many elements fit in a cache line.
-    ///
-    /// For larger slices, it's likely worthwhile to use parallelization before calling this.
-    /// Similarly if you need to add a large number of slices together, it's best to
-    /// break them into small chunks and call this on the smaller chunks.
-    ///
-    /// # Panics
-    /// The function will panic if the lengths of the two slices are not equal.
-    #[inline]
-    fn add_slices(slice_1: &mut [Self], slice_2: &[Self]) {
-        let (shorts_1, suffix_1) = Self::Packing::pack_slice_with_suffix_mut(slice_1);
-        let (shorts_2, suffix_2) = Self::Packing::pack_slice_with_suffix(slice_2);
-        debug_assert_eq!(shorts_1.len(), shorts_2.len());
-        debug_assert_eq!(suffix_1.len(), suffix_2.len());
-        for (x_1, &x_2) in shorts_1.iter_mut().zip(shorts_2) {
-            *x_1 += x_2;
-        }
-        for (x_1, &x_2) in suffix_1.iter_mut().zip(suffix_2) {
-            *x_1 += x_2;
-        }
     }
 
     /// The number of bits required to define an element of this field.
@@ -799,8 +767,6 @@ pub trait PrimeField32: PrimeField64 {
 ///
 /// It also provides a type which handles packed vectors of extension field elements.
 pub trait ExtensionField<Base: Field>: Field + Algebra<Base> + BasedVectorSpace<Base> {
-    type ExtensionPacking: PackedFieldExtension<Base, Self> + 'static + Copy + Send + Sync;
-
     /// Determine if the given element lies in the base field.
     #[must_use]
     fn is_in_basefield(&self) -> bool;
@@ -811,10 +777,21 @@ pub trait ExtensionField<Base: Field>: Field + Algebra<Base> + BasedVectorSpace<
     fn as_base(&self) -> Option<Base>;
 }
 
-// Every field is trivially a one dimensional extension over itself.
-impl<F: Field> ExtensionField<F> for F {
-    type ExtensionPacking = F::Packing;
+/// An extension field whose elements can be SIMD-packed.
+///
+/// Split out of `ExtensionField` for the same reason `HasPacking` is split out of `Field`:
+/// `PackedFieldExtension` names `ExtensionField`, so declaring the packing here would make the two
+/// mutually recursive and unliftable.
+pub trait HasExtensionPacking<Base: HasPacking>: ExtensionField<Base> {
+    type ExtensionPacking: PackedFieldExtension<Base, Self> + 'static + Copy + Send + Sync;
+}
 
+// Every field is trivially a one dimensional extension over itself.
+impl<F: HasPacking> HasExtensionPacking<F> for F {
+    type ExtensionPacking = F::Packing;
+}
+
+impl<F: Field> ExtensionField<F> for F {
     #[inline]
     fn is_in_basefield(&self) -> bool {
         true
@@ -823,6 +800,42 @@ impl<F: Field> ExtensionField<F> for F {
     #[inline]
     fn as_base(&self) -> Option<F> {
         Some(*self)
+    }
+}
+
+/// A field whose elements can be SIMD-packed.
+///
+/// Kept separate from `Field` so that `Field` does not name `PackedField`. Since
+/// `PackedField::Scalar: Field`, having `Field::Packing` made the two traits mutually recursive,
+/// which stops Charon from lifting the associated type and stops Aeneas from extracting either.
+pub trait HasPacking: Field {
+    type Packing: PackedField<Scalar = Self>;
+
+    /// Add two slices of field elements together, returning the result in the first slice.
+    ///
+    /// Makes use of packing to speed up the addition.
+    ///
+    /// This is optimal for cases where the two slices are small to medium length. E.g. between
+    /// `F::Packing::WIDTH` and roughly however many elements fit in a cache line.
+    ///
+    /// For larger slices, it's likely worthwhile to use parallelization before calling this.
+    /// Similarly if you need to add a large number of slices together, it's best to
+    /// break them into small chunks and call this on the smaller chunks.
+    ///
+    /// # Panics
+    /// The function will panic if the lengths of the two slices are not equal.
+    #[inline]
+    fn add_slices(slice_1: &mut [Self], slice_2: &[Self]) {
+        let (shorts_1, suffix_1) = Self::Packing::pack_slice_with_suffix_mut(slice_1);
+        let (shorts_2, suffix_2) = Self::Packing::pack_slice_with_suffix(slice_2);
+        debug_assert_eq!(shorts_1.len(), shorts_2.len());
+        debug_assert_eq!(suffix_1.len(), suffix_2.len());
+        for (x_1, &x_2) in shorts_1.iter_mut().zip(shorts_2) {
+            *x_1 += x_2;
+        }
+        for (x_1, &x_2) in suffix_1.iter_mut().zip(suffix_2) {
+            *x_1 += x_2;
+        }
     }
 }
 

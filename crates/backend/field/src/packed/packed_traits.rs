@@ -7,7 +7,7 @@ use core::ops::{Div, DivAssign};
 use core::{array, slice};
 
 use crate::field::Field;
-use crate::{Algebra, BasedVectorSpace, ExtensionField, Powers, PrimeCharacteristicRing};
+use crate::{Algebra, BasedVectorSpace, ExtensionField, HasPacking, Powers, PrimeCharacteristicRing};
 
 /// A trait to constrain types that can be packed into a packed value.
 ///
@@ -326,7 +326,7 @@ pub unsafe trait PackedFieldPow2: PackedField {
 ///
 /// This is interpreted by taking a transpose to get `[[F; D]; W]` which can then be reinterpreted
 /// as `[EF; W]` by making use of the chosen basis `B` again.
-pub trait PackedFieldExtension<BaseField: Field, ExtField: ExtensionField<BaseField>>:
+pub trait PackedFieldExtension<BaseField: HasPacking, ExtField: ExtensionField<BaseField>>:
     Algebra<ExtField> + Algebra<BaseField::Packing> + BasedVectorSpace<BaseField::Packing>
 {
     /// Given a slice of extension field `EF` elements of length `W`,
@@ -416,7 +416,7 @@ unsafe impl<F: Field> PackedFieldPow2 for F {
     }
 }
 
-impl<F: Field> PackedFieldExtension<F, F> for F::Packing {
+impl<F: HasPacking> PackedFieldExtension<F, F> for F::Packing {
     #[inline]
     fn from_ext_slice(ext_slice: &[F]) -> Self {
         *F::Packing::from_slice(ext_slice)

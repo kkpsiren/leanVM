@@ -1,13 +1,13 @@
 use std::hint::black_box;
 use std::time::Instant;
 
-use field::Field;
+use field::HasPacking;
 use field::PackedValue;
 use field::PrimeCharacteristicRing;
 
 use crate::{KoalaBear, default_koalabear_poseidon1_16};
 
-type FPacking = <KoalaBear as Field>::Packing;
+type FPacking = <KoalaBear as HasPacking>::Packing;
 const PACKING_WIDTH: usize = <FPacking as PackedValue>::WIDTH;
 
 #[test]

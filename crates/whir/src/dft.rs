@@ -26,7 +26,7 @@ Credits: https://github.com/Plonky3/Plonky3 (radix_2_small_batch.rs)
 use std::sync::RwLock;
 
 use field::PackedValue;
-use field::{BasedVectorSpace, Field, PackedField, TwoAdicField};
+use field::{BasedVectorSpace, HasPacking, PackedField, TwoAdicField};
 use zk_alloc::ArenaVec;
 
 use crate::utils::{flatten_to_base_arena, reconstitute_from_base_arena};
@@ -44,7 +44,7 @@ pub(crate) struct EvalsDft<F> {
     twiddles: RwLock<Vec<Vec<F>>>,
 }
 
-impl<F: TwoAdicField> EvalsDft<F> {
+impl<F: TwoAdicField + HasPacking> EvalsDft<F> {
     pub(crate) fn max_n_twiddles(&self) -> usize {
         let guard = self.twiddles.read().unwrap();
         1 << guard.len()
@@ -75,7 +75,7 @@ impl<F: TwoAdicField> EvalsDft<F> {
 
 impl<F> EvalsDft<F>
 where
-    F: TwoAdicField,
+    F: TwoAdicField + HasPacking,
 {
     pub(crate) fn dft_batch_by_evals<V: AsRef<[F]> + AsMut<[F]> + Send + Sync>(
         &self,
@@ -165,7 +165,7 @@ where
 /// Basically identical to [par_remaining_layers] but in reverse and we
 /// also divide by the height.
 #[inline]
-fn par_initial_layers<F: Field>(mat: &mut [F], chunk_size: usize, root_table: &[Vec<F>], width: usize) {
+fn par_initial_layers<F: HasPacking>(mat: &mut [F], chunk_size: usize, root_table: &[Vec<F>], width: usize) {
     let n_full = mat.len() / chunk_size * chunk_size;
     parallel::par_chunks_mut(&mut mat[..n_full], chunk_size, |_, chunk| {
         initial_layers(chunk, root_table, width);
@@ -173,7 +173,7 @@ fn par_initial_layers<F: Field>(mat: &mut [F], chunk_size: usize, root_table: &[
 }
 
 #[inline]
-fn initial_layers<F: Field>(chunk: &mut [F], root_table: &[Vec<F>], width: usize) {
+fn initial_layers<F: HasPacking>(chunk: &mut [F], root_table: &[Vec<F>], width: usize) {
     for twiddles in root_table.iter().rev() {
         let twiddles: &[EvalsButterfly<F>] = unsafe { as_base_slice(twiddles) };
         dft_layer(chunk, twiddles, width);
@@ -181,7 +181,7 @@ fn initial_layers<F: Field>(chunk: &mut [F], root_table: &[Vec<F>], width: usize
 }
 
 #[inline]
-fn dft_layer<F: Field, B: Butterfly<F>>(vec: &mut [F], twiddles: &[B], width: usize) {
+fn dft_layer<F: HasPacking, B: Butterfly<F>>(vec: &mut [F], twiddles: &[B], width: usize) {
     vec.chunks_exact_mut(twiddles.len() * 2 * width).for_each(|block| {
         let (left, right) = block.split_at_mut(twiddles.len() * width);
         left.chunks_exact_mut(width)
@@ -199,7 +199,7 @@ fn dft_layer<F: Field, B: Butterfly<F>>(vec: &mut [F], twiddles: &[B], width: us
 }
 
 #[inline]
-fn dft_layer_par<F: Field, B: Butterfly<F>>(vec: &mut [F], twiddles: &[B], width: usize) {
+fn dft_layer_par<F: HasPacking, B: Butterfly<F>>(vec: &mut [F], twiddles: &[B], width: usize) {
     let ts = twiddles.len();
     let block_size = 2 * ts * width;
     debug_assert!(vec.len().is_multiple_of(block_size),);
@@ -226,7 +226,7 @@ fn dft_layer_par<F: Field, B: Butterfly<F>>(vec: &mut [F], twiddles: &[B], width
 /// - `twiddles_large`: Precomputed twiddle factors for the layer with the largest block size.
 /// - `multi_butterfly`: Multi-layer butterfly which applies the two layers in the correct order.
 #[inline]
-fn dft_layer_par_double<F: Field, B: Butterfly<F>, M: MultiLayerButterfly<F, B>>(
+fn dft_layer_par_double<F: HasPacking, B: Butterfly<F>, M: MultiLayerButterfly<F, B>>(
     mat: &mut MatrixViewMut<'_, F>,
     twiddles_small: &[B],
     twiddles_large: &[B],
@@ -269,7 +269,7 @@ fn dft_layer_par_double<F: Field, B: Butterfly<F>, M: MultiLayerButterfly<F, B>>
 /// - `twiddles_large`: Precomputed twiddle factors for the layer with the largest block size.
 /// - `multi_butterfly`: Multi-layer butterfly which applies the three layers in the correct order.
 #[inline]
-fn dft_layer_par_triple<F: Field, B: Butterfly<F>, M: MultiLayerButterfly<F, B>>(
+fn dft_layer_par_triple<F: HasPacking, B: Butterfly<F>, M: MultiLayerButterfly<F, B>>(
     mat: &mut MatrixViewMut<'_, F>,
     twiddles_small: &[B],
     twiddles_med: &[B],
@@ -322,7 +322,7 @@ fn dft_layer_par_triple<F: Field, B: Butterfly<F>, M: MultiLayerButterfly<F, B>>
 ///
 /// This function is used to correct for the fact that the total number of layers
 /// may not be a multiple of `LAYERS_PER_GROUP`.
-fn dft_layer_par_extra_layers<F: Field, B: Butterfly<F>, M: MultiLayerButterfly<F, B>>(
+fn dft_layer_par_extra_layers<F: HasPacking, B: Butterfly<F>, M: MultiLayerButterfly<F, B>>(
     mat: &mut MatrixViewMut<'_, F>,
     root_table: &[Vec<F>],
     multi_layer: M,
@@ -355,7 +355,7 @@ type DoubleLayerBlockDecomposition<'a, F> = ((&'a mut [F], &'a mut [F]), (&'a mu
 
 /// Performs an FFT layer on the sub-blocks using a single twiddle factor.
 #[inline]
-fn fft_double_layer_single_twiddle<F: Field, Fly: Butterfly<F>>(
+fn fft_double_layer_single_twiddle<F: HasPacking, Fly: Butterfly<F>>(
     block: &mut DoubleLayerBlockDecomposition<'_, F>,
     butterfly: Fly,
 ) {
@@ -364,7 +364,7 @@ fn fft_double_layer_single_twiddle<F: Field, Fly: Butterfly<F>>(
 }
 
 #[inline]
-fn fft_double_layer_double_twiddle<F: Field, Fly0: Butterfly<F>, Fly1: Butterfly<F>>(
+fn fft_double_layer_double_twiddle<F: HasPacking, Fly0: Butterfly<F>, Fly1: Butterfly<F>>(
     block: &mut DoubleLayerBlockDecomposition<'_, F>,
     fly0: Fly0,
     fly1: Fly1,
@@ -381,7 +381,7 @@ type TripleLayerBlockDecomposition<'a, F> = (
 
 /// Performs an FFT layer on the sub-blocks using a single twiddle factor.
 #[inline]
-fn fft_triple_layer_single_twiddle<F: Field, Fly: Butterfly<F>>(
+fn fft_triple_layer_single_twiddle<F: HasPacking, Fly: Butterfly<F>>(
     block: &mut TripleLayerBlockDecomposition<'_, F>,
     butterfly: Fly,
 ) {
@@ -392,7 +392,7 @@ fn fft_triple_layer_single_twiddle<F: Field, Fly: Butterfly<F>>(
 }
 
 #[inline]
-fn fft_triple_layer_double_twiddle<F: Field, Fly0: Butterfly<F>, Fly1: Butterfly<F>>(
+fn fft_triple_layer_double_twiddle<F: HasPacking, Fly0: Butterfly<F>, Fly1: Butterfly<F>>(
     block: &mut TripleLayerBlockDecomposition<'_, F>,
     fly0: Fly0,
     fly1: Fly1,
@@ -404,7 +404,7 @@ fn fft_triple_layer_double_twiddle<F: Field, Fly0: Butterfly<F>, Fly1: Butterfly
 }
 
 #[inline]
-fn fft_triple_layer_quad_twiddle<F: Field, Fly: Butterfly<F>>(
+fn fft_triple_layer_quad_twiddle<F: HasPacking, Fly: Butterfly<F>>(
     block: &mut TripleLayerBlockDecomposition<'_, F>,
     fly0: Fly,
     fly1: Fly,
@@ -433,7 +433,7 @@ fn estimate_num_rows_in_l1<T: Sized>(height: usize, width: usize) -> usize {
     (workload_size::<T>() / width).next_power_of_two().min(height) // Ensure we don't exceed the height of the matrix.
 }
 
-trait MultiLayerButterfly<F: Field, B: Butterfly<F>>: Copy + Send + Sync {
+trait MultiLayerButterfly<F: HasPacking, B: Butterfly<F>>: Copy + Send + Sync {
     fn apply_2_layers(
         &self,
         chunk_decomposition: DoubleLayerBlockDecomposition<'_, F>,
@@ -455,7 +455,7 @@ trait MultiLayerButterfly<F: Field, B: Butterfly<F>>: Copy + Send + Sync {
 #[derive(Debug, Clone, Copy)]
 struct MyMultiLayerButterfly;
 
-impl<F: Field> MultiLayerButterfly<F, EvalsButterfly<F>> for MyMultiLayerButterfly {
+impl<F: HasPacking> MultiLayerButterfly<F, EvalsButterfly<F>> for MyMultiLayerButterfly {
     #[inline]
     fn apply_2_layers(
         &self,
@@ -497,7 +497,7 @@ impl<F: Field> MultiLayerButterfly<F, EvalsButterfly<F>> for MyMultiLayerButterf
     }
 }
 
-pub trait Butterfly<F: Field>: Copy + Send + Sync {
+pub trait Butterfly<F: HasPacking>: Copy + Send + Sync {
     fn apply<PF: PackedField<Scalar = F>>(&self, x_1: PF, x_2: PF) -> (PF, PF);
     #[inline]
     fn apply_in_place<PF: PackedField<Scalar = F>>(&self, x_1: &mut PF, x_2: &mut PF) {
@@ -522,7 +522,7 @@ pub trait Butterfly<F: Field>: Copy + Send + Sync {
 #[derive(Copy, Clone, Debug)]
 pub struct TwiddleFreeEvalsButterfly;
 
-impl<F: Field> Butterfly<F> for TwiddleFreeEvalsButterfly {
+impl<F: HasPacking> Butterfly<F> for TwiddleFreeEvalsButterfly {
     #[inline]
     fn apply<PF: PackedField<Scalar = F>>(&self, x_1: PF, x_2: PF) -> (PF, PF) {
         (x_2, x_1.double() - x_2)
@@ -533,7 +533,7 @@ impl<F: Field> Butterfly<F> for TwiddleFreeEvalsButterfly {
 #[repr(transparent)]
 pub struct EvalsButterfly<F>(pub F);
 
-impl<F: Field> Butterfly<F> for EvalsButterfly<F> {
+impl<F: HasPacking> Butterfly<F> for EvalsButterfly<F> {
     #[inline]
     fn apply<PF: PackedField<Scalar = F>>(&self, x_1: PF, x_2: PF) -> (PF, PF) {
         // Use fused_sub_mul to skip intermediate modular reduction on (x_2 - x_1)

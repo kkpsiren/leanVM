@@ -1,13 +1,22 @@
-use field::{ExtensionField, Field, PrimeCharacteristicRing};
+use field::{ExtensionField, Field, HasExtensionPacking, HasPacking, PrimeCharacteristicRing};
 
 use crate::KoalaBear;
 
 pub trait KoalaBearExtension:
-    Field + ExtensionField<KoalaBear> + PrimeCharacteristicRing<PrimeSubfield = KoalaBear>
+    Field
+    + ExtensionField<KoalaBear>
+    + PrimeCharacteristicRing<PrimeSubfield = KoalaBear>
+    + HasPacking
+    + HasExtensionPacking<KoalaBear>
 {
 }
 
-impl<T: Field + ExtensionField<KoalaBear> + PrimeCharacteristicRing<PrimeSubfield = KoalaBear>> KoalaBearExtension
-    for T
+impl<
+    T: Field
+        + ExtensionField<KoalaBear>
+        + PrimeCharacteristicRing<PrimeSubfield = KoalaBear>
+        + HasPacking
+        + HasExtensionPacking<KoalaBear>,
+> KoalaBearExtension for T
 {
 }

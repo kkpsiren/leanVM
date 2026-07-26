@@ -1,4 +1,4 @@
-use field::{ExtensionField, Field, dot_product};
+use field::{ExtensionField, Field, HasExtensionPacking, HasPacking, dot_product};
 use utils::*;
 
 use crate::{EFPacking, EvaluationsList as _, KoalaBearExtension, MultilinearPoint, PFPacking};
@@ -36,7 +36,13 @@ pub fn padd_with_zero_to_next_power_of_two<F: Field>(pol: &[F]) -> Vec<F> {
     padded
 }
 
-pub fn evaluate_as_larger_multilinear_pol<F: Field, EF: ExtensionField<F>>(pol: &[F], point: &[EF]) -> EF {
+pub fn evaluate_as_larger_multilinear_pol<
+    F: HasPacking,
+    EF: ExtensionField<F> + HasPacking + HasExtensionPacking<F>,
+>(
+    pol: &[F],
+    point: &[EF],
+) -> EF {
     // [[-pol-] 0 0 0 0 ... 0 0 0 0 0] evaluated at point
     let pol_n_vars = log2_strict_usize(pol.len());
     assert!(point.len() >= pol_n_vars);

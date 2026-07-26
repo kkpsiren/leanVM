@@ -9,7 +9,8 @@ use core::iter::{Product, Sum};
 use core::ops::{Add, AddAssign, Div, DivAssign, Mul, MulAssign, Neg, Sub, SubAssign};
 
 use field::{
-    Algebra, BasedVectorSpace, ExtensionField, Field, Packable, PrimeCharacteristicRing, TwoAdicField, field_to_array,
+    Algebra, BasedVectorSpace, ExtensionField, Field, HasExtensionPacking, HasPacking, Packable,
+    PrimeCharacteristicRing, TwoAdicField, field_to_array,
 };
 use rand::distr::StandardUniform;
 use rand::prelude::Distribution;
@@ -89,9 +90,11 @@ impl<F: QuinticExtendable> BasedVectorSpace<F> for QuinticExtensionField<F> {
     }
 }
 
-impl<F: QuinticExtendable> ExtensionField<F> for QuinticExtensionField<F> {
+impl<F: QuinticExtendable> HasExtensionPacking<F> for QuinticExtensionField<F> {
     type ExtensionPacking = PackedQuinticExtensionField<F, F::Packing>;
+}
 
+impl<F: QuinticExtendable> ExtensionField<F> for QuinticExtensionField<F> {
     #[inline]
     fn is_in_basefield(&self) -> bool {
         self.value[1..].iter().all(F::is_zero)
@@ -187,18 +190,8 @@ where
 
 impl<F: QuinticExtendable> Algebra<F> for QuinticExtensionField<F> {}
 
-impl<F: QuinticExtendable> Field for QuinticExtensionField<F> {
+impl<F: QuinticExtendable> HasPacking for QuinticExtensionField<F> {
     type Packing = Self;
-
-    const GENERATOR: Self = Self::new(F::EXT_GENERATOR);
-
-    fn try_inverse(&self) -> Option<Self> {
-        if self.is_zero() {
-            return None;
-        }
-
-        Some(quintic_inv(self))
-    }
 
     #[inline]
     fn add_slices(slice_1: &mut [Self], slice_2: &[Self]) {
@@ -211,6 +204,18 @@ impl<F: QuinticExtendable> Field for QuinticExtensionField<F> {
 
             F::add_slices(base_slice_1, base_slice_2);
         }
+    }
+}
+
+impl<F: QuinticExtendable> Field for QuinticExtensionField<F> {
+    const GENERATOR: Self = Self::new(F::EXT_GENERATOR);
+
+    fn try_inverse(&self) -> Option<Self> {
+        if self.is_zero() {
+            return None;
+        }
+
+        Some(quintic_inv(self))
     }
 
     #[inline]

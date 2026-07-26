@@ -13,8 +13,8 @@ use core::ops::{Add, AddAssign, Div, DivAssign, Mul, MulAssign, Neg, Sub, SubAss
 use field::integers::QuotientMap;
 use field::op_assign_macros::{impl_add_assign, impl_div_methods, impl_mul_methods, impl_sub_assign};
 use field::{
-    Field, InjectiveMonomial, Packable, PermutationMonomial, PrimeCharacteristicRing, PrimeField, PrimeField32,
-    PrimeField64, TwoAdicField, quotient_map_small_int,
+    Field, HasPacking, InjectiveMonomial, Packable, PermutationMonomial, PrimeCharacteristicRing, PrimeField,
+    PrimeField32, PrimeField64, TwoAdicField, quotient_map_small_int,
 };
 use rand::Rng;
 use rand::distr::{Distribution, StandardUniform};
@@ -370,7 +370,7 @@ impl<FP: FieldParameters + RelativelyPrimePower<D>, const D: u64> PermutationMon
     }
 }
 
-impl<FP: FieldParameters> Field for MontyField31<FP> {
+impl<FP: FieldParameters> HasPacking for MontyField31<FP> {
     #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
     type Packing = crate::PackedMontyField31Neon<FP>;
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2", not(target_feature = "avx512f")))]
@@ -383,7 +383,9 @@ impl<FP: FieldParameters> Field for MontyField31<FP> {
         all(target_arch = "x86_64", target_feature = "avx512f"),
     )))]
     type Packing = Self;
+}
 
+impl<FP: FieldParameters> Field for MontyField31<FP> {
     const GENERATOR: Self = FP::MONTY_GEN;
 
     fn try_inverse(&self) -> Option<Self> {
