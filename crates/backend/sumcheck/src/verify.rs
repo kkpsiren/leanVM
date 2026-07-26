@@ -1,7 +1,7 @@
 use fiat_shamir::*;
 use poly::*;
 
-pub fn sumcheck_verify<EF: KoalaBearExtension>(
+pub fn sumcheck_verify<EF: KoalaBearExtensionNoPacking>(
     verifier_state: &mut impl FSVerifier<EF>,
     n_vars: usize,
     degree: usize,

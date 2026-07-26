@@ -5,4 +5,4 @@ pub type FPacking<F> = <F as HasPacking>::Packing;
 pub type PFPacking<F> = <PF<F> as HasPacking>::Packing;
 pub type EFPacking<EF> = <EF as HasExtensionPacking<PF<EF>>>::ExtensionPacking;
 
-pub use koala_bear::KoalaBearExtension;
+pub use koala_bear::{KoalaBearExtension, KoalaBearExtensionNoPacking};

@@ -1,4 +1,4 @@
-use koala_bear::KoalaBearExtension;
+use koala_bear::{KoalaBearExtension, KoalaBearExtensionNoPacking};
 
 use crate::{
     MerkleOpening, MerklePath, PF, ProofError, ProofResult, flatten_scalars_to_base, pack_scalars_to_extension,
@@ -43,7 +43,7 @@ pub trait FSProver<EF: KoalaBearExtension>: ChallengeSampler<EF> {
     }
 }
 
-pub trait FSVerifier<EF: KoalaBearExtension>: ChallengeSampler<EF> {
+pub trait FSVerifier<EF: KoalaBearExtensionNoPacking>: ChallengeSampler<EF> {
     fn state(&self) -> String;
     fn next_base_scalars_vec(&mut self, n: usize) -> Result<Vec<PF<EF>>, ProofError>;
     fn observe_scalars(&mut self, scalars: &[PF<EF>]);

@@ -8,9 +8,6 @@ use core::iter::{Product, Sum};
 use core::ops::{Add, AddAssign, Div, DivAssign, Mul, MulAssign, Neg, Sub, SubAssign};
 use core::slice;
 
-use serde::Serialize;
-use serde::de::DeserializeOwned;
-
 use crate::exponentiation::bits_u64;
 use crate::integers::{QuotientMap, from_integer_types};
 use crate::packed::PackedField;
@@ -627,19 +624,7 @@ impl<R: PrimeCharacteristicRing> Algebra<R> for R {}
 /// A ring is a field if every element `x` has a unique multiplicative inverse `x^{-1}`
 /// which satisfies `x * x^{-1} = F::ONE`.
 pub trait Field:
-    Algebra<Self>
-    + Packable
-    + 'static
-    + Copy
-    + Div<Self, Output = Self>
-    + DivAssign
-    + Eq
-    + Hash
-    + Send
-    + Sync
-    + Display
-    + Serialize
-    + DeserializeOwned
+    Algebra<Self> + Packable + 'static + Copy + Div<Self, Output = Self> + DivAssign + Eq + Hash + Send + Sync + Display
 {
     /// A generator of this field's multiplicative group.
     const GENERATOR: Self;
