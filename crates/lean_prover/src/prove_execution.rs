@@ -16,6 +16,30 @@ pub struct ExecutionProof {
     pub metadata: Option<ExecutionMetadata>,
 }
 
+/// Σ_j alpha^{2j}·(±numerator_j) + alpha^{2j+1}·(c − denominator_j) over the table's Column buses
+/// (sign = the bus direction), i.e. the initial claim of the table's AIR sumcheck.
+pub fn column_buses_initial_value(
+    table: &Table,
+    numerators: &[EF],
+    denominators: &[EF],
+    alpha_powers: &[EF],
+    logup_c: EF,
+) -> EF {
+    let directions = column_bus_directions(&table.bus_interactions());
+    assert_eq!(numerators.len(), directions.len(), "{}: bus claims vs Column buses", table.name());
+    assert_eq!(denominators.len(), directions.len());
+    let mut acc = EF::ZERO;
+    for (j, dir) in directions.iter().enumerate() {
+        let signed = numerators[j]
+            * match dir {
+                BusDirection::Pull => EF::NEG_ONE,
+                BusDirection::Push => EF::ONE,
+            };
+        acc += alpha_powers[2 * j] * signed + alpha_powers[2 * j + 1] * (logup_c - denominators[j]);
+    }
+    acc
+}
+
 pub fn prove_execution(
     bytecode: &Bytecode,
     public_input: &[F; PUBLIC_INPUT_LEN],
@@ -108,6 +132,23 @@ pub fn prove_execution(
         Ok(())
     })?;
 
+    // Range-section multiplicities: count every range push (One-bus into a range section) per value.
+    let range_accs: Vec<Vec<F>> = info_span!("Building range access counts").in_scope(|| {
+        let mut accs: Vec<Vec<F>> = RANGE_SECTIONS.iter().map(|s| vec![F::ZERO; 1 << s.log_rows]).collect();
+        for (table, trace) in &traces {
+            for bus in table.bus_interactions() {
+                let Some(s) = bus.range_section() else { continue };
+                let BusData::Column(col) = bus.data[0] else { panic!("range push data must be a column") };
+                let n = 1 << RANGE_SECTIONS[s].log_rows;
+                for v in trace.columns[col].iter() {
+                    let v = v.as_canonical_u32() as usize;
+                    if v < n { accs[s][v] += F::ONE; } // an out-of-range value simply has no matching row: the proof fails
+                }
+            }
+        }
+        accs
+    });
+
     // 1st Commitment
     let stacked_pcs_witness = stack_polynomials_and_commit(
         &mut prover_state,
@@ -115,6 +156,7 @@ pub fn prove_execution(
         &memory,
         &memory_acc,
         &bytecode_acc,
+        &range_accs,
         &traces,
     );
 
@@ -132,6 +174,7 @@ pub fn prove_execution(
         &memory_acc,
         bytecode.instructions_multilinear(),
         &bytecode_acc,
+        &range_accs,
         &traces,
     );
     let gkr_point = &logup_statements.gkr_point;
@@ -175,18 +218,16 @@ pub fn prove_execution(
     for (idx, table) in ALL_TABLES.iter().enumerate() {
         let log_n_rows = tables_log_heights[table];
         let n_constraints = table.n_constraints();
-        let bus_numerator_value = logup_statements.bus_numerators_values[table];
-        let bus_denominator_value = logup_statements.bus_denominators_values[table];
-        let signed_numerator = bus_numerator_value
-            * match table.bus_interactions()[0].direction {
-                BusDirection::Pull => EF::NEG_ONE,
-                BusDirection::Push => EF::ONE,
-            };
-        // Each table consumes a disjoint range of alpha powers; alpha^offset weights the bus
-        // numerator (multiplicity), alpha^{offset+1} weights the bus fingerprint, alpha^{offset+2..}
-        // weight the remaining AIR constraints.
-        let bus_final_value = air_alpha_powers[alpha_offset] * signed_numerator
-            + air_alpha_powers[alpha_offset + 1] * (logup_c - bus_denominator_value);
+        // Each table consumes a disjoint range of alpha powers; for its j-th Column-multiplicity bus,
+        // alpha^{offset+2j} weights the (signed) numerator and alpha^{offset+2j+1} the fingerprint;
+        // the remaining AIR constraints follow.
+        let bus_final_value = column_buses_initial_value(
+            table,
+            &logup_statements.bus_numerators_values[table],
+            &logup_statements.bus_denominators_values[table],
+            &air_alpha_powers[alpha_offset..alpha_offset + n_constraints],
+            logup_c,
+        );
 
         let eq_suffix = from_end(gkr_point, log_n_rows).to_vec();
 
@@ -228,7 +269,8 @@ pub fn prove_execution(
     let public_memory_random_point = MultilinearPoint(prover_state.sample_vec(log2_strict_usize(PUBLIC_INPUT_LEN)));
     let public_memory_eval = (&memory[..PUBLIC_INPUT_LEN]).evaluate(&public_memory_random_point);
 
-    let previous_statements = vec![
+    let max_table_n_vars = *tables_log_heights.values().max().unwrap();
+    let mut previous_statements = vec![
         SparseStatement::new(
             stacked_pcs_witness.stacked_n_vars,
             logup_statements.memory_and_acc_point,
@@ -251,6 +293,10 @@ pub fn prove_execution(
             )],
         ),
     ];
+    for (s, (pt, v)) in logup_statements.range_acc_evals.iter().enumerate() {
+        let off = range_acc_stacked_offset(log2_strict_usize(memory.len()), bytecode.log_size(), max_table_n_vars, s);
+        previous_statements.push(SparseStatement::new(stacked_pcs_witness.stacked_n_vars, pt.clone(), vec![SparseValue::new(off >> RANGE_SECTIONS[s].log_rows, *v)]));
+    }
 
     let global_statements_base = stacked_pcs_global_statements(
         stacked_pcs_witness.stacked_n_vars,

@@ -4,6 +4,7 @@ use crate::*;
 use backend::{Proof, RawProof, VerifierState};
 use lean_vm::*;
 use sub_protocols::*;
+use crate::prove_execution::column_buses_initial_value;
 
 #[derive(Debug, Clone)]
 pub struct ProofVerificationDetails {
@@ -112,15 +113,13 @@ pub fn verify_execution(
 
     for table in ALL_TABLES {
         let n_constraints = table.n_constraints();
-        let bus_numerator_value = logup_statements.bus_numerators_values[&table];
-        let bus_denominator_value = logup_statements.bus_denominators_values[&table];
-        let signed_numerator = bus_numerator_value
-            * match table.bus_interactions()[0].direction {
-                BusDirection::Pull => EF::NEG_ONE,
-                BusDirection::Push => EF::ONE,
-            };
-        initial_sum += air_alpha_powers[alpha_offset] * signed_numerator
-            + air_alpha_powers[alpha_offset + 1] * (logup_c - bus_denominator_value);
+        initial_sum += column_buses_initial_value(
+            &table,
+            &logup_statements.bus_numerators_values[&table],
+            &logup_statements.bus_denominators_values[&table],
+            &air_alpha_powers[alpha_offset..alpha_offset + n_constraints],
+            logup_c,
+        );
 
         let alpha_slice = air_alpha_powers[alpha_offset..alpha_offset + n_constraints].to_vec();
         verify_data.push(TableVerifyData {
@@ -173,7 +172,8 @@ pub fn verify_execution(
     let public_memory_random_point = MultilinearPoint(verifier_state.sample_vec(log2_strict_usize(public_input.len())));
     let public_memory_eval = public_input.evaluate(&public_memory_random_point);
 
-    let previous_statements = vec![
+    let max_table_n_vars = *table_n_vars.values().max().unwrap();
+    let mut previous_statements = vec![
         SparseStatement::new(
             parsed_commitment.num_variables,
             logup_statements.memory_and_acc_point,
@@ -196,6 +196,10 @@ pub fn verify_execution(
             )],
         ),
     ];
+    for (s, (pt, v)) in logup_statements.range_acc_evals.iter().enumerate() {
+        let off = range_acc_stacked_offset(log_memory, bytecode.log_size(), max_table_n_vars, s);
+        previous_statements.push(SparseStatement::new(parsed_commitment.num_variables, pt.clone(), vec![SparseValue::new(off >> RANGE_SECTIONS[s].log_rows, *v)]));
+    }
 
     let global_statements_base = stacked_pcs_global_statements(
         parsed_commitment.num_variables,

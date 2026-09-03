@@ -1683,6 +1683,28 @@ fn simplify_lines(
                             continue;
                         }
 
+                        // ed25519 tables: name(ptr_a, ptr_b, ptr_res)
+                        if function_name == lean_vm::ED_SIG_NAME || function_name == lean_vm::ED_DECOMPRESS_NAME {
+                            if !targets.is_empty() {
+                                return Err(format!("Precompile {function_name} should not return values, at {location}"));
+                            }
+                            if args.len() != 3 {
+                                return Err(format!("Precompile {function_name} expects 3 arguments (ptr_a, ptr_b, ptr_res), got {}, at {location}", args.len()));
+                            }
+                            let simplified_args = args
+                                .iter()
+                                .map(|arg| simplify_expr(ctx, state, const_malloc, arg, &mut res))
+                                .collect::<Result<Vec<_>, _>>()?;
+                            let data = if function_name == lean_vm::ED_SIG_NAME { PrecompileCompTimeArgs::EdSig } else { PrecompileCompTimeArgs::EdDecompress };
+                            res.push(SimpleLine::Precompile(PrecompileArgs {
+                                arg_0: simplified_args[0].clone(),
+                                arg_1: simplified_args[1].clone(),
+                                res: simplified_args[2].clone(),
+                                data,
+                            }));
+                            continue;
+                        }
+
                         // Special handling for poseidon16 precompile (7 variants).
                         if ALL_POSEIDON16_NAMES.contains(&function_name.as_str()) {
                             if !targets.is_empty() {

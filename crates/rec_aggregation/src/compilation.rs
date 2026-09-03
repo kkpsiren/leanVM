@@ -254,6 +254,19 @@ fn build_replacements(log_inner_bytecode: usize, bytecode_zero_eval: F) -> BTree
         "LOGUP_MEMORY_DOMAINSEP_PLACEHOLDER".to_string(),
         LOGUP_MEMORY_DOMAINSEP.to_string(),
     );
+    {
+        use lean_vm::{N_RANGE_SECTIONS, RANGE_LOG_TOTAL, RANGE_MIN_LOG_ALIGN, RANGE_SECTIONS};
+        let list = |f: &dyn Fn(usize) -> usize| format!("[{}]", (0..N_RANGE_SECTIONS).map(|s| f(s).to_string()).collect::<Vec<_>>().join(", "));
+        let offsets_div: Vec<usize> = { let mut off = 0; RANGE_SECTIONS.iter().map(|sec| { let d = off >> sec.log_rows; off += 1 << sec.log_rows; d }).collect() };
+        replacements.insert("N_RANGE_SECTIONS_PLACEHOLDER".to_string(), N_RANGE_SECTIONS.to_string());
+        replacements.insert("RANGE_LOG_TOTAL_PLACEHOLDER".to_string(), RANGE_LOG_TOTAL.to_string());
+        replacements.insert("RANGE_MIN_LOG_ALIGN_PLACEHOLDER".to_string(), RANGE_MIN_LOG_ALIGN.to_string());
+        replacements.insert("RANGE_SECTION_LOG_ROWS_PLACEHOLDER".to_string(), list(&|s| RANGE_SECTIONS[s].log_rows));
+        replacements.insert("RANGE_SECTION_BITS_PLACEHOLDER".to_string(), list(&|s| RANGE_SECTIONS[s].bits));
+        replacements.insert("RANGE_SECTION_DOMSEPS_PLACEHOLDER".to_string(), list(&|s| RANGE_SECTIONS[s].domainsep));
+        replacements.insert("RANGE_SECTION_DEAD_DOMSEPS_PLACEHOLDER".to_string(), list(&|s| RANGE_SECTIONS[s].dead_domainsep));
+        replacements.insert("RANGE_SECTION_OFFSETS_DIV_PLACEHOLDER".to_string(), list(&|s| offsets_div[s]));
+    }
     replacements.insert(
         "LOGUP_BYTECODE_DOMAINSEP_PLACEHOLDER".to_string(),
         LOGUP_BYTECODE_DOMAINSEP.to_string(),
@@ -278,7 +291,19 @@ fn build_replacements(log_inner_bytecode: usize, bytecode_zero_eval: F) -> BTree
     let mut n_air_shift_columns = vec![];
     let mut n_air_constraints = vec![];
     let mut one_buses_all_cols = vec![];
+    let mut n_column_buses = vec![];
+    let mut column_bus_pull = vec![];
+    let mut column_bus_offsets = vec![];
+    let mut column_bus_total = 0usize;
     for table in ALL_TABLES {
+        let dirs = column_bus_directions(&table.bus_interactions());
+        column_bus_offsets.push(column_bus_total.to_string());
+        column_bus_total += dirs.len();
+        n_column_buses.push(dirs.len().to_string());
+        column_bus_pull.push(format!(
+            "[{}]",
+            dirs.iter().map(|d| if matches!(d, BusDirection::Pull) { "1" } else { "0" }).collect::<Vec<_>>().join(", ")
+        ));
         let mut table_domseps = vec![];
         let mut table_data_cols = vec![];
         let mut table_data_offsets = vec![];
@@ -347,6 +372,10 @@ fn build_replacements(log_inner_bytecode: usize, bytecode_zero_eval: F) -> BTree
         "ONE_BUSES_DOMSEPS_PLACEHOLDER".to_string(),
         format!("[{}]", one_buses_domseps.join(", ")),
     );
+    replacements.insert("N_COLUMN_BUSES_PLACEHOLDER".to_string(), format!("[{}]", n_column_buses.join(", ")));
+    replacements.insert("COLUMN_BUS_PULL_PLACEHOLDER".to_string(), format!("[{}]", column_bus_pull.join(", ")));
+    replacements.insert("COLUMN_BUS_OFFSETS_PLACEHOLDER".to_string(), format!("[{}]", column_bus_offsets.join(", ")));
+    replacements.insert("TOTAL_COLUMN_BUSES_PLACEHOLDER".to_string(), column_bus_total.to_string());
     replacements.insert(
         "ONE_BUSES_DATA_COLS_PLACEHOLDER".to_string(),
         format!("[{}]", one_buses_data_cols.join(", ")),
@@ -466,6 +495,8 @@ fn all_air_evals_in_zk_dsl() -> String {
     res += &air_eval_in_zk_dsl(ExecutionTable::<false> {});
     res += &air_eval_in_zk_dsl(ExtensionOpPrecompile::<false> {});
     res += &air_eval_in_zk_dsl(Poseidon16Precompile::<false> {});
+    res += &air_eval_in_zk_dsl(lean_vm::ed25519::EdSigTable::<false> {});
+    res += &air_eval_in_zk_dsl(lean_vm::ed25519::EdDecompressTable::<false> {});
     res
 }
 
@@ -516,9 +547,7 @@ fn air_eval_in_zk_dsl<T: TableT>(table: T) -> String
 where
     T::ExtraData: Default,
 {
-    let (constraints, bus_multiplicity, bus_data) = get_symbolic_constraints_and_bus_data_values::<F, _>(&table);
-    // `bus_data`'s last entry is the domainsep (logup domain separation).
-    let (bus_domainsep, bus_real_data) = bus_data.split_last().unwrap();
+    let (constraints, buses) = get_symbolic_constraints_and_bus_data_values::<F, _>(&table);
     let mut ctx = AirCodegenCtx::new();
 
     let mut res = format!(
@@ -534,40 +563,51 @@ where
         eval_air_constraint(*constraint, Some(&dest), &mut ctx, &mut res);
     }
 
-    // first: bus data
-    let multiplicity = eval_air_constraint(bus_multiplicity, None, &mut ctx, &mut res);
-    res += &format!("\n    buff = Array(DIM * {})", bus_real_data.len());
-    for (i, data) in bus_real_data.iter().enumerate() {
-        let data_str = eval_air_constraint(*data, None, &mut ctx, &mut res);
-        res += &format!("\n    copy_ef({}, buff + DIM * {})", data_str, i);
+    // Column buses, in order: the j-th bus's multiplicity → alpha slot 2j, its fingerprint → slot 2j+1;
+    // the AIR constraints follow at slot 2·n_buses. (`air_alpha_powers` is this table's alpha slice.)
+    let alpha_at = |slot: usize| if slot == 0 { "air_alpha_powers".to_string() } else { format!("air_alpha_powers + {} * DIM", slot) };
+    let n_buses = buses.len();
+    for (j, (bus_multiplicity, bus_data)) in buses.iter().enumerate() {
+        // `bus_data`'s last entry is the domainsep (logup domain separation).
+        let (bus_domainsep, bus_real_data) = bus_data.split_last().unwrap();
+        let multiplicity = eval_air_constraint(*bus_multiplicity, None, &mut ctx, &mut res);
+        res += &format!("\n    buff_{j} = Array(DIM * {})", bus_real_data.len());
+        for (i, data) in bus_real_data.iter().enumerate() {
+            let data_str = eval_air_constraint(*data, None, &mut ctx, &mut res);
+            res += &format!("\n    copy_ef({}, buff_{j} + DIM * {})", data_str, i);
+        }
+        let domainsep_str = eval_air_constraint(*bus_domainsep, None, &mut ctx, &mut res);
+        // bus_res = sum(buff[i] * logup_beta_eq_poly[i]) + disc * logup_beta_eq_poly.last()
+        res += &format!("\n    bus_res_init_{j} = Array(DIM)");
+        res += &format!(
+            "\n    dot_product_ee(buff_{j}, logup_beta_eq_poly, bus_res_init_{j}, {})",
+            bus_real_data.len()
+        );
+        res += &format!(
+            "\n    bus_res_{j} = add_extension_ret(mul_extension_ret({}, logup_beta_eq_poly + {} * DIM), bus_res_init_{j})",
+            domainsep_str,
+            (1 << LOG_MAX_BUS_WIDTH) - 1
+        );
+        res += &format!("\n    weighted_bus_{j} = mul_extension_ret(bus_res_{j}, {})", alpha_at(2 * j + 1));
+        res += &format!("\n    weighted_multiplicity_{j} = mul_extension_ret({}, {})", alpha_at(2 * j), multiplicity);
+        if j == 0 {
+            res += &format!("\n    sum: Mut = add_extension_ret(weighted_bus_{j}, weighted_multiplicity_{j})");
+        } else {
+            res += &format!("\n    sum = add_extension_ret(sum, add_extension_ret(weighted_bus_{j}, weighted_multiplicity_{j}))");
+        }
     }
-    let domainsep_str = eval_air_constraint(*bus_domainsep, None, &mut ctx, &mut res);
-    // bus_res = sum(buff[i] * logup_beta_eq_poly[i]) + disc * logup_beta_eq_poly.last()
-    res += "\n    bus_res_init = Array(DIM)";
-    res += &format!(
-        "\n    dot_product_ee(buff, logup_beta_eq_poly, bus_res_init, {})",
-        bus_real_data.len()
-    );
-    res += &format!(
-        "\n    bus_res: Mut = add_extension_ret(mul_extension_ret({}, logup_beta_eq_poly + {} * DIM), bus_res_init)",
-        domainsep_str,
-        (1 << LOG_MAX_BUS_WIDTH) - 1
-    );
-    // `air_alpha_powers` is the slice [alpha^offset, alpha^{offset+1}, …] for this table.
-    // Multiplicity → slot 0, bus fingerprint → slot 1, remaining AIR constraints → slot 2+.
-    res += "\n    bus_res = mul_extension_ret(bus_res, air_alpha_powers + DIM)";
-    res += &format!(
-        "\n    weighted_multiplicity = mul_extension_ret(air_alpha_powers, {})",
-        multiplicity
-    );
-    res += "\n    sum: Mut = add_extension_ret(bus_res, weighted_multiplicity)";
 
     res += "\n    weighted_constraints = Array(DIM)";
     res += &format!(
-        "\n    dot_product_ee(air_alpha_powers + 2 * DIM, constraints_buf, weighted_constraints, {})",
+        "\n    dot_product_ee({}, constraints_buf, weighted_constraints, {})",
+        alpha_at(2 * n_buses),
         n_constraints
     );
-    res += "\n    sum = add_extension_ret(sum, weighted_constraints)";
+    if n_buses == 0 {
+        res += "\n    sum: Mut = weighted_constraints";
+    } else {
+        res += "\n    sum = add_extension_ret(sum, weighted_constraints)";
+    }
 
     res += "\n    return sum";
     res += "\n";
@@ -810,4 +850,13 @@ fn display_all_air_evals_in_zk_dsl() {
 #[test]
 fn display_poseidon_air_in_zk_dsl() {
     println!("{}", air_eval_in_zk_dsl(Poseidon16Precompile::<false> {}));
+}
+
+/// The self-referential recursion program must compile (and converge) with the current tables' bus
+/// layout — this is what validates the generated zkDSL verifier loops after any table/bus change.
+#[test]
+fn test_compile_recursion_program_converges() {
+    let bytecode = compile_main_program_self_referential();
+    assert!(bytecode.log_size() <= MAX_BYTECODE_LOG_SIZE);
+    println!("recursion program: log_size {} ending_pc {}", bytecode.log_size(), bytecode.ending_pc());
 }

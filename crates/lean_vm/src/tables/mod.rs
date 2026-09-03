@@ -1,3 +1,5 @@
+pub mod ed25519;
+
 mod extension_op;
 pub use extension_op::*;
 
@@ -15,6 +17,10 @@ pub use execution::*;
 
 mod utils;
 pub(crate) use utils::*;
+
+/// Domainsep of the `multibus-toy` push/pull pair (class 2 mod 4, unused by the real tables).
+pub const LOGUP_TOY_DOMAINSEP: usize = 6;
+// ed25519 tables use the class 2 mod 4 as well: ed_sig 10, ed_decompress 14 (see tables/ed25519).
 
 // In logup interractions, the `domainsep` is the last entry of every tuple going into
 // the bus. It separates the two precompile tables from each other (Poseidon16 is odd,

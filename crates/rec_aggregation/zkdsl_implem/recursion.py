@@ -20,6 +20,10 @@ LOGUP_BYTECODE_DOMAINSEP = LOGUP_BYTECODE_DOMAINSEP_PLACEHOLDER
 EXECUTION_TABLE_INDEX = EXECUTION_TABLE_INDEX_PLACEHOLDER
 
 ONE_BUSES_DOMSEPS = ONE_BUSES_DOMSEPS_PLACEHOLDER  # [[_; num_buses]; N_TABLES]
+N_COLUMN_BUSES = N_COLUMN_BUSES_PLACEHOLDER  # [_; N_TABLES] — Multiplicity::Column buses per table (they precede the One buses)
+COLUMN_BUS_PULL = COLUMN_BUS_PULL_PLACEHOLDER  # [[1 if Pull else 0; N_COLUMN_BUSES[t]]; N_TABLES]
+COLUMN_BUS_OFFSETS = COLUMN_BUS_OFFSETS_PLACEHOLDER  # [_; N_TABLES] — prefix sums of N_COLUMN_BUSES
+TOTAL_COLUMN_BUSES = TOTAL_COLUMN_BUSES_PLACEHOLDER
 ONE_BUSES_DATA_COLS = ONE_BUSES_DATA_COLS_PLACEHOLDER  # [[[_; num_data]; num_buses]; N_TABLES]
 ONE_BUSES_DATA_OFFSETS = ONE_BUSES_DATA_OFFSETS_PLACEHOLDER  # [[[_; num_data]; num_buses]; N_TABLES]
 ONE_BUSES_NEW_COLS = ONE_BUSES_NEW_COLS_PLACEHOLDER  # [[[_; n_new]; num_buses]; N_TABLES]
@@ -38,6 +42,17 @@ N_INSTRUCTION_COLUMNS = N_INSTRUCTION_COLUMNS_PLACEHOLDER
 LOG_GUEST_BYTECODE_LEN = LOG_GUEST_BYTECODE_LEN_PLACEHOLDER
 EXEC_COL_PC = COL_PC_PLACEHOLDER
 TOTAL_WHIR_STATEMENTS = TOTAL_WHIR_STATEMENTS_PLACEHOLDER
+# Structural LogUp range sections (lean_vm::RANGE_SECTIONS): one region of 2^RANGE_LOG_TOTAL rows after the
+# bytecode block, padded to the largest table height; section s has 2^RANGE_SECTION_LOG_ROWS[s] rows, is
+# ALIVE (domainsep RANGE_SECTION_DOMSEPS[s]) for idx < 2^RANGE_SECTION_BITS[s] and DEAD above.
+N_RANGE_SECTIONS = N_RANGE_SECTIONS_PLACEHOLDER
+RANGE_LOG_TOTAL = RANGE_LOG_TOTAL_PLACEHOLDER
+RANGE_MIN_LOG_ALIGN = RANGE_MIN_LOG_ALIGN_PLACEHOLDER
+RANGE_SECTION_LOG_ROWS = RANGE_SECTION_LOG_ROWS_PLACEHOLDER  # [_; N_RANGE_SECTIONS]
+RANGE_SECTION_BITS = RANGE_SECTION_BITS_PLACEHOLDER  # [_; N_RANGE_SECTIONS]
+RANGE_SECTION_DOMSEPS = RANGE_SECTION_DOMSEPS_PLACEHOLDER  # [_; N_RANGE_SECTIONS]
+RANGE_SECTION_DEAD_DOMSEPS = RANGE_SECTION_DEAD_DOMSEPS_PLACEHOLDER  # [_; N_RANGE_SECTIONS]
+RANGE_SECTION_OFFSETS_DIV = RANGE_SECTION_OFFSETS_DIV_PLACEHOLDER  # [_; N_RANGE_SECTIONS]: offset within the region / 2^log_rows
 STARTING_PC = STARTING_PC_PLACEHOLDER
 ENDING_PC = ENDING_PC_PLACEHOLDER
 BYTECODE_POINT_N_VARS = LOG_GUEST_BYTECODE_LEN + log2_ceil(N_INSTRUCTION_COLUMNS)
@@ -100,23 +115,25 @@ def recursion(inner_public_memory, initial_fiat_shamir_cap):
     assert log_max_table_height <= log_memory
     log_n_cycles = table_log_heights[EXECUTION_TABLE_INDEX]
 
-    log_bytecode_padded = maximum(LOG_GUEST_BYTECODE_LEN, log_max_table_height)
+    log_bytecode_padded = maximum(maximum(LOG_GUEST_BYTECODE_LEN, log_max_table_height), RANGE_MIN_LOG_ALIGN)
+    log_range_region = maximum(RANGE_LOG_TOTAL, log_max_table_height)
+    assert RANGE_LOG_TOTAL <= log_memory
 
-    stacked_n_vars = compute_stacked_n_vars(log_memory, log_bytecode_padded, table_heights)
+    stacked_n_vars = compute_stacked_n_vars(log_memory, log_bytecode_padded, log_range_region, table_heights)
     assert stacked_n_vars <= TWO_ADICITY + WHIR_INITIAL_FOLDING_FACTOR - whir_log_inv_rate
 
-    n_vars_logup_gkr = compute_total_gkr_n_vars(log_memory, log_bytecode_padded, table_heights)
+    n_vars_logup_gkr = compute_total_gkr_n_vars(log_memory, log_bytecode_padded, log_range_region, table_heights)
 
     n_buses_per_table = Array(N_TABLES) # indexed by table_index
     n_cols_per_table = Array(N_TABLES) # indexed by table_index
     for i in unroll(0, N_TABLES):
-        n_buses_per_table[i] = len(ONE_BUSES_DOMSEPS[i]) + 1 # + 1 for the precompile bus interaction (the rest is memory / bytecode interactions)
+        n_buses_per_table[i] = len(ONE_BUSES_DOMSEPS[i]) + N_COLUMN_BUSES[i] # Column buses (precompile bus, …) + One buses (memory / bytecode)
         n_cols_per_table[i] = NUM_COLS_AIR[i]
 
     gkr_table_base_offset = Array(N_TABLES)
     stacked_table_base_offset = Array(N_TABLES)
-    gkr_cumul: Mut = two_exp(log_memory) + two_exp(log_bytecode_padded)
-    stacked_cumul: Mut = two_exp(log_memory) * 2 + two_exp(log_bytecode_padded)
+    gkr_cumul: Mut = two_exp(log_memory) + two_exp(log_bytecode_padded) + two_exp(log_range_region)
+    stacked_cumul: Mut = two_exp(log_memory) * 2 + two_exp(log_bytecode_padded) + two_exp(log_range_region)
     for sorted_pos in unroll(0, N_TABLES):
         ti = sorted_tables[sorted_pos]
         gkr_table_base_offset[ti] = gkr_cumul
@@ -217,9 +234,53 @@ def recursion(inner_public_memory, initial_fiat_shamir_cap):
         ),
     )
 
+    # Range region: sections (numerator −acc, denominator gamma − fp(alive/dead domainsep, idx)), then padding.
+    range_acc_values = Array(N_RANGE_SECTIONS * DIM)
+    for s in unroll(0, N_RANGE_SECTIONS):
+        sec_log = RANGE_SECTION_LOG_ROWS[s]
+        sec_point = point_gkr + (n_vars_logup_gkr - sec_log) * DIM
+        sec_prefix = multilinear_location_prefix(
+            two_exp(log_memory - sec_log) + two_exp(log_bytecode_padded - sec_log) + RANGE_SECTION_OFFSETS_DIV[s],
+            n_vars_logup_gkr - sec_log,
+            point_gkr,
+        )
+        fs, sec_acc = fs_receive_ef_inlined(fs, 1)
+        copy_ef(sec_acc, range_acc_values + s * DIM)
+        retrieved_numerators_value = sub_extension_ret(retrieved_numerators_value, mul_extension_ret(sec_prefix, sec_acc))
+        sec_idx = mle_of_01234567_etc(sec_point, sec_log)
+        # alive iff the top (log_rows − bits) index bits are zero
+        alive: Mut = embed_in_ef(1)
+        for i in unroll(0, sec_log - RANGE_SECTION_BITS[s]):
+            alive = mul_extension_ret(alive, one_minus_self_extension_ret(sec_point + i * DIM))
+        sec_ds = sub_extension_ret(
+            embed_in_ef(RANGE_SECTION_DEAD_DOMSEPS[s]),
+            mul_base_extension_ret(RANGE_SECTION_DEAD_DOMSEPS[s] - RANGE_SECTION_DOMSEPS[s], alive),
+        )
+        sec_fp = add_extension_ret(
+            mul_extension_ret(sec_idx, logup_beta_eq_poly),
+            mul_extension_ret(sec_ds, logup_beta_eq_poly + (2 ** log2_ceil(MAX_BUS_WIDTH) - 1) * DIM),
+        )
+        retrieved_denominators_value = add_extension_ret(
+            retrieved_denominators_value, mul_extension_ret(sec_prefix, sub_extension_ret(logup_gamma, sec_fp))
+        )
+    range_region_prefix = multilinear_location_prefix(
+        two_exp(log_memory - log_range_region) + two_exp(log_bytecode_padded - log_range_region),
+        n_vars_logup_gkr - log_range_region,
+        point_gkr,
+    )
+    retrieved_denominators_value = add_extension_ret(
+        retrieved_denominators_value,
+        mul_extension_ret(
+            range_region_prefix,
+            mle_of_zeros_then_ones_pow2(
+                point_gkr + (n_vars_logup_gkr - log_range_region) * DIM, RANGE_LOG_TOTAL, log_range_region
+            ),
+        ),
+    )
+
     # Per-table data accumulators (indexed by table_index).
-    bus_numerators_values = Array(N_TABLES * DIM)
-    bus_denominators_values = Array(N_TABLES * DIM)
+    bus_numerators_values = Array(TOTAL_COLUMN_BUSES * DIM)
+    bus_denominators_values = Array(TOTAL_COLUMN_BUSES * DIM)
     pcs_inner_points = Array(N_TABLES)
     pcs_vals_logup = Array(N_TABLES * MAX_NUM_COLS_AIR)
     pcs_vals_air = Array(N_TABLES * MAX_NUM_COLS_AIR)
@@ -233,23 +294,25 @@ def recursion(inner_public_memory, initial_fiat_shamir_cap):
         inner_point = point_gkr + (n_vars_logup_gkr - log_n_rows) * DIM
         pcs_inner_points[table_index] = inner_point
 
-        # Bus (data flow between tables — Multiplicity::Column)
-        prefix = multilinear_location_prefix(offset / n_rows, n_vars_logup_gkr - log_n_rows, point_gkr)
+        # Buses (data flow between tables — Multiplicity::Column), in bus order.
+        for column_bus_idx in unroll(0, N_COLUMN_BUSES[table_index]):
+            prefix = multilinear_location_prefix(offset / n_rows, n_vars_logup_gkr - log_n_rows, point_gkr)
 
-        fs, eval_on_selector = fs_receive_ef_inlined(fs, 1)
-        retrieved_numerators_value = add_extension_ret(
-            retrieved_numerators_value, mul_extension_ret(prefix, eval_on_selector)
-        )
+            fs, eval_on_selector = fs_receive_ef_inlined(fs, 1)
+            retrieved_numerators_value = add_extension_ret(
+                retrieved_numerators_value, mul_extension_ret(prefix, eval_on_selector)
+            )
 
-        fs, eval_on_data = fs_receive_ef_inlined(fs, 1)
-        retrieved_denominators_value = add_extension_ret(
-            retrieved_denominators_value, mul_extension_ret(prefix, eval_on_data)
-        )
+            fs, eval_on_data = fs_receive_ef_inlined(fs, 1)
+            retrieved_denominators_value = add_extension_ret(
+                retrieved_denominators_value, mul_extension_ret(prefix, eval_on_data)
+            )
 
-        copy_ef(eval_on_selector, bus_numerators_values + table_index * DIM)
-        copy_ef(eval_on_data, bus_denominators_values + table_index * DIM)
+            bus_slot = COLUMN_BUS_OFFSETS[table_index] + column_bus_idx
+            copy_ef(eval_on_selector, bus_numerators_values + bus_slot * DIM)
+            copy_ef(eval_on_data, bus_denominators_values + bus_slot * DIM)
 
-        offset += n_rows
+            offset += n_rows
 
         # Multiplicity::One buses (bytecode lookup + memory lookups).
         for one_bus_idx in unroll(0, len(ONE_BUSES_DOMSEPS[table_index])):
@@ -257,11 +320,11 @@ def recursion(inner_public_memory, initial_fiat_shamir_cap):
             n_new = len(ONE_BUSES_NEW_COLS[table_index][one_bus_idx])
             n_data = len(ONE_BUSES_DATA_COLS[table_index][one_bus_idx])
 
-            fs, new_evals = fs_receive_ef_inlined(fs, n_new)
-
-            for i in unroll(0, n_new):
-                new_col = ONE_BUSES_NEW_COLS[table_index][one_bus_idx][i]
-                pcs_vals_logup[table_index * MAX_NUM_COLS_AIR + new_col] = new_evals + i * DIM
+            if n_new != 0:  # a bus whose columns were all opened by earlier buses sends nothing
+                fs, new_evals = fs_receive_ef_inlined(fs, n_new)
+                for i in unroll(0, n_new):
+                    new_col = ONE_BUSES_NEW_COLS[table_index][one_bus_idx][i]
+                    pcs_vals_logup[table_index * MAX_NUM_COLS_AIR + new_col] = new_evals + i * DIM
 
             data_evals = Array(n_data * DIM)
             for i in unroll(0, n_data):
@@ -303,21 +366,24 @@ def recursion(inner_public_memory, initial_fiat_shamir_cap):
     initial_sum: Mut = ZERO_VEC_PTR
     for table_index in unroll(0, N_TABLES):
         alpha_offset = AIR_ALPHA_OFFSETS[table_index]
-        bus_numerator_value = bus_numerators_values + table_index * DIM
-        bus_denominator_value = bus_denominators_values + table_index * DIM
+        # the j-th Column bus of the table owns alpha slots 2j (numerator, signed by direction) and 2j+1 (fingerprint)
+        for column_bus_idx in unroll(0, N_COLUMN_BUSES[table_index]):
+            bus_slot = COLUMN_BUS_OFFSETS[table_index] + column_bus_idx
+            bus_numerator_value = bus_numerators_values + bus_slot * DIM
+            bus_denominator_value = bus_denominators_values + bus_slot * DIM
 
-        signed_numerator: Mut = bus_numerator_value
-        if table_index != EXECUTION_TABLE_INDEX:
-            signed_numerator = opposite_extension_ret(signed_numerator)
-        bus_final_value: Mut = mul_extension_ret(air_alpha_powers + alpha_offset * DIM, signed_numerator)
-        bus_final_value = add_extension_ret(
-            bus_final_value,
-            mul_extension_ret(
-                air_alpha_powers + (alpha_offset + 1) * DIM,
-                sub_extension_ret(logup_gamma, bus_denominator_value),
-            ),
-        )
-        initial_sum = add_extension_ret(initial_sum, bus_final_value)
+            signed_numerator: Mut = bus_numerator_value
+            if COLUMN_BUS_PULL[table_index][column_bus_idx] == 1:
+                signed_numerator = opposite_extension_ret(signed_numerator)
+            bus_final_value: Mut = mul_extension_ret(air_alpha_powers + (alpha_offset + 2 * column_bus_idx) * DIM, signed_numerator)
+            bus_final_value = add_extension_ret(
+                bus_final_value,
+                mul_extension_ret(
+                    air_alpha_powers + (alpha_offset + 2 * column_bus_idx + 1) * DIM,
+                    sub_extension_ret(logup_gamma, bus_denominator_value),
+                ),
+            )
+            initial_sum = add_extension_ret(initial_sum, bus_final_value)
 
     n_max = log_max_table_height
     # Batched AIR sumcheck:
@@ -379,6 +445,9 @@ def recursion(inner_public_memory, initial_fiat_shamir_cap):
     curr_randomness += DIM
     whir_sum = add_extension_ret(mul_extension_ret(value_bytecode_acc, curr_randomness), whir_sum)
     curr_randomness += DIM
+    for s in unroll(0, N_RANGE_SECTIONS):
+        whir_sum = add_extension_ret(mul_extension_ret(range_acc_values + s * DIM, curr_randomness), whir_sum)
+        curr_randomness += DIM
 
     for table_index in unroll(0, N_TABLES):
         if table_index == EXECUTION_TABLE_INDEX:
@@ -480,6 +549,21 @@ def recursion(inner_public_memory, initial_fiat_shamir_cap):
         mul_extension_ret(mul_extension_ret(curr_randomness, prefix_bytecode_acc), eq_bytecode_acc),
     )
     curr_randomness += DIM
+
+    for s in unroll(0, N_RANGE_SECTIONS):
+        sec_log = RANGE_SECTION_LOG_ROWS[s]
+        sec_point = point_gkr + (n_vars_logup_gkr - sec_log) * DIM
+        eq_sec = Array(DIM)
+        poly_eq_ee(folding_randomness_global + (stacked_n_vars - sec_log) * DIM, sec_point, eq_sec, sec_log)
+        prefix_sec = multilinear_location_prefix(
+            two_exp(log_memory + 1 - sec_log) + two_exp(log_bytecode_padded - sec_log) + RANGE_SECTION_OFFSETS_DIV[s],
+            stacked_n_vars - sec_log,
+            folding_randomness_global,
+        )
+        eval_weights = add_extension_ret(
+            eval_weights, mul_extension_ret(mul_extension_ret(curr_randomness, prefix_sec), eq_sec)
+        )
+        curr_randomness += DIM
 
     for table_index in unroll(0, N_TABLES):
         log_n_rows = table_log_heights[table_index]
@@ -678,9 +762,10 @@ def verify_gkr_quotient_step(prev_fs, n_vars, point, claim_num, claim_den):
 
 
 @inline
-def compute_stacked_n_vars(log_memory, log_bytecode_padded, tables_heights):
+def compute_stacked_n_vars(log_memory, log_bytecode_padded, log_range_region, tables_heights):
     total: Mut = two_exp(log_memory + 1)  # memory + acc_memory
     total += two_exp(log_bytecode_padded)
+    total += two_exp(log_range_region)  # range-section accs
     for table_index in unroll(0, N_TABLES):
         n_rows = tables_heights[table_index]
         total += n_rows * NUM_COLS_AIR[table_index]
@@ -688,9 +773,10 @@ def compute_stacked_n_vars(log_memory, log_bytecode_padded, tables_heights):
     return MIN_LOG_N_ROWS_PER_TABLE + log2_ceil_runtime(total / 2**MIN_LOG_N_ROWS_PER_TABLE)
 
 
-def compute_total_gkr_n_vars(log_memory, log_bytecode_padded, tables_heights):
+def compute_total_gkr_n_vars(log_memory, log_bytecode_padded, log_range_region, tables_heights):
     total: Mut = two_exp(log_memory)
     total += two_exp(log_bytecode_padded)
+    total += two_exp(log_range_region)  # range region
     for table_index in unroll(0, N_TABLES):
         n_rows = tables_heights[table_index]
         # +1 for the Multiplicity::Column bus, plus one block per Multiplicity::One bus.

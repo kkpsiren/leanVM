@@ -96,7 +96,7 @@ pub fn get_execution_trace(
 
     // Write [0000000000000000 | poseidon_compress(0000000000000000)] (to make lookups work on padding-rows).
     let padding_zero_vec_ptr = memory_padded.len();
-    memory_padded.extend(std::iter::repeat_n(F::ZERO, 16));
+    memory_padded.extend(std::iter::repeat_n(F::ZERO, 256)); // zero region: padding rows of every table look up here (ed_sig needs 97 cells)
     let null_poseidon_16_hash_ptr = memory_padded.len();
     memory_padded.extend_from_slice(get_poseidon_16_of_zero());
 

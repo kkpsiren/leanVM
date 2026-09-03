@@ -13,13 +13,16 @@ pub struct GenericLogupStatements {
     pub value_memory_acc: EF,
     pub bytecode_and_acc_point: MultilinearPoint<EF>,
     pub value_bytecode_acc: EF,
-    pub bus_numerators_values: BTreeMap<Table, EF>,
-    pub bus_denominators_values: BTreeMap<Table, EF>,
+    /// One entry per Column-multiplicity bus of the table, in `bus_interactions()` order.
+    pub bus_numerators_values: BTreeMap<Table, Vec<EF>>,
+    pub bus_denominators_values: BTreeMap<Table, Vec<EF>>,
     pub gkr_point: Vec<EF>,
     pub columns_values: BTreeMap<Table, BTreeMap<ColIndex, EF>>,
     // Used in recursion
     pub total_gkr_n_vars: usize,
     pub bytecode_evaluation: Option<Evaluation<EF>>,
+    /// Range sections: (point over log_rows vars, acc evaluation), in RANGE_SECTIONS order.
+    pub range_acc_evals: Vec<(MultilinearPoint<EF>, EF)>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -32,9 +35,12 @@ pub fn prove_generic_logup(
     memory_acc: &[F],
     bytecode_multilinear: &[F],
     bytecode_acc: &[F],
+    range_accs: &[Vec<F>],
     traces: &BTreeMap<Table, TableTrace>,
 ) -> GenericLogupStatements {
     assert!(memory.len().is_power_of_two());
+    assert_eq!(range_accs.len(), N_RANGE_SECTIONS);
+    assert!(log2_strict_usize(memory.len()) >= RANGE_LOG_TOTAL, "memory must be ≥ 2^RANGE_LOG_TOTAL for the range region alignment");
     assert_eq!(memory.len(), memory_acc.len());
     assert!(memory.len() >= traces.values().map(|t| 1 << t.log_n_rows).max().unwrap());
 
@@ -57,7 +63,7 @@ pub fn prove_generic_logup(
     let memory_domainsep_packed = PFPacking::<EF>::from(F::from_usize(LOGUP_MEMORY_DOMAINSEP));
     let bytecode_domainsep_packed = PFPacking::<EF>::from(F::from_usize(LOGUP_BYTECODE_DOMAINSEP));
 
-    let min_section_log = log_bytecode.min(tables_log_heights_sorted.last().unwrap().1);
+    let min_section_log = log_bytecode.min(tables_log_heights_sorted.last().unwrap().1).min(RANGE_SECTIONS[N_RANGE_SECTIONS - 1].log_rows);
     if min_section_log < ENDIANNESS_PIVOT_GKR {
         tracing::info!("TODO: suboptimal GKR pivot (could be improved).");
     }
@@ -65,7 +71,7 @@ pub fn prove_generic_logup(
     let chunk_size = 1usize << pivot;
     let chunk_shift = usize::BITS as usize - pivot;
     let chunk_mask = chunk_size - 1;
-    let max_table_height = 1 << tables_log_heights_sorted[0].1;
+    let _ = tables_log_heights_sorted[0].1;
 
     let src_idx = |p: usize, w: usize| -> usize {
         let x = p * width + w;
@@ -115,18 +121,40 @@ pub fn prove_generic_logup(
             c_packed - finger_print_packed::<EF>(bytecode_domainsep_packed, &data, &alphas_packed)
         },
     );
-    if 1 << log_bytecode < max_table_height {
+    let bytecode_block = 1 << bytecode_block_log(log_bytecode, tables_log_heights_sorted[0].1);
+    if 1 << log_bytecode < bytecode_block {
         // padding
         par_fill(
-            &mut numerators[offset + (1 << log_bytecode)..offset + max_table_height],
+            &mut numerators[offset + (1 << log_bytecode)..offset + bytecode_block],
             |_| F::ZERO,
         );
         par_fill(
-            &mut denominators[(offset + (1 << log_bytecode)) / width..(offset + max_table_height) / width],
+            &mut denominators[(offset + (1 << log_bytecode)) / width..(offset + bytecode_block) / width],
             |_| EFPacking::<EF>::ONE,
         );
     }
-    offset += max_table_height.max(1 << log_bytecode);
+    offset += bytecode_block;
+
+    // Range region: sections (numerator −acc, denominator c − fp(alive/dead domainsep, [idx])), then padding.
+    let region_start = offset;
+    let region_len = 1 << range_region_log(tables_log_heights_sorted[0].1);
+    for (s, sec) in RANGE_SECTIONS.iter().enumerate() {
+        let n = 1 << sec.log_rows;
+        assert_eq!(range_accs[s].len(), n);
+        fill_num_from(&mut numerators[offset..][..n], &range_accs[s], true);
+        let limit = 1usize << sec.bits;
+        par_fill(&mut denominators[offset / width..][..n / width], |p| {
+            let idx = PFPacking::<EF>::from_fn(|w| F::from_usize(src_idx(p, w)));
+            let ds = PFPacking::<EF>::from_fn(|w| if src_idx(p, w) < limit { F::from_usize(sec.domainsep) } else { F::from_usize(sec.dead_domainsep) });
+            c_packed - finger_print_packed::<EF>(ds, &[idx], &alphas_packed)
+        });
+        offset += n;
+    }
+    if offset < region_start + region_len {
+        par_fill(&mut numerators[offset..region_start + region_len], |_| F::ZERO);
+        par_fill(&mut denominators[offset / width..(region_start + region_len) / width], |_| EFPacking::<EF>::ONE);
+    }
+    offset = region_start + region_len;
 
     for (table, _) in &tables_log_heights_sorted {
         let trace = &traces[table];
@@ -240,8 +268,11 @@ pub fn prove_generic_logup(
         pivot,
     );
 
-    // sanity check
-    assert_eq!(sum, EF::ZERO);
+    // sanity check (skipped only by the multibus-toy tamper switch, which exists so that a test can
+    // hand a deliberately unbalanced bus to the VERIFIER)
+    if !(lean_vm::multibus_toy_tamper() || lean_vm::multibus_toy_range_tamper()) {
+        assert_eq!(sum, EF::ZERO);
+    }
 
     // Memory: ...
     let memory_and_acc_point = MultilinearPoint(from_end(&claim_point_gkr, log2_strict_usize(memory.len())).to_vec());
@@ -257,6 +288,14 @@ pub fn prove_generic_logup(
 
     // evaluation on bytecode itself can be done directly by the verifier
 
+    let mut range_acc_evals = Vec::with_capacity(N_RANGE_SECTIONS);
+    for (s, sec) in RANGE_SECTIONS.iter().enumerate() {
+        let pt = MultilinearPoint(from_end(&claim_point_gkr, sec.log_rows).to_vec());
+        let v = eval_base_packed::<EF, true>(&range_accs[s], &pt.0);
+        prover_state.add_extension_scalar(v);
+        range_acc_evals.push((pt, v));
+    }
+
     let mut bus_numerators_values = BTreeMap::new();
     let mut bus_denominators_values = BTreeMap::new();
     let mut columns_values = BTreeMap::new();
@@ -266,6 +305,8 @@ pub fn prove_generic_logup(
 
         let inner_point = MultilinearPoint(from_end(&claim_point_gkr, log_n_rows).to_vec());
         let mut table_values = BTreeMap::<ColIndex, EF>::new();
+        bus_numerators_values.insert(table, Vec::new());
+        bus_denominators_values.insert(table, Vec::new());
 
         let resolve_ef = |entry: BusData| -> EF {
             match entry {
@@ -286,8 +327,8 @@ pub fn prove_generic_logup(
                     let data_evals: Vec<EF> = bus.data.iter().map(|e| resolve_ef(*e)).collect();
                     let eval_on_data = c - finger_print(resolve_ef(bus.domainsep), &data_evals, alphas_eq_poly);
                     prover_state.add_extension_scalar(eval_on_data);
-                    bus_numerators_values.insert(table, eval_on_multiplicity);
-                    bus_denominators_values.insert(table, eval_on_data);
+                    bus_numerators_values.get_mut(&table).unwrap().push(eval_on_multiplicity);
+                    bus_denominators_values.get_mut(&table).unwrap().push(eval_on_data);
                 }
                 BusMultiplicity::One => {
                     // Skip columns already in table_values: memory-lookup groups share
@@ -309,7 +350,9 @@ pub fn prove_generic_logup(
                             })
                         })
                         .collect();
-                    prover_state.add_extension_scalars(&col_evals);
+                    if !col_evals.is_empty() { // a bus whose columns were all opened by earlier buses sends nothing
+                        prover_state.add_extension_scalars(&col_evals);
+                    }
                 }
             }
         }
@@ -329,6 +372,7 @@ pub fn prove_generic_logup(
         columns_values,
         total_gkr_n_vars,
         bytecode_evaluation: None,
+        range_acc_evals,
     }
 }
 
@@ -377,7 +421,7 @@ pub fn verify_generic_logup(
         ));
     let mut offset = 1 << log_memory;
 
-    let log_bytecode_padded = log_bytecode.max(tables_heights_sorted[0].1);
+    let log_bytecode_padded = bytecode_block_log(log_bytecode, tables_heights_sorted[0].1);
     let bytecode_and_acc_point = MultilinearPoint(from_end(&point_gkr, log_bytecode).to_vec());
     let pref = pref_at(offset, log_bytecode);
     let pref_padded = pref_at(offset, log_bytecode_padded);
@@ -406,6 +450,28 @@ pub fn verify_generic_logup(
         pref_padded * mle_of_zeros_then_ones(1 << log_bytecode, from_end(&point_gkr, log_bytecode_padded));
     offset += 1 << log_bytecode_padded;
 
+    // Range region
+    let region_start = offset;
+    let region_log = range_region_log(tables_heights_sorted[0].1);
+    let mut range_acc_evals = Vec::with_capacity(N_RANGE_SECTIONS);
+    for sec in RANGE_SECTIONS.iter() {
+        let pt = MultilinearPoint(from_end(&point_gkr, sec.log_rows).to_vec());
+        let pref = pref_at(offset, sec.log_rows);
+        let value_acc = verifier_state.next_extension_scalar()?;
+        retrieved_numerators_value -= pref * value_acc;
+        let idx = mle_of_01234567_etc(&pt);
+        // alive iff the top (log_rows − bits) bits of the index are zero
+        let alive: EF = pt.0[..sec.log_rows - sec.bits].iter().map(|x| EF::ONE - *x).product();
+        let ds = EF::from_usize(sec.dead_domainsep) + alive * (EF::from_usize(sec.domainsep) - EF::from_usize(sec.dead_domainsep));
+        retrieved_denominators_value += pref * (c - finger_print(ds, &[idx], alphas_eq_poly));
+        range_acc_evals.push((pt, value_acc));
+        offset += 1 << sec.log_rows;
+    }
+    // Padding of the range region (denominator 1 on [range_total_rows, 2^region_log))
+    retrieved_denominators_value +=
+        pref_at(region_start, region_log) * mle_of_zeros_then_ones(range_total_rows(), from_end(&point_gkr, region_log));
+    offset = region_start + (1 << region_log);
+
     // ... Rest of the tables.
     let mut layout_offsets: BTreeMap<Table, usize> = BTreeMap::new();
     let mut layout_offset = offset;
@@ -422,6 +488,8 @@ pub fn verify_generic_logup(
         let log_n_rows = table_log_n_rows[&table];
         let mut offset_within_table = layout_offsets[&table];
         let mut table_values = BTreeMap::<ColIndex, EF>::new();
+        bus_numerators_values.insert(table, Vec::new());
+        bus_denominators_values.insert(table, Vec::new());
 
         for bus in table.bus_interactions() {
             let pref = pref_at(offset_within_table, log_n_rows);
@@ -431,8 +499,8 @@ pub fn verify_generic_logup(
                     let eval_on_data = verifier_state.next_extension_scalar()?;
                     retrieved_numerators_value += pref * eval_on_multiplicity;
                     retrieved_denominators_value += pref * eval_on_data;
-                    bus_numerators_values.insert(table, eval_on_multiplicity);
-                    bus_denominators_values.insert(table, eval_on_data);
+                    bus_numerators_values.get_mut(&table).unwrap().push(eval_on_multiplicity);
+                    bus_denominators_values.get_mut(&table).unwrap().push(eval_on_data);
                 }
                 BusMultiplicity::One => {
                     let n_col_entries = bus
@@ -440,7 +508,7 @@ pub fn verify_generic_logup(
                         .iter()
                         .filter(|e| e.column().is_some_and(|col| !table_values.contains_key(&col)))
                         .count();
-                    let col_evals = verifier_state.next_extension_scalars_vec(n_col_entries)?;
+                    let col_evals = if n_col_entries == 0 { vec![] } else { verifier_state.next_extension_scalars_vec(n_col_entries)? };
                     let mut eval_iter = col_evals.into_iter();
                     let data_evals: Vec<EF> = bus
                         .data
@@ -497,6 +565,7 @@ pub fn verify_generic_logup(
         columns_values,
         total_gkr_n_vars,
         bytecode_evaluation: Some(Evaluation::new(bytecode_point, bytecode_value)),
+        range_acc_evals,
     })
 }
 
@@ -520,9 +589,10 @@ fn compute_total_active_len(
     log_bytecode: usize,
     tables_heights_sorted: &[(Table, VarCount)],
 ) -> usize {
-    let max_table_height = 1 << tables_heights_sorted[0].1;
+    let max_table_log = tables_heights_sorted[0].1;
     (1 << log_memory)
-        + (1 << log_bytecode).max(max_table_height)
+        + (1 << bytecode_block_log(log_bytecode, max_table_log))
+        + (1 << range_region_log(max_table_log))
         + tables_heights_sorted
             .iter()
             .map(|(table, log_n_rows)| offset_for_table(table, *log_n_rows))

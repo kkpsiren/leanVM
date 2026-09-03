@@ -77,6 +77,9 @@ pub enum PrecompileCompTimeArgs<S> {
         size: S,
         mode: ExtensionOpMode,
     },
+    /// ed25519 tables (no compile-time data): `ed_sig(q_ptr, out_ptr, 0)`, `ed_decompress(a_ptr, out_ptr, 0)`
+    EdSig,
+    EdDecompress,
 }
 
 impl<S> PrecompileCompTimeArgs<S> {
@@ -84,6 +87,8 @@ impl<S> PrecompileCompTimeArgs<S> {
         match self {
             Self::Poseidon16 { .. } => Table::poseidon16(),
             Self::ExtensionOp { .. } => Table::extension_op(),
+            Self::EdSig => Table::ed_sig(),
+            Self::EdDecompress => Table::ed_decompress(),
         }
     }
 
@@ -99,6 +104,8 @@ impl<S> PrecompileCompTimeArgs<S> {
                 permute,
             },
             Self::ExtensionOp { size, mode } => PrecompileCompTimeArgs::ExtensionOp { size: f(size), mode },
+            Self::EdSig => PrecompileCompTimeArgs::EdSig,
+            Self::EdDecompress => PrecompileCompTimeArgs::EdDecompress,
         }
     }
 }
@@ -294,6 +301,8 @@ impl<V: Display, S: Display> Display for PrecompileArgs<V, S> {
             PrecompileCompTimeArgs::ExtensionOp { size, mode } => {
                 write!(f, "{}({arg_0}, {arg_1}, {res}, {size})", mode.name())
             }
+            PrecompileCompTimeArgs::EdSig => write!(f, "{}({arg_0}, {arg_1}, {res})", crate::ED_SIG_NAME),
+            PrecompileCompTimeArgs::EdDecompress => write!(f, "{}({arg_0}, {arg_1}, {res})", crate::ED_DECOMPRESS_NAME),
         }
     }
 }

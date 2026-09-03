@@ -2,9 +2,10 @@ use backend::*;
 
 use crate::execution::memory::MemoryAccess;
 use crate::*;
+use crate::tables::ed25519::{EdDecompressTable, EdSigTable};
 
-pub const N_TABLES: usize = 3;
-pub const ALL_TABLES: [Table; N_TABLES] = [Table::execution(), Table::extension_op(), Table::poseidon16()];
+pub const N_TABLES: usize = 5;
+pub const ALL_TABLES: [Table; N_TABLES] = [Table::execution(), Table::extension_op(), Table::poseidon16(), Table::ed_sig(), Table::ed_decompress()];
 pub const MAX_BUS_WIDTH: usize = N_INSTRUCTION_COLUMNS + 2; // + 1 for PC, + 1 for domainsep
 pub const LOG_MAX_BUS_WIDTH: usize = log2_ceil_usize(MAX_BUS_WIDTH);
 
@@ -14,6 +15,8 @@ pub enum Table {
     Execution(ExecutionTable<true>),
     ExtensionOp(ExtensionOpPrecompile<true>),
     Poseidon16(Poseidon16Precompile<true>),
+    EdSig(EdSigTable<true>),
+    EdDecompress(EdDecompressTable<true>),
 }
 
 #[macro_export]
@@ -24,6 +27,8 @@ macro_rules! delegate_to_inner {
             Self::ExtensionOp(p) => p.$method($($($arg),*)?),
             Self::Poseidon16(p) => p.$method($($($arg),*)?),
             Self::Execution(p) => p.$method($($($arg),*)?),
+            Self::EdSig(p) => p.$method($($($arg),*)?),
+            Self::EdDecompress(p) => p.$method($($($arg),*)?),
         }
     };
     // New pattern for applying a macro to the inner value
@@ -32,6 +37,8 @@ macro_rules! delegate_to_inner {
             Table::ExtensionOp(p) => $macro_name!(p),
             Table::Poseidon16(p) => $macro_name!(p),
             Table::Execution(p) => $macro_name!(p),
+            Table::EdSig(p) => $macro_name!(p),
+            Table::EdDecompress(p) => $macro_name!(p),
         }
     };
 }
@@ -45,6 +52,12 @@ impl Table {
     }
     pub const fn poseidon16() -> Self {
         Self::Poseidon16(Poseidon16Precompile)
+    }
+    pub const fn ed_sig() -> Self {
+        Self::EdSig(EdSigTable)
+    }
+    pub const fn ed_decompress() -> Self {
+        Self::EdDecompress(EdDecompressTable)
     }
     pub fn embed<PF: PrimeCharacteristicRing>(&self) -> PF {
         PF::from_usize(self.index())
@@ -116,6 +129,18 @@ mod tests {
     fn test_table_indices() {
         for (i, table) in ALL_TABLES.iter().enumerate() {
             assert_eq!(table.index(), i);
+        }
+    }
+
+    /// Column-multiplicity buses first, then Multiplicity::One (the alpha-slot convention).
+    #[test]
+    fn test_column_buses_first() {
+        for table in ALL_TABLES {
+            let buses = table.bus_interactions();
+            let k = n_column_buses(&buses);
+            for (i, bus) in buses.iter().enumerate() {
+                assert_eq!(matches!(bus.multiplicity, BusMultiplicity::Column(_)), i < k, "{}: bus {i}", table.name());
+            }
         }
     }
 

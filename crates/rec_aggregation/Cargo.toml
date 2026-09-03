@@ -8,6 +8,7 @@ workspace = true
 
 [features]
 prox-gaps-conjecture = ["lean_prover/prox-gaps-conjecture"]
+multibus-toy = ["lean_prover/multibus-toy", "lean_vm/multibus-toy"]
 
 [dependencies]
 xmss = { workspace = true, features = ["test-utils"] }

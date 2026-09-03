@@ -258,8 +258,9 @@ struct SymbolicAirBuilder<F: Field> {
     flat: Vec<SymbolicExpression<F>>,
     shift: Vec<SymbolicExpression<F>>,
     constraints: Vec<SymbolicExpression<F>>,
-    bus_multiplicity_value: Option<SymbolicExpression<F>>,
-    bus_data_values: Option<Vec<SymbolicExpression<F>>>,
+    /// Column-multiplicity buses in declaration order: (multiplicity, data ‖ domainsep).
+    buses: Vec<(SymbolicExpression<F>, Vec<SymbolicExpression<F>>)>,
+    pending_multiplicity: Option<SymbolicExpression<F>>,
 }
 
 impl<F: Field> SymbolicAirBuilder<F> {
@@ -275,8 +276,8 @@ impl<F: Field> SymbolicAirBuilder<F> {
             flat,
             shift,
             constraints: Vec::new(),
-            bus_multiplicity_value: None,
-            bus_data_values: None,
+            buses: Vec::new(),
+            pending_multiplicity: None,
         }
     }
 
@@ -309,21 +310,23 @@ where
         self.constraints.push(x);
     }
 
+    /// Buses are declared as pairs of calls: first the multiplicity (one value), then the data
+    /// with the domainsep last. Any number of buses, in the table's `bus_interactions()` order.
     fn declare_values(&mut self, values: &[Self::IF]) {
-        if self.bus_multiplicity_value.is_none() {
-            assert_eq!(values.len(), 1);
-            self.bus_multiplicity_value = Some(values[0]);
-        } else {
-            assert!(self.bus_data_values.is_none());
-            self.bus_data_values = Some(values.to_vec());
+        match self.pending_multiplicity.take() {
+            None => {
+                assert_eq!(values.len(), 1, "bus multiplicity must be a single value");
+                self.pending_multiplicity = Some(values[0]);
+            }
+            Some(multiplicity) => self.buses.push((multiplicity, values.to_vec())),
         }
     }
 }
 
+/// (constraints, buses) where each bus is (multiplicity, data ‖ domainsep), in bus order.
 pub type SymbolicAirData<F> = (
     Vec<SymbolicExpression<F>>,
-    SymbolicExpression<F>,
-    Vec<SymbolicExpression<F>>,
+    Vec<(SymbolicExpression<F>, Vec<SymbolicExpression<F>>)>,
 );
 
 pub fn get_symbolic_constraints_and_bus_data_values<F: Field, A: Air>(air: &A) -> SymbolicAirData<F>
@@ -333,9 +336,6 @@ where
 {
     let mut builder = SymbolicAirBuilder::<F>::new(air.n_columns(), air.n_shift_columns());
     air.eval(&mut builder, &Default::default());
-    (
-        builder.constraints(),
-        builder.bus_multiplicity_value.unwrap(),
-        builder.bus_data_values.unwrap(),
-    )
+    assert!(builder.pending_multiplicity.is_none(), "bus multiplicity declared without data");
+    (builder.constraints(), builder.buses)
 }

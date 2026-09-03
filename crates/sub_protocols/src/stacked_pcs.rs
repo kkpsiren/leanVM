@@ -7,6 +7,7 @@ use lean_vm::{
 use lean_vm::{EF, F, Table, TableT, TableTrace};
 use std::collections::BTreeMap;
 use tracing::instrument;
+use lean_vm::{N_RANGE_SECTIONS, RANGE_SECTIONS, bytecode_block_log, range_region_log};
 
 /*
 Stacking of various (multilinear) polynomials into a single -big- (multilinear) polynomial, which is committed via WHIR.
@@ -51,7 +52,7 @@ pub fn stacked_pcs_global_statements(
     let max_table_n_vars = tables_heights_sorted[0].1;
 
     let mut table_offsets: BTreeMap<Table, usize> = BTreeMap::new();
-    let mut layout_offset = (2 << memory_n_vars) + (1 << bytecode_n_vars.max(max_table_n_vars));
+    let mut layout_offset = (2 << memory_n_vars) + (1 << bytecode_block_log(bytecode_n_vars, max_table_n_vars)) + (1 << range_region_log(max_table_n_vars));
     for (table, n_vars) in &tables_heights_sorted {
         table_offsets.insert(*table, layout_offset);
         layout_offset += table.n_columns() << n_vars;
@@ -105,6 +106,7 @@ pub fn stack_polynomials_and_commit(
     memory: &[F],
     memory_acc: &[F],
     bytecode_acc: &[F],
+    range_accs: &[Vec<F>],
     traces: &BTreeMap<Table, TableTrace>,
 ) -> StackedPcsWitness {
     assert_eq!(memory.len(), memory_acc.len());
@@ -125,8 +127,11 @@ pub fn stack_polynomials_and_commit(
     offset += memory_acc.len();
 
     global_polynomial[offset..][..bytecode_acc.len()].copy_from_slice(bytecode_acc);
-    let largest_table_height = 1 << tables_heights_sorted[0].1;
-    offset += largest_table_height.max(bytecode_acc.len()); // we may pad bytecode_acc to match largest table height
+    let max_table_log = tables_heights_sorted[0].1;
+    offset += 1 << bytecode_block_log(log2_strict_usize(bytecode_acc.len()), max_table_log); // bytecode_acc padded to the block
+    let region_start = offset;
+    for acc in range_accs { global_polynomial[offset..][..acc.len()].copy_from_slice(acc); offset += acc.len(); }
+    offset = region_start + (1 << range_region_log(max_table_log));
 
     for (table, log_n_rows) in &tables_heights_sorted {
         let n_rows = 1 << *log_n_rows;
@@ -187,7 +192,8 @@ fn compute_stacked_n_vars(
 ) -> VarCount {
     let max_table_log_n_rows = tables_log_heights.values().copied().max().unwrap();
     let total_len = (2 << log_memory)
-        + (1 << log_bytecode.max(max_table_log_n_rows))
+        + (1 << bytecode_block_log(log_bytecode, max_table_log_n_rows))
+        + (1 << range_region_log(max_table_log_n_rows))
         + tables_log_heights
             .iter()
             .map(|(table, log_n_rows)| table.n_columns() << log_n_rows)
@@ -203,13 +209,21 @@ pub fn min_stacked_n_vars(log_bytecode: usize) -> usize {
     compute_stacked_n_vars(MIN_LOG_MEMORY_SIZE, log_bytecode, &min_tables_log_heights)
 }
 
+/// Stacked offset (in cells) of range section `s`'s acc column.
+pub fn range_acc_stacked_offset(memory_n_vars: usize, bytecode_n_vars: usize, max_table_n_vars: usize, s: usize) -> usize {
+    let mut off = (2 << memory_n_vars) + (1 << bytecode_block_log(bytecode_n_vars, max_table_n_vars));
+    for sec in RANGE_SECTIONS.iter().take(s) { off += 1 << sec.log_rows; }
+    off
+}
+
 pub fn total_whir_statements() -> usize {
-    6 // memory + memory_acc + public_memory + bytecode_acc + pc_start + pc_end
+    6 + N_RANGE_SECTIONS // memory + memory_acc + public_memory + bytecode_acc + pc_start + pc_end + range accs
      + ALL_TABLES
         .iter()
         .map(|table| {
             let mut seen_cols = std::collections::HashSet::<ColIndex>::new();
-            for bus in table.bus_interactions().iter().filter(|b| b.is_memory_lookup()) {
+            // every column referenced by a memory lookup or a range push is opened at the LogUp point
+            for bus in table.bus_interactions().iter().filter(|b| b.is_memory_lookup() || b.range_section().is_some()) {
                 for entry in &bus.data {
                     if let Some(col) = entry.column() {
                         seen_cols.insert(col);

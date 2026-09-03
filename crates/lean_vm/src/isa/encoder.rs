@@ -66,6 +66,8 @@ pub fn field_representation(instr: &Instruction) -> [F; N_INSTRUCTION_COLUMNS] {
                     assert!(*size >= 1, "invalid extension_op size={size}");
                     mode.flag_encoding() + EXT_OP_LEN_MULTIPLIER * size
                 }
+                PrecompileCompTimeArgs::EdSig => crate::tables::ed25519::edsig_table::LOGUP_EDSIG_DOMAINSEP,
+                PrecompileCompTimeArgs::EdDecompress => crate::tables::ed25519::decompress_table::LOGUP_EDDECOMPRESS_DOMAINSEP,
             };
             fields[instr_idx(EXEC_COL_AUX_2)] = F::from_usize(domainsep);
             match (precompile.arg_0, precompile.arg_1) {

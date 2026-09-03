@@ -15,7 +15,7 @@ pub const MIN_WHIR_LOG_INV_RATE: usize = 1;
 pub const MAX_WHIR_LOG_INV_RATE: usize = 4;
 
 /// Minimum and maximum memory size (as powers of two)
-pub const MIN_LOG_MEMORY_SIZE: usize = 16;
+pub const MIN_LOG_MEMORY_SIZE: usize = 18; // ≥ RANGE_LOG_TOTAL: keeps the range region aligned after memory
 pub const MAX_LOG_MEMORY_SIZE: usize = 26;
 
 pub const MIN_BYTECODE_LOG_SIZE: usize = 8;
@@ -23,10 +23,12 @@ pub const MAX_BYTECODE_LOG_SIZE: usize = 22;
 
 /// Minimum and maximum number of rows per table (as powers of two), both inclusive
 pub const MIN_LOG_N_ROWS_PER_TABLE: usize = 8; // Zero padding will be added to each at least, if this minimum is not reached, (ensuring AIR / GKR work fine, with SIMD, without too much edge cases). Long term, we should find a more elegant solution.
-pub const MAX_LOG_N_ROWS_PER_TABLE: [(Table, usize); 3] = [
-    (Table::execution(), 24),
-    (Table::extension_op(), 22),
-    (Table::poseidon16(), 22),
+pub const MAX_LOG_N_ROWS_PER_TABLE: [(Table, usize); 5] = [
+    (Table::execution(), 22),
+    (Table::extension_op(), 20),
+    (Table::poseidon16(), 20),
+    (Table::ed_sig(), 17),
+    (Table::ed_decompress(), 14),
 ];
 
 pub fn max_log_n_rows_per_table(table: &Table) -> usize {
@@ -49,8 +51,9 @@ mod tests {
     /// CRITICAL FOUR SOUNDNESS: TODO tripple check
     #[test]
     fn ensure_no_overflow_in_logup() {
+        // every Multiplicity::One bus (memory lookups AND range pushes) is one fraction per row
         fn memory_lookups_count<T: TableT>(t: &T) -> usize {
-            t.bus_interactions().iter().filter(|bus| bus.is_memory_lookup()).count()
+            t.bus_interactions().iter().filter(|bus| bus.is_memory_lookup() || bus.range_section().is_some()).count()
         }
         // memory lookup
         let mut max_memory_logup_sum: u64 = 0;
@@ -60,6 +63,8 @@ mod tests {
             max_memory_logup_sum += (num_lookups * n_rows) as u64;
             println!("Table {} has {} memory lookups", table.name(), num_lookups * n_rows);
         }
+        max_memory_logup_sum += 1u64 << crate::RANGE_LOG_TOTAL.max(MAX_LOG_N_ROWS_PER_TABLE.iter().map(|(_, l)| *l).max().unwrap());
+        println!("Total One-bus fractions at max sizes: {max_memory_logup_sum} (< p = {})", F::ORDER_U64);
         assert!(max_memory_logup_sum < F::ORDER_U64);
 
         // bytecode lookup

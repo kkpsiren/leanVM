@@ -98,6 +98,22 @@ impl<const BUS: bool> TableT for ExtensionOpPrecompile<BUS> {
                 BusData::Column(COL_IDX_RES),
             ],
         }];
+        #[cfg(feature = "multibus-toy")]
+        {
+            buses.push(BusInteraction {
+                direction: BusDirection::Push,
+                multiplicity: BusMultiplicity::Column(COL_MULTIPLICITY_EXTENSION_OP),
+                domainsep: BusData::Constant(LOGUP_TOY_DOMAINSEP),
+                data: vec![BusData::Column(COL_IDX_A)],
+            });
+            buses.push(BusInteraction {
+                direction: BusDirection::Pull,
+                multiplicity: BusMultiplicity::Column(COL_TOY),
+                domainsep: BusData::Constant(LOGUP_TOY_DOMAINSEP),
+                data: vec![BusData::Column(COL_IDX_A)],
+            });
+            buses.extend(crate::range_lookups(&[COL_TOY_RANGE], crate::RANGE_U8));
+        }
         buses.extend(memory_lookups_consecutive(COL_IDX_A, COL_V_A, DIMENSION));
         buses.extend(memory_lookups_consecutive(COL_IDX_B, COL_V_B, DIMENSION));
         buses.extend(memory_lookups_consecutive(COL_IDX_RES, COL_RES, DIMENSION));

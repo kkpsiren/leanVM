@@ -454,3 +454,100 @@ fn test_zk_vm_helper_with_bytecode(
     println!("{}", proof.metadata.as_ref().unwrap().display());
     println!("Proof time: {:.3} s", proof_time.as_secs_f32());
 }
+
+/// `multibus-toy`: the ExtensionOp table now has three Column-multiplicity buses (the precompile bus,
+/// a push of idx_a with the multiplicity, a pull of idx_a with a committed toy column). Honest: proves and
+/// verifies. Tampered toy column (prover sanity assert disabled): the VERIFIER must reject.
+#[cfg(feature = "multibus-toy")]
+#[test]
+fn test_multibus_toy_honest_and_tampered() {
+    let ext_len = 2;
+    let bytecode = compile_program_with_flags(
+        &ProgramSource::Raw(ALL_PRECOMPILES_PROGRAM.to_string()),
+        sweep_flags(100, 2, ext_len, 4),
+    );
+    let (public_input, witness) = all_precompiles_witness(ext_len, &bytecode);
+    assert_eq!(lean_vm::n_column_buses(&Table::extension_op().bus_interactions()), 3);
+
+    lean_vm::MULTIBUS_TOY_TAMPER.store(false, std::sync::atomic::Ordering::Relaxed);
+    let honest = prove_execution(&bytecode, &public_input, &witness, &default_whir_config(1), false).unwrap();
+    verify_execution(&bytecode, &public_input, honest.proof).expect("honest multibus proof must verify");
+
+    lean_vm::MULTIBUS_TOY_TAMPER.store(true, std::sync::atomic::Ordering::Relaxed);
+    let tampered = prove_execution(&bytecode, &public_input, &witness, &default_whir_config(1), false)
+        .expect("a dishonest prover can still produce a transcript");
+    lean_vm::MULTIBUS_TOY_TAMPER.store(false, std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        verify_execution(&bytecode, &public_input, tampered.proof).is_err(),
+        "an unbalanced second bus must be rejected by the verifier"
+    );
+}
+
+/// `multibus-toy` range check: the ExtensionOp toy range column (255 on every row) is pushed into the U8
+/// section. Honest: verifies. Tampered to 256 (no AIR constraint, prover sanity assert disabled): the
+/// VERIFIER must reject — the only thing catching it is the structural range section.
+#[cfg(feature = "multibus-toy")]
+#[test]
+fn test_range_section_rejects_out_of_range() {
+    let ext_len = 2;
+    let bytecode = compile_program_with_flags(
+        &ProgramSource::Raw(ALL_PRECOMPILES_PROGRAM.to_string()),
+        sweep_flags(100, 2, ext_len, 4),
+    );
+    let (public_input, witness) = all_precompiles_witness(ext_len, &bytecode);
+    assert!(Table::extension_op().bus_interactions().iter().any(|b| b.range_section() == Some(lean_vm::RANGE_U8)));
+
+    lean_vm::MULTIBUS_TOY_RANGE_TAMPER.store(false, std::sync::atomic::Ordering::Relaxed);
+    let honest = prove_execution(&bytecode, &public_input, &witness, &default_whir_config(1), false).unwrap();
+    verify_execution(&bytecode, &public_input, honest.proof).expect("honest range-checked proof must verify");
+
+    lean_vm::MULTIBUS_TOY_RANGE_TAMPER.store(true, std::sync::atomic::Ordering::Relaxed);
+    let tampered = prove_execution(&bytecode, &public_input, &witness, &default_whir_config(1), false)
+        .expect("a dishonest prover can still produce a transcript");
+    lean_vm::MULTIBUS_TOY_RANGE_TAMPER.store(false, std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        verify_execution(&bytecode, &public_input, tampered.proof).is_err(),
+        "a 256 in a byte column must be rejected by the range section"
+    );
+}
+
+/// Phase A of the ed25519 integration: the driver runs `ed_sig` on a torsion witness Q' and
+/// `ed_decompress` on the compressed key A, and asserts P = 8Q' equals the decompressed (A.x, y_can)
+/// cell by cell — a signer certificate, proven and verified through the real pipeline (execution
+/// bus + memory lookups). Then a small batch in a runtime loop.
+#[test]
+fn test_zk_vm_ed25519_signer_certificate() {
+    use lean_vm::ed25519::curve::{random_points, scalar_mul_small};
+    use lean_vm::ed25519::decompress_table::compress;
+    let n: usize = std::env::var("ED_CERT_N").ok().and_then(|v| v.parse().ok()).unwrap_or(3); // ED_CERT_N=1024 for a batch anchor
+    let program = r#"
+n = N_PLACEHOLDER
+def main():
+    q = Array(64 * n)
+    hint_witness("q", q)
+    a = Array(32 * n)
+    hint_witness("a", a)
+    out = Array(97 * n)
+    dec = Array(64 * n)
+    for i in range(0, n):
+        ed_sig(q + 64 * i, out + 97 * i, 0)
+        ed_decompress(a + 32 * i, dec + 64 * i, 0)
+        for j in unroll(0, 64):
+            assert out[97 * i + j] == dec[64 * i + j]
+    return
+"#;
+    let flags = CompilationFlags { replacements: [("N_PLACEHOLDER".to_string(), n.to_string())].into_iter().collect() };
+    let bytecode = compile_program_with_flags(&ProgramSource::Raw(program.to_string()), flags);
+    let qs = random_points(n, 77);
+    let mut q_cells = vec![]; let mut a_cells = vec![];
+    for q in &qs {
+        for b in q.x.iter().chain(q.y.iter()) { q_cells.push(F::from_usize(*b as usize)); }
+        let a = compress(&scalar_mul_small(q, 8));
+        for b in a.iter() { a_cells.push(F::from_usize(*b as usize)); }
+    }
+    let mut hints = Hints::default();
+    hints.insert(&bytecode, "q", arena_vec![ArenaVec::from_slice(&q_cells)]);
+    hints.insert(&bytecode, "a", arena_vec![ArenaVec::from_slice(&a_cells)]);
+    let witness = ExecutionWitness { hints, ..Default::default() };
+    test_zk_vm_helper_with_bytecode(&bytecode, &[F::ZERO; PUBLIC_INPUT_LEN], witness);
+}

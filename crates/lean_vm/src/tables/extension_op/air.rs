@@ -25,9 +25,17 @@ pub(super) const COL_V_B: usize = 19;
 /// res coordinates (5 columns).
 pub(super) const COL_RES: usize = 24;
 
+/// `multibus-toy`: a committed boolean column that PULLS (bus 2) what the multiplicity PUSHES (bus 1).
+#[cfg(feature = "multibus-toy")]
+pub(super) const COL_TOY: usize = 29;
+/// `multibus-toy`: a committed byte column range-checked by the U8 section (255 honest / 256 tampered).
+#[cfg(feature = "multibus-toy")]
+pub(super) const COL_TOY_RANGE: usize = 30;
+pub(super) const N_EXT_OP_AIR_COLUMNS: usize = if cfg!(feature = "multibus-toy") { 31 } else { 29 };
+
 // Virtual columns (not explicitely in AIR)
-pub(super) const COL_MULTIPLICITY_EXTENSION_OP: usize = 29;
-pub(super) const COL_DOMAINSEP_EXTENSION_OP: usize = 30;
+pub(super) const COL_MULTIPLICITY_EXTENSION_OP: usize = N_EXT_OP_AIR_COLUMNS;
+pub(super) const COL_DOMAINSEP_EXTENSION_OP: usize = N_EXT_OP_AIR_COLUMNS + 1;
 
 use backend::quintic_extension::extension::quintic_mul;
 
@@ -42,13 +50,14 @@ impl<const BUS: bool> Air for ExtensionOpPrecompile<BUS> {
     type ExtraData = ExtraDataForBuses<EF>;
 
     fn n_columns(&self) -> usize {
-        29
+        N_EXT_OP_AIR_COLUMNS
     }
     fn degree_air(&self) -> usize {
         6
     }
     fn n_constraints(&self) -> usize {
-        35
+        // 2 alpha slots per Column bus + 33 AIR constraints (+ the toy's boolean check)
+        if cfg!(feature = "multibus-toy") { 2 * 3 + 33 + 1 } else { 2 + 33 }
     }
     fn n_shift_columns(&self) -> usize {
         COL_ACC + 5
@@ -94,12 +103,30 @@ impl<const BUS: bool> Air for ExtensionOpPrecompile<BUS> {
             + len * AB::F::from_usize(EXT_OP_LEN_MULTIPLIER);
 
         let idx_r = flat[COL_IDX_RES];
+        #[cfg(feature = "multibus-toy")]
+        let toy = flat[COL_TOY];
 
         if BUS {
             eval_bus_virtual::<AB, EF>(builder, extra_data, multiplicity, aux_2, &[idx_a, idx_b, idx_r]);
         } else {
             builder.declare_values(&[multiplicity]);
             builder.declare_values(&[idx_a, idx_b, idx_r, aux_2]);
+        }
+        #[cfg(feature = "multibus-toy")]
+        {
+            // Bus 1: push (idx_a) with the multiplicity; bus 2: pull (idx_a) with the toy column. Balanced
+            // iff the toy column equals the multiplicity on every row — a tampered toy column is caught.
+            let toy_ds = AB::IF::from_usize(crate::LOGUP_TOY_DOMAINSEP);
+            if BUS {
+                eval_bus_virtual::<AB, EF>(builder, extra_data, multiplicity, toy_ds, &[idx_a]);
+                eval_bus_virtual::<AB, EF>(builder, extra_data, toy, toy_ds, &[idx_a]);
+            } else {
+                builder.declare_values(&[multiplicity]);
+                builder.declare_values(&[idx_a, toy_ds]);
+                builder.declare_values(&[toy]);
+                builder.declare_values(&[idx_a, toy_ds]);
+            }
+            builder.assert_bool(toy);
         }
 
         let is_ee = -(flag_be - AB::F::ONE);

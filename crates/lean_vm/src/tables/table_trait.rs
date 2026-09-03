@@ -61,6 +61,68 @@ impl BusInteraction {
     }
 }
 
+/// Directions of a table's Column-multiplicity buses, in `bus_interactions()` order.
+///
+/// CONVENTION (checked by `test_column_buses_first`): every Column-multiplicity bus precedes every
+/// Multiplicity::One bus, and the table's AIR emits one `eval_bus_virtual` per Column bus, in this
+/// order, before any other constraint — so the j-th Column bus owns alpha slots 2j and 2j+1.
+pub fn column_bus_directions(buses: &[BusInteraction]) -> Vec<BusDirection> {
+    buses
+        .iter()
+        .filter(|b| matches!(b.multiplicity, BusMultiplicity::Column(_)))
+        .map(|b| b.direction)
+        .collect()
+}
+
+pub fn n_column_buses(buses: &[BusInteraction]) -> usize {
+    column_bus_directions(buses).len()
+}
+
+/// A structural LogUp range section: rows idx ∈ [0, 2^log_rows); a pushed value v (One-bus, data [v],
+/// domainsep `domainsep`) balances only against row v with the ALIVE domainsep, which the section uses
+/// for idx < 2^bits and replaces by `dead_domainsep` above — so v is proven < 2^bits (spec F1: never a
+/// scaled or combined value; one column per push).
+#[derive(Debug, Clone, Copy)]
+pub struct RangeSection { pub domainsep: usize, pub dead_domainsep: usize, pub log_rows: usize, pub bits: usize }
+pub const RANGE_U16: usize = 0;
+pub const RANGE_U10: usize = 1;
+pub const RANGE_U8: usize = 2;
+pub const RANGE_U7: usize = 3;
+pub const RANGE_U5: usize = 4;
+pub const RANGE_U4: usize = 5;
+pub const N_RANGE_SECTIONS: usize = 6;
+/// Sections in descending size, summing to exactly 2^RANGE_LOG_TOTAL, so every section is aligned
+/// within the region. Domainseps in the free class 2 mod 4 (memory 1, bytecode 2, Poseidon odd ≥ 3,
+/// ExtensionOp 0 mod 4, precompiles 6/10/14/...).
+pub const RANGE_SECTIONS: [RangeSection; N_RANGE_SECTIONS] = [
+    RangeSection { domainsep: 34, dead_domainsep: 38, log_rows: 16, bits: 16 },
+    RangeSection { domainsep: 42, dead_domainsep: 46, log_rows: 16, bits: 10 },
+    RangeSection { domainsep: 50, dead_domainsep: 54, log_rows: 16, bits: 8 },
+    RangeSection { domainsep: 58, dead_domainsep: 62, log_rows: 15, bits: 7 },
+    RangeSection { domainsep: 66, dead_domainsep: 70, log_rows: 14, bits: 5 },
+    RangeSection { domainsep: 74, dead_domainsep: 78, log_rows: 14, bits: 4 },
+];
+pub const RANGE_LOG_TOTAL: usize = 18;
+pub const RANGE_MIN_LOG_ALIGN: usize = RANGE_LOG_TOTAL; // the bytecode block is padded to ≥ the region, so the region start is aligned to it
+pub const fn range_total_rows() -> usize { let mut t = 0; let mut i = 0; while i < N_RANGE_SECTIONS { t += 1 << RANGE_SECTIONS[i].log_rows; i += 1; } t }
+const _: () = assert!(range_total_rows() == 1 << RANGE_LOG_TOTAL);
+/// LogUp/stacked layout: memory | bytecode block | range region | tables (sorted by height desc).
+/// The bytecode block is padded to max(bytecode, largest table, 2^16) so the region starts aligned;
+/// the region is padded to max(2^18, largest table) so the tables after it stay aligned.
+pub const fn bytecode_block_log(log_bytecode: usize, max_table_log: usize) -> usize {
+    let a = if log_bytecode > max_table_log { log_bytecode } else { max_table_log };
+    if a > RANGE_MIN_LOG_ALIGN { a } else { RANGE_MIN_LOG_ALIGN }
+}
+pub const fn range_region_log(max_table_log: usize) -> usize { if max_table_log > RANGE_LOG_TOTAL { max_table_log } else { RANGE_LOG_TOTAL } }
+pub fn range_section_of(domainsep: usize) -> Option<usize> { RANGE_SECTIONS.iter().position(|s| s.domainsep == domainsep) }
+impl BusInteraction {
+    pub fn range_section(&self) -> Option<usize> { match self.domainsep { BusData::Constant(ds) => range_section_of(ds), _ => None } }
+}
+/// One range push per column into `section`.
+pub fn range_lookups(cols: &[ColIndex], section: usize) -> Vec<BusInteraction> {
+    cols.iter().map(|&c| BusInteraction { direction: BusDirection::Push, multiplicity: BusMultiplicity::One, domainsep: BusData::Constant(RANGE_SECTIONS[section].domainsep), data: vec![BusData::Column(c)] }).collect()
+}
+
 pub fn memory_lookups_consecutive(idx_col: ColIndex, values_start: ColIndex, n: usize) -> Vec<BusInteraction> {
     (0..n)
         .map(|i| BusInteraction {

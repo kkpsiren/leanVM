@@ -40,6 +40,9 @@ fn is_reserved_function_name(name: &str) -> bool {
     if ExtensionOpMode::from_name(name).is_some() {
         return true;
     }
+    if name == lean_vm::ED_SIG_NAME || name == lean_vm::ED_DECOMPRESS_NAME {
+        return true;
+    }
     false
 }
 

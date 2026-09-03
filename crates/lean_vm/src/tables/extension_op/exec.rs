@@ -181,6 +181,11 @@ pub(super) fn exec_multi_row(
             trace.columns[COL_ACC + k].push(val);
         }
 
+        #[cfg(feature = "multibus-toy")]
+        trace.columns[COL_TOY].push(F::from_bool(is_start && !crate::multibus_toy_tamper()));
+        #[cfg(feature = "multibus-toy")]
+        trace.columns[COL_TOY_RANGE].push(F::from_usize(if crate::multibus_toy_range_tamper() { 256 } else { 255 }));
+
         // Virtual columns
         trace.columns[COL_MULTIPLICITY_EXTENSION_OP].push(F::from_bool(is_start));
         trace.columns[COL_DOMAINSEP_EXTENSION_OP].push(F::from_usize(mode_bits + EXT_OP_LEN_MULTIPLIER * current_len));

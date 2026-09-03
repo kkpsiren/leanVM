@@ -6,7 +6,15 @@ edition.workspace = true
 [lints]
 workspace = true
 
+[features]
+# A second and third Column-multiplicity bus on the ExtensionOp table (a committed toy column pulls what the
+# multiplicity pushes), used to validate the k-buses-per-table machinery end to end. Test-only.
+multibus-toy = []
+
 [dependencies]
+num-bigint = "0.4"
+num-integer = "0.1"
+num-traits = "0.2"
 xmss.workspace = true
 tracing.workspace = true
 backend.workspace = true
