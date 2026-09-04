@@ -511,6 +511,370 @@ fn test_range_section_rejects_out_of_range() {
     );
 }
 
+/// Phase B: `sha512(block, out, zeros)` on N padded blocks; the driver asserts each 64-byte digest
+/// equals the hinted native digest cell by cell (a wrong precompile fails the assert or the proof).
+#[test]
+fn test_zk_vm_sha512_precompile() {
+    use lean_vm::ed25519::sha512_table::{block_words, digest_bytes, pad_single_block, sha512_block};
+    let n: usize = std::env::var("SHA_N").ok().and_then(|v| v.parse().ok()).unwrap_or(3);
+    let program = r#"
+N = N_PLACEHOLDER
+def main():
+    blk = Array(128 * N)
+    hint_witness("blk", blk)
+    expect = Array(64 * N)
+    hint_witness("expect", expect)
+    zeros = Array(64)
+    for j in unroll(0, 64):
+        zeros[j] = 0
+    out = Array(64 * N)
+    for i in range(0, N):
+        sha512(blk + 128 * i, out + 64 * i, zeros)
+        for j in unroll(0, 64):
+            assert out[64 * i + j] == expect[64 * i + j]
+    return
+"#;
+    let flags = CompilationFlags { replacements: [("N_PLACEHOLDER".to_string(), n.to_string())].into_iter().collect() };
+    let bytecode = compile_program_with_flags(&ProgramSource::Raw(program.to_string()), flags);
+    let mut blk_cells = vec![]; let mut exp_cells = vec![];
+    for i in 0..n {
+        let msg: Vec<u8> = (0..(84 + (i % 20))).map(|k| ((k * 7 + i * 13) & 255) as u8).collect();
+        let block = pad_single_block(&msg);
+        blk_cells.extend(block.iter().map(|b| F::from_usize(*b as usize)));
+        exp_cells.extend(digest_bytes(&sha512_block(&block_words(&block))).iter().map(|b| F::from_usize(*b as usize)));
+    }
+    let mut hints = Hints::default();
+    hints.insert(&bytecode, "blk", arena_vec![ArenaVec::from_slice(&blk_cells)]);
+    hints.insert(&bytecode, "expect", arena_vec![ArenaVec::from_slice(&exp_cells)]);
+    let witness = ExecutionWitness { hints, ..Default::default() };
+    println!("sha512 x{n}");
+    test_zk_vm_helper_with_bytecode(&bytecode, &[F::ZERO; PUBLIC_INPUT_LEN], witness);
+}
+
+/// Phase B: N signatures through `sha512` → `scalar_l` (K/S chained by pointer) → `signer_scalar` on the
+/// final K. The driver asserts K_red ‖ windows against hints; the test computes K_red independently
+/// with num-bigint from (h, ρ, s), so a wrong table cannot agree with it.
+#[test]
+#[ignore = "superseded by test_zk_vm_ed25519_batch: with EdAdd present the routing tuples of random scalars do not form a valid batch"]
+fn test_zk_vm_scalar_chain() {
+    use lean_vm::ed25519::gadgets::{L_25519, limbs_to_int, modulus_int};
+    use lean_vm::ed25519::scalar_table::rho_from_cells;
+    use lean_vm::ed25519::sha512_table::{block_words, digest_bytes, pad_single_block, sha512_block};
+    use num_bigint::BigInt;
+    use num_integer::Integer;
+    let n: usize = std::env::var("SCALAR_N").ok().and_then(|v| v.parse().ok()).unwrap_or(4);
+    let program = r#"
+N = N_PLACEHOLDER
+def main():
+    blk = Array(128 * N)
+    hint_witness("blk", blk)
+    srho = Array(36 * N)
+    hint_witness("srho", srho)
+    zeros = Array(64)
+    for j in unroll(0, 64):
+        zeros[j] = 0
+    rec = Array(100 * N)
+    out = Array(90 * N)
+    for i in range(0, N):
+        sha512(blk + 128 * i, rec + 100 * i, zeros)
+        for j in unroll(0, 36):
+            rec[100 * i + 64 + j] = srho[36 * i + j]
+    scalar_l(rec, zeros, out)
+    for i in range(1, N):
+        scalar_l(rec + 100 * i, out + 90 * (i - 1), out + 90 * i)
+    kout = Array(84)
+    signer_scalar(out + 90 * (N - 1), kout, 0)
+    expect = Array(84)
+    hint_witness("expect", expect)
+    for j in unroll(0, 84):
+        assert kout[j] == expect[j]
+    return
+"#;
+    let flags = CompilationFlags { replacements: [("N_PLACEHOLDER".to_string(), n.to_string())].into_iter().collect() };
+    let bytecode = compile_program_with_flags(&ProgramSource::Raw(program.to_string()), flags);
+    let l = modulus_int(&L_25519);
+    let mut x = 0x9e3779b97f4a7c15u64; let mut nb = move || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; x };
+    let mut blk_cells = vec![]; let mut srho_cells = vec![];
+    let mut k_total = BigInt::from(0u8);
+    let mut k_wide = [0i64; 32];
+    for _ in 0..n {
+        let msg: Vec<u8> = (0..84).map(|_| (nb() & 255) as u8).collect();
+        let block = pad_single_block(&msg);
+        blk_cells.extend(block.iter().map(|b| F::from_usize(*b as usize)));
+        let h = digest_bytes(&sha512_block(&block_words(&block)));
+        let s_raw: Vec<u8> = (0..32).map(|_| (nb() & 255) as u8).collect();
+        let s_int = limbs_to_int(&s_raw).mod_floor(&l);
+        let mut s = [0u8; 32]; for (i, b) in s_int.to_bytes_le().1.iter().enumerate() { s[i] = *b; }
+        let rho_cells: [u32; 4] = std::array::from_fn(|_| (nb() % F::ORDER_U64) as u32);
+        srho_cells.extend(s.iter().map(|b| F::from_usize(*b as usize)));
+        srho_cells.extend(rho_cells.iter().map(|c| F::from_usize(*c as usize)));
+        // independent: c = h mod L, k = ρ·c mod L, K_total += k; the lazy limbs sum k's bytes
+        let c = limbs_to_int(&h).mod_floor(&l);
+        let rho = BigInt::from(rho_from_cells(&rho_cells));
+        let k = (&rho * &c).mod_floor(&l);
+        k_total += &k;
+        let kb = k.to_bytes_le().1; for (i, b) in kb.iter().enumerate() { k_wide[i] += *b as i64; }
+    }
+    let k_red = k_total.mod_floor(&l);
+    // expected output record: K_red bytes ‖ windows from the native T7 row of the same wide sum
+    let t7 = lean_vm::ed25519::signer_scalar_table::make_row(&k_wide, 0, false, 0, 0);
+    let mut expect: Vec<F> = t7[lean_vm::ed25519::signer_scalar_table::COL_OUT..lean_vm::ed25519::signer_scalar_table::COL_OUT + 84].to_vec();
+    let mut kred_bytes = [0u8; 32]; for (i, b) in k_red.to_bytes_le().1.iter().enumerate() { kred_bytes[i] = *b; }
+    for i in 0..32 { assert_eq!(expect[i], F::from_usize(kred_bytes[i] as usize), "native T7 disagrees with BigInt at limb {i}"); expect[i] = F::from_usize(kred_bytes[i] as usize); }
+    let mut hints = Hints::default();
+    hints.insert(&bytecode, "blk", arena_vec![ArenaVec::from_slice(&blk_cells)]);
+    hints.insert(&bytecode, "srho", arena_vec![ArenaVec::from_slice(&srho_cells)]);
+    hints.insert(&bytecode, "expect", arena_vec![ArenaVec::from_slice(&expect)]);
+    let witness = ExecutionWitness { hints, ..Default::default() };
+    println!("scalar chain x{n}");
+    test_zk_vm_helper_with_bytecode(&bytecode, &[F::ZERO; PUBLIC_INPUT_LEN], witness);
+}
+
+/// Phase C: a real ed25519 batch end to end. N = M·G signatures (G per signer) generated natively;
+/// the driver runs ed_sig (R records), ed_decompress (A records), assembles the SHA-512 blocks from
+/// T1's output, chains scalar_l per signer with S carried across signers, reduces each K and S with
+/// signer_scalar; the EdAdd post-pass consumes the routing tuples and its final row proves the MSM
+/// total is O. A tampered signature scalar must not prove.
+fn ed25519_batch_setup(m: usize, g: usize, tamper: bool) -> (Bytecode, ExecutionWitness) {
+    use lean_vm::ed25519::curve::{Affine, base_point, scalar_mul_bigint};
+    use lean_vm::ed25519::decompress_table::compress;
+    use lean_vm::ed25519::gadgets::{L_25519, limbs_to_int, modulus_int};
+    use lean_vm::ed25519::sha512_table::{block_words, digest_bytes, pad_single_block, sha512_block};
+    use num_bigint::BigInt;
+    use num_integer::Integer;
+    let n = m * g;
+    let program = r#"
+N = N_PLACEHOLDER
+M = M_PLACEHOLDER
+G = G_PLACEHOLDER
+def main():
+    q = Array(64 * N)
+    hint_witness("q", q)
+    a = Array(32 * M)
+    hint_witness("a", a)
+    msg = Array(20 * N)
+    hint_witness("msg", msg)
+    s = Array(32 * N)
+    hint_witness("s", s)
+    rho = Array(4 * N)
+    hint_witness("rho", rho)
+    bpt = Array(97)
+    hint_witness("bpt", bpt)
+    zeros = Array(64)
+    for t in unroll(0, 64):
+        zeros[t] = 0
+    rrec = Array(97 * N)
+    for i in unroll(0, N):
+        ed_sig(q + 64 * i, rrec + 97 * i, 0)
+    arec = Array(97 * M)
+    for j in unroll(0, M):
+        ed_decompress(a + 32 * j, arec + 97 * j, 0)
+    blk = Array(128 * N)
+    rec = Array(101 * N)
+    for j in unroll(0, M):
+        for gi in unroll(0, G):
+            i = j * G + gi
+            for t in unroll(0, 31):
+                blk[128 * i + t] = rrec[97 * i + 32 + t]
+            blk[128 * i + 31] = rrec[97 * i + 63] + 128 * rrec[97 * i + 64]
+            for t in unroll(0, 32):
+                blk[128 * i + 32 + t] = a[32 * j + t]
+            for t in unroll(0, 20):
+                blk[128 * i + 64 + t] = msg[20 * i + t]
+            blk[128 * i + 84] = 128
+            for t in unroll(85, 126):
+                blk[128 * i + t] = 0
+            blk[128 * i + 126] = 2
+            blk[128 * i + 127] = 160
+            sha512(blk + 128 * i, rec + 101 * i, zeros)
+            for t in unroll(0, 32):
+                rec[101 * i + 64 + t] = s[32 * i + t]
+            for t in unroll(0, 4):
+                rec[101 * i + 96 + t] = rho[4 * i + t]
+            rec[101 * i + 100] = rrec + 97 * i
+    out = Array(90 * N)
+    sacc = Array(64 * M)
+    for j in unroll(0, M):
+        for t in unroll(0, 32):
+            sacc[64 * j + t] = 0
+        if j == 0:
+            for t in unroll(0, 32):
+                sacc[64 * j + 32 + t] = 0
+        else:
+            for t in unroll(0, 32):
+                sacc[64 * j + 32 + t] = out[90 * (G * j - 1) + 32 + t]
+        scalar_l(rec + 101 * (G * j), sacc + 64 * j, out + 90 * (G * j))
+        for i in unroll(G * j + 1, G * j + G):
+            scalar_l(rec + 101 * i, out + 90 * (i - 1), out + 90 * i)
+    krec = Array(34 * M)
+    kout = Array(84 * M)
+    for j in unroll(0, M):
+        for t in unroll(0, 32):
+            krec[34 * j + t] = out[90 * (G * (j + 1) - 1) + t]
+        krec[34 * j + 32] = arec + 97 * j
+        krec[34 * j + 33] = 1
+        signer_scalar(krec + 34 * j, kout + 84 * j, 0)
+    srec = Array(34)
+    sout = Array(84)
+    for t in unroll(0, 32):
+        srec[t] = out[90 * (N - 1) + 32 + t]
+    srec[32] = bpt
+    srec[33] = 0
+    signer_scalar(srec, sout, 0)
+    return
+"#;
+    let flags = CompilationFlags { replacements: [("N_PLACEHOLDER".to_string(), n.to_string()), ("M_PLACEHOLDER".to_string(), m.to_string()), ("G_PLACEHOLDER".to_string(), g.to_string())].into_iter().collect() };
+    let bytecode = compile_program_with_flags(&ProgramSource::Raw(program.to_string()), flags);
+    let l = modulus_int(&L_25519);
+    let mut x = 0x5851f42d4c957f2du64; let mut nb = move || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; x };
+    let rand_scalar = |nb: &mut dyn FnMut() -> u64| -> BigInt { let bytes: Vec<u8> = (0..32).map(|_| (nb() & 255) as u8).collect(); limbs_to_int(&bytes).mod_floor(&l) };
+    let to32 = |v: &BigInt| -> [u8; 32] { let mut o = [0u8; 32]; for (i, b) in v.to_bytes_le().1.iter().enumerate() { o[i] = *b; } o };
+    let bp = base_point();
+    let inv8 = BigInt::from(8u8).modpow(&(&l - BigInt::from(2u8)), &l);
+    let cells = |v: &[u8]| -> Vec<F> { v.iter().map(|b| F::from_usize(*b as usize)).collect() };
+    let (mut q_c, mut a_c, mut msg_c, mut s_c, mut rho_c) = (vec![], vec![], vec![], vec![], vec![]);
+    // native cross-checks: every signature verifies; the batch MSM S·B − Σρ_iR_i − ΣK_jA_j closes
+    use lean_vm::ed25519::curve::{NEUTRAL, affine_add};
+    use lean_vm::ed25519::gadgets::{P_25519, mod_sub};
+    use lean_vm::ed25519::scalar_table::rho_from_cells;
+    let neg = |p: &Affine| Affine { x: mod_sub(&[0u8; 32], &p.x, &P_25519), y: p.y };
+    let mut msm = NEUTRAL; let mut s_total = BigInt::from(0u8);
+    for j in 0..m {
+        let a_sk = rand_scalar(&mut nb);
+        let a_pt = scalar_mul_bigint(&bp, &a_sk);
+        let a_bytes = compress(&a_pt);
+        a_c.extend(cells(&a_bytes));
+        for gi in 0..g {
+            let i = j * g + gi;
+            let r = rand_scalar(&mut nb);
+            let r_pt = scalar_mul_bigint(&bp, &r);
+            let r_bytes = compress(&r_pt);
+            let msg: Vec<u8> = (0..20).map(|_| (nb() & 255) as u8).collect();
+            let mut pre = vec![]; pre.extend_from_slice(&r_bytes); pre.extend_from_slice(&a_bytes); pre.extend_from_slice(&msg);
+            let h = digest_bytes(&sha512_block(&block_words(&pad_single_block(&pre))));
+            let c = limbs_to_int(&h).mod_floor(&l);
+            let mut s_val = (&r + &c * &a_sk).mod_floor(&l);
+            if tamper && i == 0 { s_val = (&s_val + BigInt::from(1u8)).mod_floor(&l); }
+            let qp: Affine = scalar_mul_bigint(&bp, &(&r * &inv8).mod_floor(&l));
+            q_c.extend(cells(&qp.x)); q_c.extend(cells(&qp.y));
+            msg_c.extend(cells(&msg));
+            s_c.extend(cells(&to32(&s_val)));
+            let rho_cells: [u32; 4] = std::array::from_fn(|_| (nb() % F::ORDER_U64) as u32);
+            for c in rho_cells { rho_c.push(F::from_usize(c as usize)); }
+            // native checks
+            let lhs = scalar_mul_bigint(&bp, &s_val);
+            let rhs = affine_add(&r_pt, &scalar_mul_bigint(&a_pt, &c));
+            if !tamper { assert_eq!(lhs, rhs, "native signature {i} does not verify"); }
+            assert_eq!(scalar_mul_bigint(&qp, &BigInt::from(8u8)), r_pt, "8·Q' != R for signature {i}");
+            let rho = BigInt::from(rho_from_cells(&rho_cells));
+            msm = affine_add(&msm, &neg(&scalar_mul_bigint(&r_pt, &rho)));
+            msm = affine_add(&msm, &neg(&scalar_mul_bigint(&a_pt, &(&rho * &c).mod_floor(&l))));
+            s_total = (&s_total + &rho * &s_val).mod_floor(&l);
+        }
+    }
+    msm = affine_add(&msm, &scalar_mul_bigint(&bp, &s_total));
+    if !tamper { assert_eq!(msm, NEUTRAL, "native batch MSM does not close"); }
+    println!("NATIVE MATH OK (signatures verify, MSM closes)");
+    // base point record [Bx | By | 0 | p − Bx] (hinted here; the production driver embeds it in the bytecode)
+    let mut bpt_c = vec![]; bpt_c.extend(cells(&bp.x)); bpt_c.extend(cells(&bp.y)); bpt_c.push(F::ZERO);
+    { use lean_vm::ed25519::gadgets::{P_25519, mod_sub}; bpt_c.extend(cells(&mod_sub(&[0u8; 32], &bp.x, &P_25519))); }
+    let mut hints = Hints::default();
+    for (name, v) in [("q", &q_c), ("a", &a_c), ("msg", &msg_c), ("s", &s_c), ("rho", &rho_c), ("bpt", &bpt_c)] { hints.insert(&bytecode, name, arena_vec![ArenaVec::from_slice(v)]); }
+    let witness = ExecutionWitness { hints, ..Default::default() };
+    (bytecode, witness)
+}
+
+fn ed25519_batch_run(m: usize, g: usize, tamper: bool) -> Result<(), String> {
+    let (bytecode, witness) = ed25519_batch_setup(m, g, tamper);
+    let public_input = [F::ZERO; PUBLIC_INPUT_LEN];
+    let time = std::time::Instant::now();
+    let proof = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| prove_execution(&bytecode, &public_input, &witness, &default_whir_config(1), false))) {
+        Ok(Ok(p)) => p,
+        Ok(Err(e)) => return Err(format!("prove: {e:?}")),
+        Err(_) => return Err("prove panicked (constraints not satisfied)".to_string()),
+    };
+    println!("batch M={m} G={g} tamper={tamper}: proof {:.3} s", time.elapsed().as_secs_f32());
+    println!("{}", proof.metadata.as_ref().unwrap().display());
+    verify_execution(&bytecode, &public_input, proof.proof).map(|_| ()).map_err(|e| format!("verify: {e:?}"))
+}
+
+/// Native AIR check of every ed25519 table on the batch trace: reports the first violated
+/// constraint per table (row, constraint index, row flags) — the prover itself never checks.
+fn native_check_ed_tables(bytecode: &Bytecode, witness: &ExecutionWitness) -> Vec<String> {
+    use lean_vm::ed25519::*;
+    struct Rec { flat: Vec<F>, shift: Vec<F>, idx: usize, failures: Vec<usize> }
+    impl AirBuilder for Rec {
+        type F = F; type IF = F; type EF = EF;
+        fn flat(&self) -> &[F] { &self.flat }
+        fn shift(&self) -> &[F] { &self.shift }
+        fn assert_zero(&mut self, x: F) { if x != F::ZERO { self.failures.push(self.idx); } self.idx += 1; }
+        fn assert_zero_ef(&mut self, x: EF) { if x != EF::ZERO { self.failures.push(self.idx); } self.idx += 1; }
+    }
+    let public_input = [F::ZERO; PUBLIC_INPUT_LEN];
+    let execution_result = try_execute_bytecode(bytecode, &public_input, witness, false).expect("execution");
+    let trace = crate::trace_gen::get_execution_trace(bytecode, execution_result, &witness.min_table_log_n_rows);
+    let mut report = vec![];
+    macro_rules! check {
+        ($name:expr, $air:expr, $table:expr, $flags:expr) => {{
+            let tr = &trace.traces[&$table];
+            let n = tr.columns[0].len(); let n_cols = tr.columns.len();
+            let n_shift = $table.n_shift_columns();
+            let mut first: Option<String> = None; let mut n_bad = 0;
+            for r in 0..n {
+                let flat: Vec<F> = (0..n_cols).map(|c| tr.columns[c][r]).collect();
+                let rn = if r + 1 < n { r + 1 } else { r };
+                let shift: Vec<F> = (0..n_shift).map(|c| tr.columns[c][rn]).collect();
+                let mut b = Rec { flat, shift, idx: 0, failures: vec![] };
+                $air.eval(&mut b, &ExtraDataForBuses::new(&[], vec![]));
+                if !b.failures.is_empty() {
+                    n_bad += 1;
+                    if first.is_none() {
+                        let flags: Vec<String> = $flags.iter().map(|&(nm, c): &(&str, usize)| format!("{nm}={}", tr.columns[c][r].as_canonical_u32())).collect();
+                        first = Some(format!("{}: row {r}/{n}: constraints {:?} ({})", $name, &b.failures[..b.failures.len().min(8)], flags.join(" ")));
+                    }
+                }
+            }
+            if let Some(f) = first { report.push(format!("{f}; {n_bad} bad rows")); }
+        }};
+    }
+    check!("ed_sig", EdSigTable::<false>, Table::ed_sig(), [("mult", edsig_table::COL_MULT)]);
+    check!("ed_decompress", EdDecompressTable::<false>, Table::ed_decompress(), [("mult", decompress_table::COL_MULT), ("sign", decompress_table::COL_SIGN)]);
+    check!("sha512", Sha512Table::<false>, Table::sha512(), [("r0", sha512_table::COL_FLAGS), ("r20", sha512_table::COL_FLAGS + 20)]);
+    check!("scalar_l", ScalarLTable::<false>, Table::scalar_l(), [("mult", scalar_table::COL_MULT)]);
+    check!("signer_scalar", SignerScalarTable::<false>, Table::signer_scalar(), [("mult", signer_scalar_table::COL_MULT), ("flip", signer_scalar_table::COL_FLIP)]);
+    check!("ed_add", EdAddTable::<false>, Table::ed_add(), [("active", ed_add_table::COL_ACTIVE), ("start", ed_add_table::COL_START), ("head", ed_add_table::COL_HEAD), ("kb", ed_add_table::COL_KB), ("kr1", ed_add_table::COL_KR1), ("kr2", ed_add_table::COL_KR2), ("kh", ed_add_table::COL_KH), ("j", ed_add_table::COL_J), ("b", ed_add_table::COL_B), ("cnt", ed_add_table::COL_CNT), ("empty", ed_add_table::COL_EMPTY)]);
+    // the MSM total: the horner head row's acc_out
+    {
+        let tr = &trace.traces[&Table::ed_add()];
+        for r in 0..tr.columns[0].len() {
+            if tr.columns[ed_add_table::COL_KH][r] == F::ONE && tr.columns[ed_add_table::COL_HEAD][r] == F::ONE {
+                let x: Vec<u32> = (0..32).map(|i| tr.columns[ed_add_table::COL_X3 + i][r].as_canonical_u32()).collect();
+                let y: Vec<u32> = (0..32).map(|i| tr.columns[ed_add_table::COL_Y3 + i][r].as_canonical_u32()).collect();
+                report.push(format!("MSM total: x={:?} y={:?} (want x=0, y=1)", &x[..4], &y[..4]));
+            }
+        }
+    }
+    report
+}
+
+#[test]
+fn test_ed25519_batch_native_constraints() {
+    let (bytecode, witness) = ed25519_batch_setup(2, 2, false);
+    for line in native_check_ed_tables(&bytecode, &witness) { println!("NATIVE {line}"); }
+}
+
+#[test]
+fn test_zk_vm_ed25519_batch() {
+    let m: usize = std::env::var("BATCH_M").ok().and_then(|v| v.parse().ok()).unwrap_or(2);
+    let g: usize = std::env::var("BATCH_G").ok().and_then(|v| v.parse().ok()).unwrap_or(2);
+    ed25519_batch_run(m, g, false).expect("a valid batch must prove and verify");
+}
+
+#[test]
+fn test_zk_vm_ed25519_batch_rejects_tampered_signature() {
+    assert!(ed25519_batch_run(1, 2, true).is_err(), "a tampered signature scalar must not prove");
+}
+
 /// Phase A of the ed25519 integration: the driver runs `ed_sig` on a torsion witness Q' and
 /// `ed_decompress` on the compressed key A, and asserts P = 8Q' equals the decompressed (A.x, y_can)
 /// cell by cell — a signer certificate, proven and verified through the real pipeline (execution
@@ -528,12 +892,14 @@ def main():
     a = Array(32 * n)
     hint_witness("a", a)
     out = Array(97 * n)
-    dec = Array(64 * n)
+    dec = Array(97 * n)
     for i in range(0, n):
         ed_sig(q + 64 * i, out + 97 * i, 0)
-        ed_decompress(a + 32 * i, dec + 64 * i, 0)
+        ed_decompress(a + 32 * i, dec + 97 * i, 0)
         for j in unroll(0, 64):
-            assert out[97 * i + j] == dec[64 * i + j]
+            assert out[97 * i + j] == dec[97 * i + j]
+        for j in unroll(65, 97):
+            assert out[97 * i + j] == dec[97 * i + j]
     return
 "#;
     let flags = CompilationFlags { replacements: [("N_PLACEHOLDER".to_string(), n.to_string())].into_iter().collect() };

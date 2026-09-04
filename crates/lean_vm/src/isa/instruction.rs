@@ -80,6 +80,12 @@ pub enum PrecompileCompTimeArgs<S> {
     /// ed25519 tables (no compile-time data): `ed_sig(q_ptr, out_ptr, 0)`, `ed_decompress(a_ptr, out_ptr, 0)`
     EdSig,
     EdDecompress,
+    /// `sha512(block_ptr, out_ptr, zero_ptr)`
+    Sha512,
+    /// `scalar_l(in_ptr, acc_ptr, out_ptr)`
+    ScalarL,
+    /// `signer_scalar(k_ptr, out_ptr, 0)`
+    SignerScalar,
 }
 
 impl<S> PrecompileCompTimeArgs<S> {
@@ -89,6 +95,9 @@ impl<S> PrecompileCompTimeArgs<S> {
             Self::ExtensionOp { .. } => Table::extension_op(),
             Self::EdSig => Table::ed_sig(),
             Self::EdDecompress => Table::ed_decompress(),
+            Self::Sha512 => Table::sha512(),
+            Self::ScalarL => Table::scalar_l(),
+            Self::SignerScalar => Table::signer_scalar(),
         }
     }
 
@@ -106,6 +115,9 @@ impl<S> PrecompileCompTimeArgs<S> {
             Self::ExtensionOp { size, mode } => PrecompileCompTimeArgs::ExtensionOp { size: f(size), mode },
             Self::EdSig => PrecompileCompTimeArgs::EdSig,
             Self::EdDecompress => PrecompileCompTimeArgs::EdDecompress,
+            Self::Sha512 => PrecompileCompTimeArgs::Sha512,
+            Self::ScalarL => PrecompileCompTimeArgs::ScalarL,
+            Self::SignerScalar => PrecompileCompTimeArgs::SignerScalar,
         }
     }
 }
@@ -303,6 +315,9 @@ impl<V: Display, S: Display> Display for PrecompileArgs<V, S> {
             }
             PrecompileCompTimeArgs::EdSig => write!(f, "{}({arg_0}, {arg_1}, {res})", crate::ED_SIG_NAME),
             PrecompileCompTimeArgs::EdDecompress => write!(f, "{}({arg_0}, {arg_1}, {res})", crate::ED_DECOMPRESS_NAME),
+            PrecompileCompTimeArgs::Sha512 => write!(f, "{}({arg_0}, {arg_1}, {res})", crate::SHA512_NAME),
+            PrecompileCompTimeArgs::ScalarL => write!(f, "{}({arg_0}, {arg_1}, {res})", crate::SCALAR_L_NAME),
+            PrecompileCompTimeArgs::SignerScalar => write!(f, "{}({arg_0}, {arg_1}, {res})", crate::SIGNER_SCALAR_NAME),
         }
     }
 }

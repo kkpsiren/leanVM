@@ -21,6 +21,8 @@ backend.workspace = true
 serde.workspace = true
 
 [dev-dependencies]
+num-bigint = "0.4"
+num-integer = "0.1"
 xmss.workspace = true
 rec_aggregation.workspace = true
 serde_json.workspace = true

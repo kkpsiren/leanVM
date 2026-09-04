@@ -497,6 +497,10 @@ fn all_air_evals_in_zk_dsl() -> String {
     res += &air_eval_in_zk_dsl(Poseidon16Precompile::<false> {});
     res += &air_eval_in_zk_dsl(lean_vm::ed25519::EdSigTable::<false> {});
     res += &air_eval_in_zk_dsl(lean_vm::ed25519::EdDecompressTable::<false> {});
+    res += &air_eval_in_zk_dsl(lean_vm::ed25519::Sha512Table::<false> {});
+    res += &air_eval_in_zk_dsl(lean_vm::ed25519::ScalarLTable::<false> {});
+    res += &air_eval_in_zk_dsl(lean_vm::ed25519::SignerScalarTable::<false> {});
+    res += &air_eval_in_zk_dsl(lean_vm::ed25519::EdAddTable::<false> {});
     res
 }
 

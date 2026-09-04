@@ -212,15 +212,14 @@ pub fn prove_generic_logup(
             let denom_slot = &mut denominators[offset / width..][..(1 << log_n_rows) / width];
 
             let n_data = bus.data.len();
-            let mut data_cols: [&[F]; MAX_BUS_WIDTH] = [&[]; MAX_BUS_WIDTH];
+            // each data entry is a column (+ constant offset) or a constant
+            let mut data_cols: [Option<&[F]>; MAX_BUS_WIDTH] = [None; MAX_BUS_WIDTH];
+            let mut data_consts: [PFPacking<EF>; MAX_BUS_WIDTH] = [PFPacking::<EF>::ZERO; MAX_BUS_WIDTH];
             for (k, entry) in bus.data.iter().enumerate() {
                 match *entry {
-                    BusData::Column(c) => {
-                        data_cols[k] = &trace.columns[c];
-                    }
-                    _ => {
-                        panic!("Non-Column BusData::data entries are not supported on the fast path");
-                    }
+                    BusData::Column(c) => { data_cols[k] = Some(&trace.columns[c]); }
+                    BusData::ColumnPlusConstant(c, ofs) => { data_cols[k] = Some(&trace.columns[c]); data_consts[k] = PFPacking::<EF>::from(F::from_usize(ofs)); }
+                    BusData::Constant(v) => { data_consts[k] = PFPacking::<EF>::from(F::from_usize(v)); }
                 }
             }
             let ds_col: Option<&[F]> = match bus.domainsep {
@@ -235,8 +234,10 @@ pub fn prove_generic_logup(
             par_fill(denom_slot, |p| {
                 let mut data_buf = [PFPacking::<EF>::ZERO; MAX_BUS_WIDTH];
                 for k in 0..n_data {
-                    let col = data_cols[k];
-                    data_buf[k] = PFPacking::<EF>::from_fn(|w| col[src_idx(p, w)]);
+                    data_buf[k] = match data_cols[k] {
+                        Some(col) => PFPacking::<EF>::from_fn(|w| col[src_idx(p, w)]) + data_consts[k],
+                        None => data_consts[k],
+                    };
                 }
                 let ds = match ds_col {
                     Some(col) => PFPacking::<EF>::from_fn(|w| col[src_idx(p, w)]),

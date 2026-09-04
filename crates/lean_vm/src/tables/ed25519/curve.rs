@@ -52,3 +52,11 @@ pub fn random_points(n: usize, seed: u64) -> Vec<Affine> {
     out
 }
 
+
+/// k·P by double-and-add over k's bits (test/witness helper; slow BigInt arithmetic).
+pub fn scalar_mul_bigint(p: &Affine, k: &num_bigint::BigInt) -> Affine {
+    let bits = k.bits() as usize;
+    let mut acc = NEUTRAL; let mut base = *p;
+    for i in 0..bits { if k.bit(i as u64) { acc = affine_add(&acc, &base); } base = affine_add(&base, &base); }
+    acc
+}

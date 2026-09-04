@@ -40,7 +40,7 @@ fn is_reserved_function_name(name: &str) -> bool {
     if ExtensionOpMode::from_name(name).is_some() {
         return true;
     }
-    if name == lean_vm::ED_SIG_NAME || name == lean_vm::ED_DECOMPRESS_NAME {
+    if [lean_vm::ED_SIG_NAME, lean_vm::ED_DECOMPRESS_NAME, lean_vm::SHA512_NAME, lean_vm::SCALAR_L_NAME, lean_vm::SIGNER_SCALAR_NAME].contains(&name) {
         return true;
     }
     false

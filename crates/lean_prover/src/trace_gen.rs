@@ -143,6 +143,9 @@ pub fn get_execution_trace(
     let extension_op_trace = traces.get_mut(&Table::extension_op()).unwrap();
     fill_trace_extension_op(extension_op_trace, &memory_padded);
 
+    // EdAdd (T3) is a post-pass over the routing tuples of ScalarL/SignerScalar and the point records in memory.
+    lean_vm::ed25519::fill_trace_ed_add(&mut traces, &memory_padded, padding_zero_vec_ptr);
+
     traces.insert(
         Table::execution(),
         TableTrace {

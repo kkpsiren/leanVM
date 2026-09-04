@@ -12,7 +12,7 @@ pub use execution::*;
 pub use isa::*;
 pub use tables::*;
 pub use tables::ed25519;
-pub use tables::ed25519::{ED_DECOMPRESS_NAME, ED_SIG_NAME, EdDecompressTable, EdSigTable};
+pub use tables::ed25519::{ED_DECOMPRESS_NAME, ED_SIG_NAME, EdDecompressTable, EdSigTable, SCALAR_L_NAME, SHA512_NAME, SIGNER_SCALAR_NAME, EdAddTable, ScalarLTable, Sha512Table, SignerScalarTable};
 
 /// `multibus-toy` tamper switch (test-only): when set, the ExtensionOp toy pull column is zeroed so the
 /// toy bus is unbalanced, and the prover's own LogUp sanity assert is skipped — the VERIFIER must catch it.

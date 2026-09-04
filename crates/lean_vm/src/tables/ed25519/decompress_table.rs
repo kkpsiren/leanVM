@@ -21,23 +21,27 @@ pub const COL_NU_A: usize = 1;
 pub const COL_NU_B: usize = 2;
 pub const COL_NU_C: usize = 3;
 pub const COL_A: usize = 4;              // 32
-pub const COL_OUT: usize = 36;           // 64: AX (32) YCAN (32)
+pub const COL_OUT: usize = 36;           // 97: AX (32) YCAN (32) PAD (1) NX (32) — the same shape as EdSig's OUT
 pub const COL_AX: usize = 36;
 pub const COL_YCAN: usize = 68;
-pub const COL_H: usize = 100;            // 1
-pub const COL_SIGN: usize = 101;         // 1
-pub const COL_T: usize = 102;            // 130
-pub const COL_V: usize = 232;            // 130
-pub const COL_XCAN: usize = 362;         // 32
-pub const COL_W: usize = 394;            // 130
-pub const COL_OC: usize = 524;           // 98
-pub const COL_XLT: usize = 622;          // 64
-pub const COL_HX: usize = 686;           // 1
-pub const COL_NEG: usize = 687;          // 32
-pub const COL_GE: usize = 719;           // 1
-pub const COL_YB: usize = 720;           // 32
-pub const COL_YLT: usize = 752;          // 64
-pub const N_COLS: usize = 816;
+pub const COL_PAD: usize = 100;
+pub const COL_NX: usize = 101;
+pub const N_OUT: usize = 97;
+pub const COL_H: usize = 133;            // 1
+pub const COL_SIGN: usize = 134;         // 1
+pub const COL_T: usize = 135;            // 130
+pub const COL_V: usize = 265;            // 130
+pub const COL_XCAN: usize = 395;         // 32
+pub const COL_W: usize = 427;            // 130
+pub const COL_OC: usize = 557;           // 98
+pub const COL_XLT: usize = 655;          // 64
+pub const COL_HX: usize = 719;           // 1
+pub const COL_NEG: usize = 720;          // 32 borrows of p − x_can
+pub const COL_PMX: usize = 752;          // 32: p − x_can
+pub const COL_GE: usize = 784;           // 1
+pub const COL_YB: usize = 785;           // 32
+pub const COL_YLT: usize = 817;          // 64
+pub const N_COLS: usize = 881;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct EdDecompressTable<const BUS: bool>;
@@ -79,14 +83,17 @@ impl<const BUS: bool> Air for EdDecompressTable<BUS> {
             builder.assert_zero(g.clone() * (AB::IF::from_usize(pm1) - xcan[i].clone() - prev - diff[i].clone() + bw[i].clone() * f(256))); builder.assert_bool(bw[i].clone()); }
           builder.assert_zero(bw[31].clone()); }
         builder.assert_zero(g.clone() * (xcan[0].clone() - c[COL_HX].clone().double()));
-        let ax = sl(COL_AX, 32); let nb = sl(COL_NEG, 32);
+        // pmx = p − x_can (exact borrow chain, always); A.x = sign ? pmx : x_can; nx = p − A.x = sign ? x_can : pmx
+        let ax = sl(COL_AX, 32); let nx = sl(COL_NX, 32); let pmx = sl(COL_PMX, 32); let nb = sl(COL_NEG, 32);
         for i in 0..32 {
             let prev = if i == 0 { AB::IF::ZERO } else { nb[i - 1].clone() };
-            builder.assert_zero(sign.clone() * (AB::IF::from_usize(p_limbs[i]) - xcan[i].clone() - prev - ax[i].clone() + nb[i].clone() * f(256)));
-            builder.assert_zero((one.clone() - sign.clone()) * (ax[i].clone() - xcan[i].clone()));
+            builder.assert_zero(g.clone() * (AB::IF::from_usize(p_limbs[i]) - xcan[i].clone() - prev - pmx[i].clone() + nb[i].clone() * f(256)));
             builder.assert_bool(nb[i].clone());
+            builder.assert_zero(ax[i].clone() - sign.clone() * pmx[i].clone() - (one.clone() - sign.clone()) * xcan[i].clone());
+            builder.assert_zero(nx[i].clone() - sign.clone() * xcan[i].clone() - (one.clone() - sign.clone()) * pmx[i].clone());
         }
         builder.assert_zero(nb[31].clone());
+        builder.assert_zero(c[COL_PAD].clone());
         let ge = c[COL_GE].clone(); builder.assert_bool(ge.clone());
         let ycan = sl(COL_YCAN, 32); let yb = sl(COL_YB, 32);
         for i in 0..32 {
@@ -102,7 +109,7 @@ impl<const BUS: bool> Air for EdDecompressTable<BUS> {
           builder.assert_zero((one.clone() - ge.clone()) * bw[31].clone()); }
     }
 }
-pub const N_CONSTRAINTS: usize = 2 + 2 + 2 + 4 * 65 + 65 + 1 + 97 + 1 + 97 + 65;
+pub const N_CONSTRAINTS: usize = 2 + 2 + 2 + 4 * 65 + 65 + 1 + 130 + 1 + 97 + 65;
 
 impl<const BUS: bool> TableT for EdDecompressTable<BUS> {
     fn name(&self) -> &'static str { "ed_decompress" }
@@ -110,7 +117,7 @@ impl<const BUS: bool> TableT for EdDecompressTable<BUS> {
     fn bus_interactions(&self) -> Vec<BusInteraction> {
         let mut buses = vec![BusInteraction { direction: BusDirection::Pull, multiplicity: BusMultiplicity::Column(COL_MULT), domainsep: BusData::Constant(LOGUP_EDDECOMPRESS_DOMAINSEP), data: vec![BusData::Column(COL_NU_A), BusData::Column(COL_NU_B), BusData::Column(COL_NU_C)] }];
         buses.extend(memory_lookups_consecutive(COL_NU_A, COL_A, 32));
-        buses.extend(memory_lookups_consecutive(COL_NU_B, COL_OUT, 64));
+        buses.extend(memory_lookups_consecutive(COL_NU_B, COL_OUT, N_OUT));
         let (u8s, u16s, u7s) = range_cols();
         buses.extend(range_lookups(&u8s, RANGE_U8));
         buses.extend(range_lookups(&u16s, RANGE_U16));
@@ -124,7 +131,7 @@ impl<const BUS: bool> TableT for EdDecompressTable<BUS> {
         let mut cells = [F::ZERO; 32]; ctx.memory.get_slice_into(a_ptr, &mut cells)?;
         let a: [u8; 32] = std::array::from_fn(|i| { let v = cells[i].as_canonical_u32(); assert!(v < 256, "ed_decompress: A limb is not a byte"); v as u8 });
         let row = make_row(&a, a_ptr, out_ptr);
-        ctx.memory.set_slice(out_ptr, &row[COL_OUT..COL_OUT + 64])?;
+        ctx.memory.set_slice(out_ptr, &row[COL_OUT..COL_OUT + N_OUT])?;
         let trace = ctx.traces.get_mut(&self.table()).unwrap();
         for (i, v) in row.iter().enumerate() { trace.columns[i].push(*v); }
         Ok(())
@@ -134,7 +141,7 @@ impl<const BUS: bool> TableT for EdDecompressTable<BUS> {
 pub fn range_cols() -> (Vec<usize>, Vec<usize>, Vec<usize>) {
     let mut u8s = vec![]; let mut u16s = vec![];
     let rng = |v: &mut Vec<usize>, b: usize, n: usize| v.extend(b..b + n);
-    rng(&mut u8s, COL_A, 32); rng(&mut u8s, COL_OUT, 64); rng(&mut u8s, COL_XCAN, 32);
+    rng(&mut u8s, COL_A, 32); rng(&mut u8s, COL_AX, 64); rng(&mut u8s, COL_NX, 32); rng(&mut u8s, COL_PMX, 32); rng(&mut u8s, COL_XCAN, 32);
     for b in [COL_T, COL_V, COL_W] { rng(&mut u8s, b, 32 + QL); rng(&mut u16s, b + 66, WL); }
     rng(&mut u8s, COL_OC, QL); rng(&mut u16s, COL_OC + QL, WL);
     rng(&mut u8s, COL_XLT, 32); rng(&mut u8s, COL_YLT, 32);
@@ -166,8 +173,9 @@ pub fn make_row(a: &[u8; 32], a_ptr: usize, out_ptr: usize) -> [F; N_COLS] {
     let borrow_chain = |row: &mut [F; N_COLS], base: usize, minuend: &[i32; 32], sub: &[u8; 32]| { let mut bw = 0i32; for i in 0..32 { let mut d = minuend[i] - sub[i] as i32 - bw; bw = 0; if d < 0 { d += 256; bw = 1; } row[base + i] = fu(d as u8); row[base + 32 + i] = fu(bw as u8); } assert_eq!(bw, 0); };
     borrow_chain(&mut row, COL_XLT, &pm1, &xcan);
     row[COL_HX] = fu(xcan[0] >> 1);
-    let ax = if sign == 1 { let mut bw = 0i32; let mut out = [0u8; 32]; for i in 0..32 { let mut d = P_25519[i] as i32 - xcan[i] as i32 - bw; bw = 0; if d < 0 { d += 256; bw = 1; } out[i] = d as u8; row[COL_NEG + i] = fu(bw as u8); } assert_eq!(bw, 0); out } else { xcan };
-    for i in 0..32 { row[COL_AX + i] = fu(ax[i]); }
+    let pmx = { let mut bw = 0i32; let mut out = [0u8; 32]; for i in 0..32 { let mut d = P_25519[i] as i32 - xcan[i] as i32 - bw; bw = 0; if d < 0 { d += 256; bw = 1; } out[i] = d as u8; row[COL_NEG + i] = fu(bw as u8); } assert_eq!(bw, 0); out };
+    let (ax, nx) = if sign == 1 { (pmx, xcan) } else { (xcan, pmx) };
+    for i in 0..32 { row[COL_AX + i] = fu(ax[i]); row[COL_NX + i] = fu(nx[i]); row[COL_PMX + i] = fu(pmx[i]); }
     let ge = limbs_to_int(&y) >= modulus_int(m);
     row[COL_GE] = F::from_bool(ge);
     let ycan = if ge { let mut bw = 0i32; let mut out = [0u8; 32]; for i in 0..32 { let mut d = y[i] as i32 - P_25519[i] as i32 - bw; bw = 0; if d < 0 { d += 256; bw = 1; } out[i] = d as u8; row[COL_YB + i] = fu(bw as u8); } assert_eq!(bw, 0); out } else { borrow_chain(&mut row, COL_YLT, &pm1, &y); y };

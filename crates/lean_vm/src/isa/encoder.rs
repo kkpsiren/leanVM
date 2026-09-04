@@ -68,6 +68,9 @@ pub fn field_representation(instr: &Instruction) -> [F; N_INSTRUCTION_COLUMNS] {
                 }
                 PrecompileCompTimeArgs::EdSig => crate::tables::ed25519::edsig_table::LOGUP_EDSIG_DOMAINSEP,
                 PrecompileCompTimeArgs::EdDecompress => crate::tables::ed25519::decompress_table::LOGUP_EDDECOMPRESS_DOMAINSEP,
+                PrecompileCompTimeArgs::Sha512 => crate::tables::ed25519::sha512_table::LOGUP_SHA512_DOMAINSEP,
+                PrecompileCompTimeArgs::ScalarL => crate::tables::ed25519::scalar_table::LOGUP_SCALAR_L_DOMAINSEP,
+                PrecompileCompTimeArgs::SignerScalar => crate::tables::ed25519::signer_scalar_table::LOGUP_SIGNER_SCALAR_DOMAINSEP,
             };
             fields[instr_idx(EXEC_COL_AUX_2)] = F::from_usize(domainsep);
             match (precompile.arg_0, precompile.arg_1) {

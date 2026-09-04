@@ -1525,6 +1525,8 @@ dependencies = [
  "backend",
  "lean_compiler",
  "lean_vm",
+ "num-bigint",
+ "num-integer",
  "rand 0.10.1",
  "rec_aggregation",
  "serde",

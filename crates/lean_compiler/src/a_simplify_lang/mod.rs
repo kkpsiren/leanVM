@@ -1684,7 +1684,7 @@ fn simplify_lines(
                         }
 
                         // ed25519 tables: name(ptr_a, ptr_b, ptr_res)
-                        if function_name == lean_vm::ED_SIG_NAME || function_name == lean_vm::ED_DECOMPRESS_NAME {
+                        if [lean_vm::ED_SIG_NAME, lean_vm::ED_DECOMPRESS_NAME, lean_vm::SHA512_NAME, lean_vm::SCALAR_L_NAME, lean_vm::SIGNER_SCALAR_NAME].contains(&function_name.as_str()) {
                             if !targets.is_empty() {
                                 return Err(format!("Precompile {function_name} should not return values, at {location}"));
                             }
@@ -1695,7 +1695,13 @@ fn simplify_lines(
                                 .iter()
                                 .map(|arg| simplify_expr(ctx, state, const_malloc, arg, &mut res))
                                 .collect::<Result<Vec<_>, _>>()?;
-                            let data = if function_name == lean_vm::ED_SIG_NAME { PrecompileCompTimeArgs::EdSig } else { PrecompileCompTimeArgs::EdDecompress };
+                            let data = match function_name.as_str() {
+                                lean_vm::ED_SIG_NAME => PrecompileCompTimeArgs::EdSig,
+                                lean_vm::ED_DECOMPRESS_NAME => PrecompileCompTimeArgs::EdDecompress,
+                                lean_vm::SHA512_NAME => PrecompileCompTimeArgs::Sha512,
+                                lean_vm::SCALAR_L_NAME => PrecompileCompTimeArgs::ScalarL,
+                                _ => PrecompileCompTimeArgs::SignerScalar,
+                            };
                             res.push(SimpleLine::Precompile(PrecompileArgs {
                                 arg_0: simplified_args[0].clone(),
                                 arg_1: simplified_args[1].clone(),

@@ -2,11 +2,11 @@ use backend::*;
 
 use crate::execution::memory::MemoryAccess;
 use crate::*;
-use crate::tables::ed25519::{EdDecompressTable, EdSigTable};
+use crate::tables::ed25519::{EdAddTable, EdDecompressTable, EdSigTable, ScalarLTable, Sha512Table, SignerScalarTable};
 
-pub const N_TABLES: usize = 5;
-pub const ALL_TABLES: [Table; N_TABLES] = [Table::execution(), Table::extension_op(), Table::poseidon16(), Table::ed_sig(), Table::ed_decompress()];
-pub const MAX_BUS_WIDTH: usize = N_INSTRUCTION_COLUMNS + 2; // + 1 for PC, + 1 for domainsep
+pub const N_TABLES: usize = 9;
+pub const ALL_TABLES: [Table; N_TABLES] = [Table::execution(), Table::extension_op(), Table::poseidon16(), Table::ed_sig(), Table::ed_decompress(), Table::sha512(), Table::scalar_l(), Table::signer_scalar(), Table::ed_add()];
+pub const MAX_BUS_WIDTH: usize = 16; // ≥ bytecode (N_INSTRUCTION_COLUMNS + 2) and the 15-entry chunk tuples of EdAdd
 pub const LOG_MAX_BUS_WIDTH: usize = log2_ceil_usize(MAX_BUS_WIDTH);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -17,6 +17,10 @@ pub enum Table {
     Poseidon16(Poseidon16Precompile<true>),
     EdSig(EdSigTable<true>),
     EdDecompress(EdDecompressTable<true>),
+    Sha512(Sha512Table<true>),
+    ScalarL(ScalarLTable<true>),
+    SignerScalar(SignerScalarTable<true>),
+    EdAdd(EdAddTable<true>),
 }
 
 #[macro_export]
@@ -29,6 +33,10 @@ macro_rules! delegate_to_inner {
             Self::Execution(p) => p.$method($($($arg),*)?),
             Self::EdSig(p) => p.$method($($($arg),*)?),
             Self::EdDecompress(p) => p.$method($($($arg),*)?),
+            Self::Sha512(p) => p.$method($($($arg),*)?),
+            Self::ScalarL(p) => p.$method($($($arg),*)?),
+            Self::SignerScalar(p) => p.$method($($($arg),*)?),
+            Self::EdAdd(p) => p.$method($($($arg),*)?),
         }
     };
     // New pattern for applying a macro to the inner value
@@ -39,6 +47,10 @@ macro_rules! delegate_to_inner {
             Table::Execution(p) => $macro_name!(p),
             Table::EdSig(p) => $macro_name!(p),
             Table::EdDecompress(p) => $macro_name!(p),
+            Table::Sha512(p) => $macro_name!(p),
+            Table::ScalarL(p) => $macro_name!(p),
+            Table::SignerScalar(p) => $macro_name!(p),
+            Table::EdAdd(p) => $macro_name!(p),
         }
     };
 }
@@ -58,6 +70,18 @@ impl Table {
     }
     pub const fn ed_decompress() -> Self {
         Self::EdDecompress(EdDecompressTable)
+    }
+    pub const fn sha512() -> Self {
+        Self::Sha512(Sha512Table)
+    }
+    pub const fn scalar_l() -> Self {
+        Self::ScalarL(ScalarLTable)
+    }
+    pub const fn signer_scalar() -> Self {
+        Self::SignerScalar(SignerScalarTable)
+    }
+    pub const fn ed_add() -> Self {
+        Self::EdAdd(EdAddTable)
     }
     pub fn embed<PF: PrimeCharacteristicRing>(&self) -> PF {
         PF::from_usize(self.index())
@@ -152,6 +176,7 @@ mod tests {
             .map(|bus| bus.data.len() + 1)
             .max()
             .unwrap();
-        assert_eq!(MAX_BUS_WIDTH, expected_max_bus_width);
+        assert!(expected_max_bus_width <= MAX_BUS_WIDTH, "widest bus {expected_max_bus_width} > MAX_BUS_WIDTH");
+        assert!(N_INSTRUCTION_COLUMNS + 2 <= MAX_BUS_WIDTH);
     }
 }
