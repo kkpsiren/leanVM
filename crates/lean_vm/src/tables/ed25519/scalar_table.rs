@@ -83,6 +83,9 @@ impl<const BUS: bool> Air for ScalarLTable<BUS> {
         }
         builder.assert_bool(mult.clone());
         for j in 0..WINDOWS { builder.assert_zero(mult.clone() * (c[COL_NSGN + j].clone() + c[COL_SGN + j].clone() - AB::IF::ONE)); } // gated: padding rows are all zero
+        // SOUNDNESS: an inactive row (mult=0) must route nothing, else a padding row injects an
+        // arbitrary (scalar, point) into the MSM — a universal forgery. nz is boolean, so this forces nz=0.
+        for j in 0..WINDOWS { builder.assert_zero((AB::IF::ONE - mult.clone()) * c[COL_NZ + j].clone()); }
         let g = mult.clone();
         let sl = |base: usize, n: usize| -> Vec<AB::IF> { c[base..base + n].to_vec() };
         let hints_r = |base: usize| -> (Vec<AB::IF>, HintCols<'_, AB::IF>) { (c[base..base + 32].to_vec(), HintCols { r: Some(&c[base..base + 32]), q: &c[base + 32..base + 32 + QL], w: &c[base + 66..base + 66 + WL] }) };
@@ -140,7 +143,7 @@ impl<const BUS: bool> Air for ScalarLTable<BUS> {
     }
 }
 // bus 2 + mult 1 + c 65 + bits 124 + cells 4 + uniqueness 12 + windows 13×6 + 1 + k 65 + σ 65 + s<L 65 + acc 64
-pub const N_CONSTRAINTS: usize = 2 + 2 * WINDOWS + 1 + WINDOWS + 65 + 124 + 4 + 12 + 13 * 6 + 1 + 65 + 65 + 65 + 64;
+pub const N_CONSTRAINTS: usize = 2 + 2 * WINDOWS + 1 + WINDOWS + WINDOWS + 65 + 124 + 4 + 12 + 13 * 6 + 1 + 65 + 65 + 65 + 64;
 
 impl<const BUS: bool> TableT for ScalarLTable<BUS> {
     fn name(&self) -> &'static str { "scalar_l" }

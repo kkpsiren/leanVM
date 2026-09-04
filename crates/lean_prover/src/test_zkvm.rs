@@ -863,6 +863,104 @@ fn test_ed25519_batch_native_constraints() {
     for line in native_check_ed_tables(&bytecode, &witness) { println!("NATIVE {line}"); }
 }
 
+/// Phase D: a real leaf from the dataset — sorted by signer, hinted groups, root/ctx/ρ/H_leaf in-circuit,
+/// the public input recomputed reader-side from the columns.
+fn leaf_dataset(n: usize) -> Vec<crate::ed25519_leaf::SigRow> {
+    let path = std::env::var("LEAF_DATASET").unwrap_or_else(|_| format!("{}/.cache/fb-stacks/datasets/sigs-25k-diverse.json", std::env::var("HOME").unwrap()));
+    let rows = crate::ed25519_leaf::rows_from_json(&path);
+    rows[..n].to_vec()
+}
+#[test]
+fn test_zk_vm_ed25519_leaf() {
+    use crate::ed25519_leaf::*;
+    let n: usize = std::env::var("LEAF_N").ok().and_then(|v| v.parse().ok()).unwrap_or(16);
+    let blob_id = [f(11), f(22), f(33), f(44)];
+    let leaf = build_leaf(&leaf_dataset(n), 3, &blob_id).expect("leaf");
+    println!("leaf: {} signatures, {} signers", leaf.n_seg, leaf.n_groups);
+    assert_eq!(leaf.public_input, expected_public_input(&leaf.rows, 3, &blob_id), "reader-side H_leaf");
+    let time = std::time::Instant::now();
+    let proof = prove_leaf(&leaf, &default_whir_config(1)).unwrap();
+    println!("leaf proof: {:.3} s", time.elapsed().as_secs_f32());
+    println!("{}", proof.metadata.as_ref().unwrap().display());
+    verify_leaf(&leaf.public_input, proof.proof).expect("leaf must verify");
+}
+#[test]
+fn test_zk_vm_ed25519_leaf_rejects_tampering() {
+    use crate::ed25519_leaf::*;
+    let blob_id = [f(11), f(22), f(33), f(44)];
+    let mut rows = leaf_dataset(4);
+    // tamper: flip a bit of the digest of the first row (the column changes, the signature no longer matches)
+    rows[0].digest[3] ^= 1;
+    let leaf = build_leaf(&rows, 3, &blob_id).expect("leaf builds");
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| prove_leaf(&leaf, &default_whir_config(1))));
+    let rejected = match res { Ok(Ok(p)) => verify_leaf(&leaf.public_input, p.proof).is_err(), _ => true };
+    assert!(rejected, "a leaf with a signature over the wrong digest must not verify");
+    // wrong public input (different seg_index) must not verify either
+    let leaf2 = build_leaf(&leaf_dataset(4), 3, &blob_id).unwrap();
+    let proof = prove_leaf(&leaf2, &default_whir_config(1)).unwrap();
+    assert!(verify_leaf(&expected_public_input(&leaf2.rows, 4, &blob_id), proof.proof).is_err(), "wrong seg_index must not verify");
+}
+
+/// Every leaf of both 25k datasets builds (all real signatures pass the strict checks); LEAF_SIZE per leaf.
+#[test]
+#[ignore = "dataset sweep: LEAF_SWEEP=build|prove, ~30 s (build) / minutes (prove)"]
+fn test_ed25519_leaf_dataset_sweep() {
+    use crate::ed25519_leaf::*;
+    let mode = std::env::var("LEAF_SWEEP").unwrap_or_else(|_| "build".to_string());
+    let size: usize = std::env::var("LEAF_SIZE").ok().and_then(|v| v.parse().ok()).unwrap_or(1024);
+    let home = std::env::var("HOME").unwrap();
+    let datasets: Vec<String> = std::env::var("LEAF_DATASETS").map(|v| v.split(',').map(String::from).collect()).unwrap_or_else(|_| vec![format!("{home}/.cache/fb-stacks/datasets/sigs-25k.json"), format!("{home}/.cache/fb-stacks/datasets/sigs-25k-diverse.json")]);
+    let blob_id = [f(1), f(2), f(3), f(4)];
+    for path in datasets {
+        let rows = rows_from_json(&path);
+        let n_leaves = (rows.len() + size - 1) / size;
+        let mut ok = 0; let t0 = std::time::Instant::now();
+        for k in 0..n_leaves {
+            let chunk = &rows[k * size..((k + 1) * size).min(rows.len())];
+            let leaf = build_leaf(chunk, k, &blob_id).unwrap_or_else(|e| panic!("{path} leaf {k}: {e}"));
+            assert_eq!(leaf.public_input, expected_public_input(&leaf.rows, k, &blob_id));
+            if mode == "prove" {
+                let t = std::time::Instant::now();
+                let proof = prove_leaf(&leaf, &default_whir_config(1)).unwrap();
+                verify_leaf(&leaf.public_input, proof.proof).expect("leaf verifies");
+                println!("SWEEP {} leaf {k}: {} sigs, {} signers, proof+verify {:.1} s", path.rsplit('/').next().unwrap(), leaf.n_seg, leaf.n_groups, t.elapsed().as_secs_f32());
+            }
+            ok += 1;
+        }
+        println!("SWEEP {}: {ok}/{n_leaves} leaves of {size} {} in {:.1} s", path.rsplit('/').next().unwrap(), if mode == "prove" { "proven and verified" } else { "built" }, t0.elapsed().as_secs_f32());
+    }
+}
+
+/// Frame-model probe: a 70k-cell local array in main, then callee frames; prints the addresses so a
+/// callee frame landing inside the caller's array (frame under-allocation) is visible.
+#[test]
+fn test_big_frame_probe() {
+    // If constant-size arrays are not counted in the frame size, helper's frame lands inside `big`
+    // and the runtime loop's writes to big[i] collide with it.
+    let program = r#"
+def main():
+    big = Array(20000)
+    y = helper(3)
+    assert y == 6
+    for i in range(0, 20000):
+        big[i] = i
+    z = helper(4)
+    assert z == 8
+    return
+
+def helper(a):
+    t = Array(64)
+    for i in unroll(0, 64):
+        t[i] = a + i
+    return t[0] * 2
+"#;
+    let bytecode = compile_program_with_flags(&ProgramSource::Raw(program.to_string()), CompilationFlags::default());
+    let witness = ExecutionWitness { hints: Hints::default(), ..Default::default() };
+    let res = try_execute_bytecode(&bytecode, &[F::ZERO; PUBLIC_INPUT_LEN], &witness, false);
+    match &res { Ok(_) => println!("PROBE: frames disjoint (ok)"), Err(e) => println!("PROBE: runner error: {e}") }
+    assert!(res.is_ok());
+}
+
 #[test]
 fn test_zk_vm_ed25519_batch() {
     let m: usize = std::env::var("BATCH_M").ok().and_then(|v| v.parse().ok()).unwrap_or(2);

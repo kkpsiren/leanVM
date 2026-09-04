@@ -1,5 +1,6 @@
 from recursion import *
 from xmss_aggregate import *
+from ed_leaf import *
 
 MAX_RECURSIONS = MAX_RECURSIONS_PLACEHOLDER
 MAX_N_SIGS = MAX_XMSS_AGGREGATED_PLACEHOLDER
@@ -29,6 +30,17 @@ MULTI_MESSAGE_DIGESTS_OFFSET = COMPONENT_DATA_OFFSET
 
 BYTECODE_CLAIM_NUM_CHUNKS = BYTECODE_CLAIM_SIZE_PADDED / DIGEST_LEN
 MULTI_MESSAGE_BASE_NUM_CHUNKS = BYTECODE_CLAIM_NUM_CHUNKS + 2  # prefix chunk + domsep chunk
+
+# ed25519 leaf mode: [flag, n_seg, 0×6] [zero bytecode claim] [cap] [meta(8)] [root_seg(8)]
+ED25519_LEAF_FLAG = ED25519_LEAF_FLAG_PLACEHOLDER
+ED25519_BLOB_FLAG = ED25519_BLOB_FLAG_PLACEHOLDER
+ED25519_LEAF_VERSION = ED25519_LEAF_VERSION_PLACEHOLDER
+ED_LEAF_META_OFFSET = COMPONENT_DATA_OFFSET
+ED_LEAF_ROOT_OFFSET = COMPONENT_DATA_OFFSET + DIGEST_LEN
+ED_LEAF_INPUT_DATA_SIZE = COMPONENT_DATA_OFFSET + 2 * DIGEST_LEN
+ED_LEAF_NUM_CHUNKS = ED_LEAF_INPUT_DATA_SIZE / DIGEST_LEN
+# ed25519 blob mode: [flag, K, 0×6] [reduced bytecode claim] [cap] [K leaf digests] [n_total, blob_id×4, 0×3]
+ED_BLOB_DIGESTS_OFFSET = COMPONENT_DATA_OFFSET
 
 
 def main():
@@ -69,6 +81,57 @@ def main():
         reduce_bytecode_claims(bytecode_claims, n_bytecode_claims, bytecode_claim_output, initial_fiat_shamir_cap)
 
         slice_hash_range(data_buf, n_components + MULTI_MESSAGE_BASE_NUM_CHUNKS, pub_mem)
+        return
+
+    if discriminator == ED25519_LEAF_FLAG:
+        # ============ ed25519 leaf: N_seg signatures of one blob (Phase D transcript v1) ============
+        n_seg = data_buf[1]
+        assert n_seg != 0
+        meta = data_buf + ED_LEAF_META_OFFSET
+        assert meta[0] == n_seg
+        assert meta[2] == ED25519_LEAF_VERSION
+        assert meta[3] == 0
+        ed25519_leaf(n_seg, meta, data_buf + ED_LEAF_ROOT_OFFSET)
+        # no inner proofs: the zero bytecode claim
+        for k in unroll(0, BYTECODE_POINT_N_VARS):
+            set_to_5_zeros(bytecode_claim_output + k * DIM)
+        bytecode_claim_output[BYTECODE_POINT_N_VARS * DIM] = BYTECODE_ZERO_EVAL
+        for k in unroll(1, DIM):
+            bytecode_claim_output[BYTECODE_POINT_N_VARS * DIM + k] = 0
+        slice_hash(data_buf, ED_LEAF_NUM_CHUNKS, pub_mem)
+        return
+
+    if discriminator == ED25519_BLOB_FLAG:
+        # ============ ed25519 blob: K leaf proofs, seg_index = position, Σ n_seg = n_total ============
+        k_leaves = data_buf[1]
+        assert k_leaves != 0
+        assert k_leaves <= MAX_RECURSIONS
+        trailer = data_buf + ED_BLOB_DIGESTS_OFFSET + k_leaves * DIGEST_LEN
+        n_bytecode_claims = k_leaves * 2
+        bytecode_claims = Array(n_bytecode_claims)
+        n_acc = Array(k_leaves + 1)
+        n_acc[0] = 0
+        for c in range(0, k_leaves):
+            digest = data_buf + ED_BLOB_DIGESTS_OFFSET + c * DIGEST_LEN
+            leaf_buf = Array(ED_LEAF_INPUT_DATA_SIZE)
+            hint_witness("component_layout", leaf_buf)
+            ensure_well_formed_input_data(leaf_buf, initial_fiat_shamir_cap, ED25519_LEAF_FLAG)
+            meta = leaf_buf + ED_LEAF_META_OFFSET
+            assert meta[0] == leaf_buf[1]
+            assert meta[1] == c
+            assert meta[2] == ED25519_LEAF_VERSION
+            assert meta[3] == 0
+            for t in unroll(0, 4):
+                assert meta[4 + t] == trailer[1 + t]
+            n_acc[c + 1] = n_acc[c] + leaf_buf[1]
+            slice_hash(leaf_buf, ED_LEAF_NUM_CHUNKS, digest)
+            bytecode_claims[2 * c] = leaf_buf + BYTECODE_CLAIM_OFFSET
+            bytecode_claims[2 * c + 1] = recursion(digest, initial_fiat_shamir_cap)
+        assert n_acc[k_leaves] == trailer[0]
+        for t in unroll(5, DIGEST_LEN):
+            assert trailer[t] == 0
+        reduce_bytecode_claims(bytecode_claims, n_bytecode_claims, bytecode_claim_output, initial_fiat_shamir_cap)
+        slice_hash_range(data_buf, k_leaves + MULTI_MESSAGE_BASE_NUM_CHUNKS + 1, pub_mem)
         return
 
     assert discriminator == SINGLE_MESSAGE_FLAG

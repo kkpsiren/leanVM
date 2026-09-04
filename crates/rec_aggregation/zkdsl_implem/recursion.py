@@ -1,6 +1,7 @@
 from snark_lib import *
 from whir import *
 from hashing import *
+from g8 import *
 
 N_TABLES = N_TABLES_PLACEHOLDER
 
@@ -30,6 +31,8 @@ ONE_BUSES_NEW_COLS = ONE_BUSES_NEW_COLS_PLACEHOLDER  # [[[_; n_new]; num_buses];
 
 NUM_COLS_AIR = NUM_COLS_AIR_PLACEHOLDER
 MAX_NUM_COLS_AIR = MAX_NUM_COLS_AIR_PLACEHOLDER  # max(NUM_COLS_AIR[t] for t in 0..N_TABLES)
+COLS_AIR_OFFSETS = COLS_AIR_OFFSETS_PLACEHOLDER  # prefix sums of NUM_COLS_AIR: the per-table base in the pcs arrays
+TOTAL_NUM_COLS_AIR = TOTAL_NUM_COLS_AIR_PLACEHOLDER
 ONE_BUSES_ALL_COLS = ONE_BUSES_ALL_COLS_PLACEHOLDER  # [[col, ...], _; N_TABLES] — sorted union of cols across all Multiplicity::One buses per table
 
 MAX_AIR_FULL_DEGREE = MAX_AIR_FULL_DEGREE_PLACEHOLDER
@@ -61,6 +64,7 @@ BYTECODE_CLAIM_SIZE = (BYTECODE_POINT_N_VARS + 1) * DIM
 BYTECODE_CLAIM_SIZE_PADDED = next_multiple_of(BYTECODE_CLAIM_SIZE, DIGEST_LEN)
 INNER_PUBLIC_MEMORY_LOG_SIZE = 3  # public input = 1 hash digest = 8 field elements
 PUB_INPUT_SIZE = DIGEST_LEN  # the public input is a single digest
+DIMS_N_CHUNKS = div_ceil(N_TABLES + 2, DIGEST_LEN)
 
 
 def recursion(inner_public_memory, initial_fiat_shamir_cap):
@@ -72,10 +76,9 @@ def recursion(inner_public_memory, initial_fiat_shamir_cap):
 
     fs = fs_observe(fs, inner_public_memory, PUB_INPUT_SIZE)  # observe public input (the data digest)
 
-    # table dims
-    debug_assert(N_TABLES + 1 < DIGEST_LEN)
-    fs, dims = fs_receive_chunks(fs, 1)
-    for i in unroll(N_TABLES + 2, 8):
+    # table dims: [whir_log_inv_rate, log_memory, log heights × N_TABLES], zero-padded to whole chunks
+    fs, dims = fs_receive_chunks(fs, DIMS_N_CHUNKS)
+    for i in unroll(N_TABLES + 2, DIMS_N_CHUNKS * DIGEST_LEN):
         assert dims[i] == 0
     whir_log_inv_rate = dims[0]
     log_memory = dims[1]
@@ -282,9 +285,9 @@ def recursion(inner_public_memory, initial_fiat_shamir_cap):
     bus_numerators_values = Array(TOTAL_COLUMN_BUSES * DIM)
     bus_denominators_values = Array(TOTAL_COLUMN_BUSES * DIM)
     pcs_inner_points = Array(N_TABLES)
-    pcs_vals_logup = Array(N_TABLES * MAX_NUM_COLS_AIR)
-    pcs_vals_air = Array(N_TABLES * MAX_NUM_COLS_AIR)
-    pcs_shifts_air = Array(N_TABLES * MAX_NUM_COLS_AIR)
+    pcs_vals_logup = Array(TOTAL_NUM_COLS_AIR)
+    pcs_vals_air = Array(TOTAL_NUM_COLS_AIR)
+    pcs_shifts_air = Array(TOTAL_NUM_COLS_AIR)
 
     for table_index in unroll(0, N_TABLES):
         log_n_rows = table_log_heights[table_index]
@@ -324,13 +327,13 @@ def recursion(inner_public_memory, initial_fiat_shamir_cap):
                 fs, new_evals = fs_receive_ef_inlined(fs, n_new)
                 for i in unroll(0, n_new):
                     new_col = ONE_BUSES_NEW_COLS[table_index][one_bus_idx][i]
-                    pcs_vals_logup[table_index * MAX_NUM_COLS_AIR + new_col] = new_evals + i * DIM
+                    pcs_vals_logup[COLS_AIR_OFFSETS[table_index] + new_col] = new_evals + i * DIM
 
             data_evals = Array(n_data * DIM)
             for i in unroll(0, n_data):
                 data_col = ONE_BUSES_DATA_COLS[table_index][one_bus_idx][i]
                 data_ofs = ONE_BUSES_DATA_OFFSETS[table_index][one_bus_idx][i]
-                src = pcs_vals_logup[table_index * MAX_NUM_COLS_AIR + data_col]
+                src = pcs_vals_logup[COLS_AIR_OFFSETS[table_index] + data_col]
                 if data_ofs == 0:
                     copy_ef(src, data_evals + i * DIM)
                 if data_ofs != 0:
@@ -390,6 +393,7 @@ def recursion(inner_public_memory, initial_fiat_shamir_cap):
     fs, all_challenges, batched_air_final_value = sumcheck_verify_reversed(fs, n_max, initial_sum, MAX_AIR_FULL_DEGREE)
 
     check_sum: Mut = ZERO_VEC_PTR
+    air_evals_buf = Array(N_TABLES * DIM)
     for table_index in unroll(0, N_TABLES):
         log_n_rows = table_log_heights[table_index]
         n_flat_columns = N_AIR_COLUMNS[table_index]
@@ -398,9 +402,12 @@ def recursion(inner_public_memory, initial_fiat_shamir_cap):
 
         fs, inner_evals = fs_receive_ef_inlined(fs, n_flat_columns + n_shift_columns)
 
-        air_constraints_eval = evaluate_air_constraints(
-            table_index, inner_evals, air_alpha_powers + alpha_offset * DIM, logup_beta_eq_poly
+        # written through an output buffer: a per-iteration return value would reuse one frame slot
+        # across the unrolled iterations (compiler limitation), which is fatal in write-once memory
+        evaluate_air_constraints_into(
+            table_index, inner_evals, air_alpha_powers + alpha_offset * DIM, logup_beta_eq_poly, air_evals_buf + table_index * DIM
         )
+        air_constraints_eval = air_evals_buf + table_index * DIM
 
         bus_point = pcs_inner_points[table_index]
         eq_val = poly_eq_extension_dynamic_ret(bus_point, all_challenges, log_n_rows)
@@ -412,11 +419,11 @@ def recursion(inner_public_memory, initial_fiat_shamir_cap):
 
         # AIR block (i=1): all flat cols 0..n_flat_columns populated; shifts 0..n_shift_columns populated.
         for i in unroll(0, n_flat_columns):
-            pcs_vals_air[table_index * MAX_NUM_COLS_AIR + i] = inner_evals + i * DIM
+            pcs_vals_air[COLS_AIR_OFFSETS[table_index] + i] = inner_evals + i * DIM
         if n_shift_columns != 0:
             evals_shift = inner_evals + n_flat_columns * DIM
             for i in unroll(0, n_shift_columns):
-                pcs_shifts_air[table_index * MAX_NUM_COLS_AIR + i] = evals_shift + i * DIM
+                pcs_shifts_air[COLS_AIR_OFFSETS[table_index] + i] = evals_shift + i * DIM
 
     # verify that the AIR-batched sumcheck is valid
     copy_ef(check_sum, batched_air_final_value)
@@ -460,7 +467,7 @@ def recursion(inner_public_memory, initial_fiat_shamir_cap):
         for k in unroll(0, len(ONE_BUSES_ALL_COLS[table_index])):
             col = ONE_BUSES_ALL_COLS[table_index][k]
             whir_sum = add_extension_ret(
-                mul_extension_ret(pcs_vals_logup[table_index * MAX_NUM_COLS_AIR + col], curr_randomness),
+                mul_extension_ret(pcs_vals_logup[COLS_AIR_OFFSETS[table_index] + col], curr_randomness),
                 whir_sum,
             )
             curr_randomness += DIM
@@ -468,13 +475,13 @@ def recursion(inner_public_memory, initial_fiat_shamir_cap):
         # AIR
         for j in unroll(0, N_AIR_SHIFT_COLUMNS[table_index]):
             whir_sum = add_extension_ret(
-                mul_extension_ret(pcs_shifts_air[table_index * MAX_NUM_COLS_AIR + j], curr_randomness),
+                mul_extension_ret(pcs_shifts_air[COLS_AIR_OFFSETS[table_index] + j], curr_randomness),
                 whir_sum,
             )
             curr_randomness += DIM
         for j in unroll(0, N_AIR_COLUMNS[table_index]):
             whir_sum = add_extension_ret(
-                mul_extension_ret(pcs_vals_air[table_index * MAX_NUM_COLS_AIR + j], curr_randomness),
+                mul_extension_ret(pcs_vals_air[COLS_AIR_OFFSETS[table_index] + j], curr_randomness),
                 whir_sum,
             )
             curr_randomness += DIM
@@ -779,23 +786,19 @@ def compute_total_gkr_n_vars(log_memory, log_bytecode_padded, log_range_region, 
     total += two_exp(log_range_region)  # range region
     for table_index in unroll(0, N_TABLES):
         n_rows = tables_heights[table_index]
-        # +1 for the Multiplicity::Column bus, plus one block per Multiplicity::One bus.
-        n_buses = len(ONE_BUSES_DOMSEPS[table_index]) + 1
+        # Column buses (precompile bus + routing/chunk/token buses) + one block per Multiplicity::One bus.
+        n_buses = len(ONE_BUSES_DOMSEPS[table_index]) + N_COLUMN_BUSES[table_index]
         total += n_rows * n_buses
     return log2_ceil_runtime(total)
 
 
-def evaluate_air_constraints(table_index, inner_evals, air_alpha_powers, logup_beta_eq_poly):
+def evaluate_air_constraints_into(table_index, inner_evals, air_alpha_powers, logup_beta_eq_poly, out):
     res: Imm
     debug_assert(table_index < N_TABLES)
     match table_index:
-        case 0:
-            res = evaluate_air_constraints_table_0(inner_evals, air_alpha_powers, logup_beta_eq_poly)
-        case 1:
-            res = evaluate_air_constraints_table_1(inner_evals, air_alpha_powers, logup_beta_eq_poly)
-        case 2:
-            res = evaluate_air_constraints_table_2(inner_evals, air_alpha_powers, logup_beta_eq_poly)
-    return res
+        AIR_DISPATCH_ARMS_PLACEHOLDER
+    copy_ef(res, out)
+    return
 
 
 EVALUATE_AIR_FUNCTIONS_PLACEHOLDER

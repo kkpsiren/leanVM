@@ -9,7 +9,7 @@ use core::ops::{Add, AddAssign, Deref, Mul, MulAssign, Neg, Sub, SubAssign};
 use field::{Algebra, Field, InjectiveMonomial, PrimeCharacteristicRing};
 use koala_bear::KoalaBear;
 
-use crate::{Air, AirBuilder};
+use crate::{Air, AirBuilder, G8IdentityRecord, G8_N_CONSTRAINTS};
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct SymbolicVariable<F> {
@@ -261,6 +261,21 @@ struct SymbolicAirBuilder<F: Field> {
     /// Column-multiplicity buses in declaration order: (multiplicity, data ‖ domainsep).
     buses: Vec<(SymbolicExpression<F>, Vec<SymbolicExpression<F>>)>,
     pending_multiplicity: Option<SymbolicExpression<F>>,
+    /// Recorded G8 identities (their constraints are `Constant(ZERO)` placeholders in `constraints`).
+    identities: Vec<SymbolicG8Identity<F>>,
+}
+
+/// A recorded G8 identity: `first_constraint` is the index of its first placeholder constraint.
+#[derive(Debug, Clone)]
+pub struct SymbolicG8Identity<F: Copy + 'static> {
+    pub first_constraint: usize,
+    pub gate: SymbolicExpression<F>,
+    pub products: Vec<(Vec<SymbolicExpression<F>>, Vec<SymbolicExpression<F>>, bool)>,
+    pub linears: Vec<(Vec<SymbolicExpression<F>>, bool)>,
+    pub r: Option<Vec<SymbolicExpression<F>>>,
+    pub q: Vec<SymbolicExpression<F>>,
+    pub w: Vec<SymbolicExpression<F>>,
+    pub modulus: [u8; 32],
 }
 
 impl<F: Field> SymbolicAirBuilder<F> {
@@ -278,6 +293,7 @@ impl<F: Field> SymbolicAirBuilder<F> {
             constraints: Vec::new(),
             buses: Vec::new(),
             pending_multiplicity: None,
+            identities: Vec::new(),
         }
     }
 
@@ -312,6 +328,24 @@ where
 
     /// Buses are declared as pairs of calls: first the multiplicity (one value), then the data
     /// with the domainsep last. Any number of buses, in the table's `bus_interactions()` order.
+    fn record_g8_identity(&mut self, rec: G8IdentityRecord<'_, Self::IF>) -> bool {
+        let first_constraint = self.constraints.len();
+        self.identities.push(SymbolicG8Identity {
+            first_constraint,
+            gate: *rec.gate,
+            products: rec.products.iter().map(|(a, b, pos)| (a.to_vec(), b.to_vec(), *pos)).collect(),
+            linears: rec.linears.iter().map(|(c, pos)| (c.to_vec(), *pos)).collect(),
+            r: rec.r.map(|r| r.to_vec()),
+            q: rec.q.to_vec(),
+            w: rec.w.to_vec(),
+            modulus: *rec.modulus,
+        });
+        for _ in 0..G8_N_CONSTRAINTS {
+            self.constraints.push(SymbolicExpression::Constant(F::ZERO));
+        }
+        true
+    }
+
     fn declare_values(&mut self, values: &[Self::IF]) {
         match self.pending_multiplicity.take() {
             None => {
@@ -323,10 +357,12 @@ where
     }
 }
 
-/// (constraints, buses) where each bus is (multiplicity, data ‖ domainsep), in bus order.
+/// (constraints, buses, identities) where each bus is (multiplicity, data ‖ domainsep), in bus order,
+/// and each identity's 65 constraints are placeholders in `constraints`.
 pub type SymbolicAirData<F> = (
     Vec<SymbolicExpression<F>>,
     Vec<(SymbolicExpression<F>, Vec<SymbolicExpression<F>>)>,
+    Vec<SymbolicG8Identity<F>>,
 );
 
 pub fn get_symbolic_constraints_and_bus_data_values<F: Field, A: Air>(air: &A) -> SymbolicAirData<F>
@@ -337,5 +373,5 @@ where
     let mut builder = SymbolicAirBuilder::<F>::new(air.n_columns(), air.n_shift_columns());
     air.eval(&mut builder, &Default::default());
     assert!(builder.pending_multiplicity.is_none(), "bus multiplicity declared without data");
-    (builder.constraints(), builder.buses)
+    (builder.constraints(), builder.buses.clone(), builder.identities.clone())
 }

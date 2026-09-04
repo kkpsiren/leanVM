@@ -87,4 +87,28 @@ pub trait AirBuilder: Sized {
     fn declare_values(&mut self, values: &[Self::IF]) {
         let _ = values;
     }
+
+    /// A non-native limb identity (the ed25519 G8 gadget): `Σ ±a·b + Σ ±c − r − q·M ≡ (W − off)(X − 256)`
+    /// as `G8_N_CONSTRAINTS` coefficient constraints. Builders that evaluate return `false` and the caller
+    /// expands the polynomials; a structural builder (recursion codegen) may record the identity and
+    /// return `true`, in which case it must account for `G8_N_CONSTRAINTS` constraints itself.
+    #[inline(always)]
+    fn record_g8_identity(&mut self, rec: G8IdentityRecord<'_, Self::IF>) -> bool {
+        let _ = rec;
+        false
+    }
+}
+
+pub const G8_N_CONSTRAINTS: usize = 65;
+#[derive(Debug)]
+pub struct G8IdentityRecord<'a, T> {
+    pub gate: &'a T,
+    /// (a limbs, b limbs, positive?)
+    pub products: &'a [(&'a [T], &'a [T], bool)],
+    /// (limbs, positive?)
+    pub linears: &'a [(&'a [T], bool)],
+    pub r: Option<&'a [T]>,
+    pub q: &'a [T],
+    pub w: &'a [T],
+    pub modulus: &'a [u8; 32],
 }

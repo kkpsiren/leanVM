@@ -1,4 +1,5 @@
 use backend::*;
+use backend::{G8_N_CONSTRAINTS, SymbolicG8Identity};
 use lean_compiler::{CompilationFlags, ProgramSource, compile_program_with_flags};
 use lean_prover::{
     GRINDING_BITS, MAX_NUM_VARIABLES_TO_SEND_COEFFS, RS_DOMAIN_INITIAL_REDUCTION_FACTOR, WHIR_INITIAL_FOLDING_FACTOR,
@@ -48,6 +49,8 @@ pub const MAX_XMSS_DUPLICATES: usize = 1 << 15; // ...same
 
 pub(crate) const SINGLE_MESSAGE_FLAG: usize = 1;
 pub(crate) const MULTI_MESSAGE_FLAG: usize = 0;
+pub(crate) const ED25519_LEAF_FLAG: usize = 2;
+pub(crate) const ED25519_BLOB_FLAG: usize = 3;
 
 pub(crate) const BYTECODE_CLAIM_OFFSET: usize = DIGEST_LEN;
 /// Single-message component data: pubkeys_hash | message | merkle_chunks | tweaks_hash.
@@ -364,6 +367,12 @@ fn build_replacements(log_inner_bytecode: usize, bytecode_zero_eval: F) -> BTree
     }
     let max_num_cols_air = ALL_TABLES.iter().map(|t| t.n_columns()).max().unwrap();
     replacements.insert("MAX_NUM_COLS_AIR_PLACEHOLDER".to_string(), max_num_cols_air.to_string());
+    {
+        let mut offsets = vec![]; let mut acc = 0usize;
+        for t in ALL_TABLES { offsets.push(acc.to_string()); acc += t.n_columns(); }
+        replacements.insert("COLS_AIR_OFFSETS_PLACEHOLDER".to_string(), format!("[{}]", offsets.join(", ")));
+        replacements.insert("TOTAL_NUM_COLS_AIR_PLACEHOLDER".to_string(), acc.to_string());
+    }
     replacements.insert(
         "ONE_BUSES_ALL_COLS_PLACEHOLDER".to_string(),
         format!("[{}]", one_buses_all_cols.join(", ")),
@@ -430,6 +439,13 @@ fn build_replacements(log_inner_bytecode: usize, bytecode_zero_eval: F) -> BTree
         "EVALUATE_AIR_FUNCTIONS_PLACEHOLDER".to_string(),
         all_air_evals_in_zk_dsl(),
     );
+    {
+        // One match arm per table so the dispatcher covers 0..N_TABLES (not just the stock 3).
+        let arms: Vec<String> = (0..N_TABLES).map(|i| format!("case {i}:
+            res = evaluate_air_constraints_table_{i}(inner_evals, air_alpha_powers, logup_beta_eq_poly)")).collect();
+        replacements.insert("AIR_DISPATCH_ARMS_PLACEHOLDER".to_string(), arms.join("
+        "));
+    }
     replacements.insert(
         "N_INSTRUCTION_COLUMNS_PLACEHOLDER".to_string(),
         N_INSTRUCTION_COLUMNS.to_string(),
@@ -475,6 +491,10 @@ fn build_replacements(log_inner_bytecode: usize, bytecode_zero_eval: F) -> BTree
         MAX_XMSS_DUPLICATES.to_string(),
     );
     replacements.insert("MAX_RECURSIONS_PLACEHOLDER".to_string(), MAX_RECURSIONS.to_string());
+    replacements.insert("ED25519_LEAF_FLAG_PLACEHOLDER".to_string(), ED25519_LEAF_FLAG.to_string());
+    replacements.insert("ED25519_BLOB_FLAG_PLACEHOLDER".to_string(), ED25519_BLOB_FLAG.to_string());
+    replacements.insert("ED25519_LEAF_VERSION_PLACEHOLDER".to_string(), lean_prover::ed25519_leaf::LEAF_VERSION.to_string());
+    for (k, v) in lean_prover::ed25519_leaf::leaf_program_replacements() { replacements.insert(k, v); }
 
     // Bytecode zero eval
     replacements.insert(
@@ -551,7 +571,7 @@ fn air_eval_in_zk_dsl<T: TableT>(table: T) -> String
 where
     T::ExtraData: Default,
 {
-    let (constraints, buses) = get_symbolic_constraints_and_bus_data_values::<F, _>(&table);
+    let (constraints, buses, identities) = get_symbolic_constraints_and_bus_data_values::<F, _>(&table);
     let mut ctx = AirCodegenCtx::new();
 
     let mut res = format!(
@@ -562,9 +582,18 @@ where
 
     let n_constraints = constraints.len();
     res += &format!("\n    constraints_buf = Array(DIM * {})", n_constraints);
-    for (index, constraint) in constraints.iter().enumerate() {
+    let identity_at: HashMap<usize, usize> = identities.iter().enumerate().map(|(k, id)| (id.first_constraint, k)).collect();
+    let mut index = 0;
+    while index < n_constraints {
+        if let Some(&k) = identity_at.get(&index) {
+            // a recorded G8 identity: 65 constraints through the loop-based helpers (g8.py)
+            emit_g8_identity(&identities[k], &format!("constraints_buf + {} * DIM", index), &mut ctx, &mut res);
+            index += G8_N_CONSTRAINTS;
+            continue;
+        }
         let dest = format!("constraints_buf + {} * DIM", index);
-        eval_air_constraint(*constraint, Some(&dest), &mut ctx, &mut res);
+        eval_air_constraint(constraints[index], Some(&dest), &mut ctx, &mut res);
+        index += 1;
     }
 
     // Column buses, in order: the j-th bus's multiplicity → alpha slot 2j, its fingerprint → slot 2j+1;
@@ -616,6 +645,59 @@ where
     res += "\n    return sum";
     res += "\n";
     res
+}
+
+/// A limb vector as a zkDSL pointer: consecutive column openings are passed as `inner_evals + DIM*k`,
+/// anything else is materialized into a fresh buffer.
+fn g8_operand(exprs: &[SymbolicExpression<F>], ctx: &mut AirCodegenCtx, res: &mut String) -> String {
+    let consecutive = exprs.iter().enumerate().all(|(i, e)| matches!(e, SymbolicExpression::Variable(v) if v.index == match exprs[0] { SymbolicExpression::Variable(v0) => v0.index + i, _ => usize::MAX }));
+    if consecutive && !exprs.is_empty() {
+        if let SymbolicExpression::Variable(v0) = exprs[0] {
+            return format!("{} + DIM * {}", AIR_INNER_VALUES_VAR, v0.index);
+        }
+    }
+    let name = format!("g8v_{}", ctx.ctr.get_next());
+    res.push_str(&format!("\n    {} = Array(DIM * {})", name, exprs.len()));
+    for (i, e) in exprs.iter().enumerate() {
+        let dest = format!("{} + DIM * {}", name, i);
+        eval_air_constraint(*e, Some(&dest), ctx, res);
+    }
+    name
+}
+
+fn emit_g8_identity(id: &SymbolicG8Identity<F>, dest: &str, ctx: &mut AirCodegenCtx, res: &mut String) {
+    let gate = eval_air_constraint(id.gate, None, ctx, res);
+    let mut v = format!("g8v_{}", ctx.ctr.get_next());
+    res.push_str(&format!("\n    {} = g8_zero()", v));
+    for (a, b, pos) in &id.products {
+        let a_ptr = g8_operand(a, ctx, res);
+        let b_ptr = g8_operand(b, ctx, res);
+        let b_rev = format!("g8v_{}", ctx.ctr.get_next());
+        res.push_str(&format!("\n    {} = g8_rev({})", b_rev, b_ptr));
+        let nv = format!("g8v_{}", ctx.ctr.get_next());
+        res.push_str(&format!("\n    {} = {}({}, {}, {})", nv, if *pos { "g8_conv_add" } else { "g8_conv_sub" }, v, a_ptr, b_rev));
+        v = nv;
+    }
+    for (c, pos) in &id.linears {
+        let c_ptr = g8_operand(c, ctx, res);
+        let nv = format!("g8v_{}", ctx.ctr.get_next());
+        res.push_str(&format!("\n    {} = {}({}, {})", nv, if *pos { "g8_lin_add" } else { "g8_lin_sub" }, v, c_ptr));
+        v = nv;
+    }
+    if let Some(r) = &id.r {
+        let r_ptr = g8_operand(r, ctx, res);
+        let nv = format!("g8v_{}", ctx.ctr.get_next());
+        res.push_str(&format!("\n    {} = g8_lin_sub({}, {})", nv, v, r_ptr));
+        v = nv;
+    }
+    let q_ptr = g8_operand(&id.q, ctx, res);
+    let m_rev: Vec<u32> = id.modulus.iter().rev().map(|b| *b as u32).collect();
+    let m_name = ctx.write_base_constants(&m_rev, res);
+    let nv = format!("g8v_{}", ctx.ctr.get_next());
+    res.push_str(&format!("\n    {} = g8_qsub({}, {}, {})", nv, v, q_ptr, m_name));
+    v = nv;
+    let w_ptr = g8_operand(&id.w, ctx, res);
+    res.push_str(&format!("\n    g8_chain({}, {}, {}, {})", dest, gate, v, w_ptr));
 }
 
 fn eval_air_constraint(
@@ -843,6 +925,47 @@ fn eval_air_binary_op(
                 v
             }
         }
+    }
+}
+
+/// Every generated zkDSL evaluator equals the native `eval_extension` of its table on random inputs
+/// (runner-level, no proof) — the check that the loop-based G8 emission is exact.
+#[test]
+fn test_zk_dsl_air_evaluators_match_native() {
+    use lean_vm::ExtraDataForBuses;
+    let mut x = 0x2545f4914f6cdd1du64;
+    let mut nb = move || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; x };
+    let mut rand_ef = |nb: &mut dyn FnMut() -> u64| -> EF { EF::from_basis_coefficients_fn(|_| F::from_usize((nb() % F::ORDER_U64) as usize)) };
+    let cells = |v: &[EF]| -> Vec<F> { v.iter().flat_map(|e| e.as_basis_coefficients_slice().to_vec()).collect() };
+    for table in ALL_TABLES {
+        let n_evals = table.n_columns() + table.n_shift_columns();
+        let n_alphas = table.n_constraints();
+        let n_betas = 1 << LOG_MAX_BUS_WIDTH;
+        let evals: Vec<EF> = (0..n_evals).map(|_| rand_ef(&mut nb)).collect();
+        let alphas: Vec<EF> = (0..n_alphas).map(|_| rand_ef(&mut nb)).collect();
+        let betas: Vec<EF> = (0..n_betas).map(|_| rand_ef(&mut nb)).collect();
+        let extra = ExtraDataForBuses::new(&betas, alphas.clone());
+        macro_rules! native { ($t:expr) => {{ <_ as SumcheckComputation<EF>>::eval_extension($t, &evals, &extra) }}; }
+        let expected: EF = delegate_to_inner!(&table => native);
+        let mut replacements = build_replacements(18, F::ZERO);
+        replacements.insert("N_EVALS_PLACEHOLDER".to_string(), n_evals.to_string());
+        replacements.insert("N_ALPHAS_PLACEHOLDER".to_string(), n_alphas.to_string());
+        replacements.insert("N_BETAS_PLACEHOLDER".to_string(), n_betas.to_string());
+        replacements.insert("EVAL_FN_PLACEHOLDER".to_string(), format!("evaluate_air_constraints_table_{}", table.index()));
+        let bytecode = compile_program_with_flags(&ProgramSource::Embedded { entry: "air_eval_test.py".to_string(), dir: &EMBEDDED_ZK_DSL }, CompilationFlags { replacements });
+        let mut hints = Hints::default();
+        hints.insert(&bytecode, "evals", arena_vec![ArenaVec::from_slice(&cells(&evals))]);
+        hints.insert(&bytecode, "alphas", arena_vec![ArenaVec::from_slice(&cells(&alphas))]);
+        hints.insert(&bytecode, "betas", arena_vec![ArenaVec::from_slice(&cells(&betas))]);
+        hints.insert(&bytecode, "expect", arena_vec![ArenaVec::from_slice(&cells(&[expected]))]);
+        hints.insert(&bytecode, "table_index", arena_vec![arena_vec![F::from_usize(table.index())]]);
+        let witness = ExecutionWitness { hints, preamble_memory_len: PREAMBLE_MEMORY_LEN, ..Default::default() };
+        let res = try_execute_bytecode(&bytecode, &[F::ZERO; PUBLIC_INPUT_LEN], &witness, false);
+        match &res {
+            Ok(r) => println!("{}: zkDSL evaluator == native ({} cycles, bytecode 2^{})", table.name(), r.pcs.len(), bytecode.log_size()),
+            Err(e) => println!("{}: MISMATCH / runner error: {e:?}", table.name()),
+        }
+        assert!(res.is_ok(), "{}: the zkDSL evaluator disagrees with the native AIR", table.name());
     }
 }
 

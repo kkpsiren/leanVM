@@ -191,4 +191,20 @@ pub fn sqrt_mod_p(a: &[u8; 32]) -> Option<[u8; 32]> {
     if (&r * &r).mod_floor(&m) != ai { let i = BigInt::from(2).modpow(&((&m - BigInt::from(1)) >> 2usize), &m); r = (r * i).mod_floor(&m); if (&r * &r).mod_floor(&m) != ai { return None; } }
     Some(int_to_limbs(&r, 32).try_into().unwrap())
 }
+/// dalek-semantics decompression to an affine point (canonical coordinates); None if not on the curve.
+pub fn decompress_affine(a: &[u8; 32]) -> Option<Affine> {
+    let m = &P_25519; let sign = a[31] >> 7;
+    let mut y = *a; y[31] &= 0x7f;
+    let yi = limbs_to_int(&y).mod_floor(&modulus_int(m));
+    let y: [u8; 32] = int_to_limbs(&yi, 32).try_into().unwrap();
+    let t = mod_mul(&y, &y, m); let v = mod_mul(&D_LIMBS, &t, m);
+    let one = { let mut o = [0u8; 32]; o[0] = 1; o };
+    let num = mod_sub(&t, &one, m); let den = mod_add(&one, &v, m);
+    if limbs_to_int(&den).mod_floor(&modulus_int(m)) == num_bigint::BigInt::from(0u8) { return None; }
+    let x2 = mod_mul(&num, &mod_inv(&den, m), m);
+    let x = sqrt_mod_p(&x2)?;
+    let xcan = if x[0] & 1 == 0 { x } else { mod_sub(&[0u8; 32], &x, m) };
+    let ax = if sign == 1 { if xcan == [0u8; 32] { return None; } mod_sub(&[0u8; 32], &xcan, m) } else { xcan };
+    Some(Affine { x: ax, y })
+}
 pub fn compress(p: &Affine) -> [u8; 32] { let mut a = p.y; a[31] |= (p.x[0] & 1) << 7; a }

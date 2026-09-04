@@ -2,6 +2,7 @@
 
 use std::fmt::Display;
 
+pub mod ed25519_leaf;
 pub mod prove_execution;
 mod trace_gen;
 pub mod verify_execution;

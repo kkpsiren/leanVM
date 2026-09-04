@@ -43,7 +43,10 @@ pub fn eval_identity<AB: AirBuilder>(
     hints: &HintCols<'_, AB::IF>,
     modulus: &[u8; 32],
 ) {
-    debug_assert!(products.len() <= 3, "at most 3 products keep W' within 16 bits");
+    assert!(products.len() <= 3, "at most 3 products keep W' within 16 bits");
+    if builder.record_g8_identity(G8IdentityRecord { gate, products, linears, r: hints.r, q: hints.q, w: hints.w, modulus }) {
+        return; // recorded structurally (recursion codegen): 65 placeholder constraints
+    }
     let f = |x: usize| AB::F::from_usize(x);
     let q_off = AB::IF::from_usize(Q_OFFSET);
     let w_off = AB::IF::from_usize(W_OFFSET);

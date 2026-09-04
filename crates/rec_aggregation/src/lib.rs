@@ -1,6 +1,7 @@
 #![cfg_attr(not(test), allow(unused_crate_dependencies))]
 pub mod benchmark;
 mod bytecode_claims;
+pub mod ed25519;
 mod compilation;
 mod error;
 mod multi_message_aggregation;

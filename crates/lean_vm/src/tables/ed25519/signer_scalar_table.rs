@@ -61,6 +61,8 @@ impl<const BUS: bool> Air for SignerScalarTable<BUS> {
         builder.assert_bool(mult.clone()); builder.assert_zero(nu_c);
         let flip = c[COL_FLIP].clone(); builder.assert_bool(flip.clone());
         for j in 0..T7_WINDOWS { let sg = c[COL_SGN + j].clone(); builder.assert_zero(c[COL_PSGN + j].clone() - (sg.clone() + flip.clone() - (sg * flip.clone()).double())); }
+        // SOUNDNESS: an inactive row must route nothing (see scalar_table). nz is boolean ⇒ forces nz=0.
+        for j in 0..T7_WINDOWS { builder.assert_zero((AB::IF::ONE - mult.clone()) * c[COL_NZ + j].clone()); }
         let g = mult.clone();
         let k: Vec<AB::IF> = c[COL_K..COL_K + 32].to_vec();
         let hk = HintCols { r: Some(&c[COL_KRED..COL_KRED + 32]), q: &c[COL_QW..COL_QW + QL], w: &c[COL_QW + QL..COL_QW + QL + WL] };
@@ -82,7 +84,7 @@ impl<const BUS: bool> Air for SignerScalarTable<BUS> {
     }
 }
 // bus 2 + mult/nu_c 2 + identity 65 + bits 253 + recompose 32 + windows 26×6 + 1
-pub const N_CONSTRAINTS: usize = 2 + 2 * T7_WINDOWS + 2 + 1 + T7_WINDOWS + 65 + 253 + 32 + 26 * 6 + 1;
+pub const N_CONSTRAINTS: usize = 2 + 2 * T7_WINDOWS + 2 + 1 + T7_WINDOWS + T7_WINDOWS + 65 + 253 + 32 + 26 * 6 + 1;
 
 impl<const BUS: bool> TableT for SignerScalarTable<BUS> {
     fn name(&self) -> &'static str { "signer_scalar" }

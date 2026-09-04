@@ -84,3 +84,40 @@ mod constraint_counts {
         assert!(bad.is_empty(), "declared n_constraints wrong for {bad:?}");
     }
 }
+
+#[cfg(test)]
+mod routing_soundness {
+    use crate::*;
+    use backend::*;
+    struct Fail { flat: Vec<F>, n: usize, failures: usize }
+    impl AirBuilder for Fail {
+        type F = F; type IF = F; type EF = EF;
+        fn flat(&self) -> &[F] { &self.flat }
+        fn shift(&self) -> &[F] { &[] }
+        fn assert_zero(&mut self, x: F) { if x != F::ZERO { self.failures += 1; } self.n += 1; }
+        fn assert_zero_ef(&mut self, x: EF) { if x != EF::ZERO { self.failures += 1; } self.n += 1; }
+    }
+    fn run<A: Air<ExtraData = ExtraDataForBuses<EF>>>(air: &A, row: &[F]) -> usize {
+        let mut b = Fail { flat: row.to_vec(), n: 0, failures: 0 };
+        air.eval(&mut b, &ExtraDataForBuses::new(&[], vec![])); b.failures
+    }
+    /// A row that routes (some nz=1) but is marked inactive (mult=0) must be rejected: otherwise a
+    /// padding row injects an arbitrary (scalar, point) into the MSM (codex finding #2, universal forgery).
+    #[test]
+    fn inactive_rows_cannot_route() {
+        use super::{scalar_table as t4, signer_scalar_table as t7};
+        // ScalarL: a valid active row with a nonzero rho (⇒ some nz=1)
+        let mut row = t4::make_row(&[0u8; 64], &[0u8; 32], &[12345, 0, 0, 0], &[0u64; 32], &[0u64; 32], 0, 0, 0, 0);
+        assert_eq!(run(&t4::ScalarLTable::<false>, &row), 0, "the honest active ScalarL row must satisfy every constraint");
+        assert!((0..t4::WINDOWS).any(|j| row[t4::COL_NZ + j] == F::ONE), "test needs at least one routed window");
+        row[t4::COL_MULT] = F::ZERO; // mark inactive but leave the routes
+        assert!(run(&t4::ScalarLTable::<false>, &row) > 0, "an inactive ScalarL row that still routes must be rejected");
+        // SignerScalar: a valid active row with nonzero K (⇒ some nz=1)
+        let mut k = [0i64; 32]; k[0] = 7; k[1] = 99;
+        let mut row = t7::make_row(&k, 0, false, 0, 0);
+        assert_eq!(run(&t7::SignerScalarTable::<false>, &row), 0, "the honest active SignerScalar row must satisfy every constraint");
+        assert!((0..t7::T7_WINDOWS).any(|j| row[t7::COL_NZ + j] == F::ONE), "test needs at least one routed window");
+        row[t7::COL_MULT] = F::ZERO;
+        assert!(run(&t7::SignerScalarTable::<false>, &row) > 0, "an inactive SignerScalar row that still routes must be rejected");
+    }
+}
