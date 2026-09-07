@@ -83,11 +83,20 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(feature = "multibus-toy", ignore = "the toy test columns push the maximum surface past 2^30; test-only feature")]
     fn ensure_not_too_big_commitment_surface() {
+        // Mirrors the stacked PCS layout (stacked_pcs.rs): memory + acc_memory, the padded bytecode-acc
+        // block, the range region, then every table at its cap. (The two regions were missing here
+        // before the 2026-09-07 review; the real maximum is within 0.4 % of the limit.)
+        use crate::{MAX_BYTECODE_LOG_SIZE, bytecode_block_log, range_region_log};
+        let max_table_log = MAX_LOG_N_ROWS_PER_TABLE.iter().map(|(_, l)| *l).max().unwrap();
         let mut max_surface: u64 = 2 * (1 << MAX_LOG_MEMORY_SIZE) as u64; // memory and acc_memory
+        max_surface += 1u64 << bytecode_block_log(MAX_BYTECODE_LOG_SIZE, max_table_log); // bytecode acc, padded to its block
+        max_surface += 1u64 << range_region_log(max_table_log); // range region
         for (table, max_log_n_rows) in MAX_LOG_N_ROWS_PER_TABLE {
             max_surface += (table.n_columns() as u64) << (max_log_n_rows as u64);
         }
-        assert!(max_surface <= 1 << 30); // Maximum data we can commit via WHIR using an initial folding factor of 7, and rate = 1/2
+        println!("max commitment surface: {max_surface} cells ({:.2} % of 2^30)", max_surface as f64 / (1u64 << 30) as f64 * 100.0);
+        assert!(max_surface <= 1 << 30, "Maximum data we can commit via WHIR using an initial folding factor of 7, and rate = 1/2"); 
     }
 }

@@ -328,6 +328,11 @@ pub fn fill_trace_ed_add(traces: &mut BTreeMap<Table, TableTrace>, memory: &[F],
             for j in 0..t7::T7_WINDOWS { if cell(&tr.columns[t7::COL_NZ + j], r) == 1 { tuples.push((j, cell(&tr.columns[t7::COL_M + j], r), cell(&tr.columns[t7::COL_PSGN + j], r) as u8, cell(&tr.columns[t7::COL_PTR], r))); } }
         }
     }
+    // No routing tuples (a program with no ed25519 precompile calls, e.g. every node proof): the table
+    // is padding only. The padding row is a valid inactive singleton and the token bus balances 0 = 0,
+    // so nothing needs a chain. (Building the 26,900-row reduction structure here used to cost every
+    // proof a 2^15-row, 1,132-column table.)
+    if tuples.is_empty() { return NEUTRAL; }
     let point = |ptr: usize, sgn: u8| -> Affine {
         let byte = |i: usize| -> u8 { let v = memory[i].as_canonical_u32(); assert!(v < 256, "ed_add: point cell is not a byte"); v as u8 };
         let xo = ptr + sgn as usize * POINT_NX_OFFSET;

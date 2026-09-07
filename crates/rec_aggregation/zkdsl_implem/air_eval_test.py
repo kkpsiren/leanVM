@@ -8,7 +8,7 @@ from g8 import *
 N_EVALS = N_EVALS_PLACEHOLDER
 N_ALPHAS = N_ALPHAS_PLACEHOLDER
 N_BETAS = N_BETAS_PLACEHOLDER
-N_TABLES_TEST = 9
+N_TABLES_TEST = N_TABLES_PLACEHOLDER
 
 EVALUATE_AIR_FUNCTIONS_PLACEHOLDER
 
@@ -35,22 +35,5 @@ def dispatch_eval(table_index, inner_evals, air_alpha_powers, logup_beta_eq_poly
     res: Imm
     debug_assert(table_index < N_TABLES_TEST)
     match table_index:
-        case 0:
-            res = evaluate_air_constraints_table_0(inner_evals, air_alpha_powers, logup_beta_eq_poly)
-        case 1:
-            res = evaluate_air_constraints_table_1(inner_evals, air_alpha_powers, logup_beta_eq_poly)
-        case 2:
-            res = evaluate_air_constraints_table_2(inner_evals, air_alpha_powers, logup_beta_eq_poly)
-        case 3:
-            res = evaluate_air_constraints_table_3(inner_evals, air_alpha_powers, logup_beta_eq_poly)
-        case 4:
-            res = evaluate_air_constraints_table_4(inner_evals, air_alpha_powers, logup_beta_eq_poly)
-        case 5:
-            res = evaluate_air_constraints_table_5(inner_evals, air_alpha_powers, logup_beta_eq_poly)
-        case 6:
-            res = evaluate_air_constraints_table_6(inner_evals, air_alpha_powers, logup_beta_eq_poly)
-        case 7:
-            res = evaluate_air_constraints_table_7(inner_evals, air_alpha_powers, logup_beta_eq_poly)
-        case 8:
-            res = evaluate_air_constraints_table_8(inner_evals, air_alpha_powers, logup_beta_eq_poly)
+        AIR_DISPATCH_ARMS_PLACEHOLDER
     return res

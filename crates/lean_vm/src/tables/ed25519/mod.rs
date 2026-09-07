@@ -121,3 +121,110 @@ mod routing_soundness {
         assert!(run(&t7::SignerScalarTable::<false>, &row) > 0, "an inactive SignerScalar row that still routes must be rejected");
     }
 }
+
+#[cfg(test)]
+mod g8_range_coverage {
+    //! The G8 soundness argument (gadgets.rs) needs every `q` limb checked to ≤ 8 bits and every `w`
+    //! limb to ≤ 16 bits. The layouts are hand-written per table, so this test derives the limb
+    //! columns from the symbolic identities and asserts they are registered range columns.
+    use crate::F;
+    use crate::tables::table_trait::RANGE_SECTIONS;
+    use backend::{SymbolicExpression, get_symbolic_constraints_and_bus_data_values};
+    use std::collections::BTreeSet;
+
+    fn col_of(e: &SymbolicExpression<F>, n_cols: usize) -> usize {
+        match e { SymbolicExpression::Variable(v) => v.index % n_cols, _ => panic!("G8 limb operand is not a plain column") }
+    }
+    fn from_tuple((u8s, u16s, u7s): (Vec<usize>, Vec<usize>, Vec<usize>)) -> (BTreeSet<usize>, BTreeSet<usize>) {
+        let small: BTreeSet<usize> = u8s.iter().chain(&u7s).copied().collect();
+        let wide: BTreeSet<usize> = small.iter().chain(&u16s).copied().collect();
+        (small, wide)
+    }
+    fn from_sections(classes: Vec<(usize, Vec<usize>)>) -> (BTreeSet<usize>, BTreeSet<usize>) {
+        let mut small = BTreeSet::new(); let mut wide = BTreeSet::new();
+        for (sec, cols) in classes { let bits = RANGE_SECTIONS[sec].bits; for c in cols { if bits <= 8 { small.insert(c); } if bits <= 16 { wide.insert(c); } } }
+        (small, wide)
+    }
+    fn check<A: backend::Air>(name: &str, air: &A, n_cols: usize, (small, wide): (BTreeSet<usize>, BTreeSet<usize>))
+    where A::ExtraData: Default {
+        let (_, _, identities) = get_symbolic_constraints_and_bus_data_values::<F, _>(air);
+        assert!(!identities.is_empty(), "{name}: expected G8 identities");
+        for (k, id) in identities.iter().enumerate() {
+            for e in &id.q { let c = col_of(e, n_cols); assert!(small.contains(&c), "{name}: identity {k}: q limb column {c} is not range-checked to ≤ 8 bits"); }
+            for e in &id.w { let c = col_of(e, n_cols); assert!(wide.contains(&c), "{name}: identity {k}: w limb column {c} is not range-checked to ≤ 16 bits"); }
+            // the integer-lift argument also needs byte-bounded result limbs and product operands
+            if let Some(r) = &id.r { for e in r { let c = col_of(e, n_cols); assert!(small.contains(&c), "{name}: identity {k}: r limb column {c} is not range-checked to ≤ 8 bits"); } }
+            for (a, b, _) in &id.products {
+                for e in a.iter().chain(b) { if let SymbolicExpression::Variable(v) = e { let c = v.index % n_cols; assert!(small.contains(&c), "{name}: identity {k}: product operand column {c} is not range-checked to ≤ 8 bits"); } }
+            }
+        }
+        println!("{name}: {} identities, all q/w limbs range-checked", identities.len());
+    }
+    #[test]
+    fn g8_identity_limbs_are_range_checked() {
+        check("ed_sig", &super::edsig_table::EdSigTable::<false>, super::edsig_table::N_COLS, from_tuple(super::edsig_table::range_cols()));
+        check("ed_decompress", &super::decompress_table::EdDecompressTable::<false>, super::decompress_table::N_COLS, from_tuple(super::decompress_table::range_cols()));
+        check("scalar_l", &super::scalar_table::ScalarLTable::<false>, super::scalar_table::N_COLS, from_sections(super::scalar_table::range_cols()));
+        {
+            // SignerScalar bounds its reduced-scalar limbs (the identity's r) by bit decomposition, not by a
+            // range push: kred[i] = Σ_t bits[8i+t]·2^t with every bit asserted boolean, which is a tighter
+            // bound than U8. Accept those columns as byte-bounded.
+            use super::signer_scalar_table as t7;
+            let (mut small, wide) = from_sections(t7::range_cols());
+            small.extend(t7::COL_KRED..t7::COL_KRED + 32);
+            check("signer_scalar", &t7::SignerScalarTable::<false>, t7::N_COLS, (small, wide));
+        }
+        {
+            // EdAdd reads point coordinates (px, py) from memory records written by EdSig / Decompress,
+            // whose output limbs are U8-checked in those tables (verified above); the memory lookup pins
+            // equality, so those columns are byte-bounded by provenance rather than by a local range push.
+            use super::ed_add_table as t3;
+            use crate::tables::table_trait::TableT;
+            let (mut small, wide) = from_sections(t3::range_cols());
+            for b in t3::EdAddTable::<false>.bus_interactions() {
+                if b.is_memory_lookup() { for d in &b.data { if let Some(c) = d.column() { small.insert(c); } } }
+            }
+            // and the selected coordinates px/py are gated copies of those memory columns (a boolean
+            // times a byte, or the neutral point's constants), so they carry the same bound
+            small.extend(t3::COL_PX..t3::COL_PX + 64);
+            check("ed_add", &t3::EdAddTable::<false>, t3::N_COLS, (small, wide));
+        }
+    }
+}
+
+#[cfg(test)]
+mod domainseps {
+    //! LogUp domain separators: a collision between two unrelated buses would let them balance against
+    //! each other silently. Convention: table buses are ≡ 2 (mod 4), ≥ 6 (memory = 1, bytecode = 2);
+    //! range-section alive/dead domainseps are reserved for the range region and never appear on a
+    //! non-range table bus.
+    use crate::tables::table_trait::{BusData, RANGE_SECTIONS, TableT};
+    use crate::{ALL_TABLES, LOGUP_BYTECODE_DOMAINSEP, LOGUP_MEMORY_DOMAINSEP, Table};
+    use std::collections::BTreeSet;
+    #[test]
+    fn logup_domainseps_do_not_collide() {
+        let range_ds: BTreeSet<usize> = RANGE_SECTIONS.iter().flat_map(|s| [s.domainsep, s.dead_domainsep]).collect();
+        assert_eq!(range_ds.len(), 2 * RANGE_SECTIONS.len(), "range section domainseps collide");
+        let mut seen = BTreeSet::new();
+        let mut widths: std::collections::BTreeMap<usize, usize> = std::collections::BTreeMap::new();
+        for t in ALL_TABLES {
+            for b in t.bus_interactions() {
+                let BusData::Constant(ds) = b.domainsep else {
+                    // column-typed domainseps: only the three stock tables use them, and their formulas
+                    // (exec: an instruction column; poseidon: 3 + 2·f + 4·f + 8·f + 16·f·offset, odd;
+                    // extension_op: 4·f + 8·f + 16·f + 32·f + 64·len, ≡ 0 mod 4) never land in the 2-mod-4 class
+                    assert!(t == Table::execution() || t == Table::poseidon16() || t == Table::extension_op(), "{t:?}: a column-typed domainsep on a table whose formula is not checked here");
+                    continue;
+                };
+                if b.range_section().is_some() { assert!(RANGE_SECTIONS.iter().any(|s| s.domainsep == ds), "range push with a non-alive domainsep {ds}"); continue; }
+                assert!(ds == LOGUP_MEMORY_DOMAINSEP || ds == LOGUP_BYTECODE_DOMAINSEP || (ds % 4 == 2 && ds >= 6), "{t:?}: bus domainsep {ds} breaks the 2-mod-4 convention");
+                assert!(!range_ds.contains(&ds), "{t:?}: bus domainsep {ds} collides with a range section");
+                // one domainsep = one bus: every push and pull on it must carry the same data width
+                let w = b.data.len();
+                if let Some(prev) = widths.insert(ds, w) { assert_eq!(prev, w, "{t:?}: domainsep {ds} is used with data widths {prev} and {w} (two different buses share it)"); }
+                seen.insert(ds);
+            }
+        }
+        println!("table bus domainseps: {seen:?}; range: {range_ds:?}");
+    }
+}

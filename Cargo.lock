@@ -911,19 +911,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ed_air"
-version = "0.1.0"
-dependencies = [
- "backend",
- "lean_vm",
- "num-bigint",
- "num-integer",
- "num-traits",
- "rand 0.10.1",
- "sub_protocols",
-]
-
-[[package]]
 name = "educe"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

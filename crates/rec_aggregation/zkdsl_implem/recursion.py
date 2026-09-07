@@ -28,7 +28,7 @@ TOTAL_COLUMN_BUSES = TOTAL_COLUMN_BUSES_PLACEHOLDER
 ONE_BUSES_DATA_COLS = ONE_BUSES_DATA_COLS_PLACEHOLDER  # [[[_; num_data]; num_buses]; N_TABLES]
 ONE_BUSES_DATA_OFFSETS = ONE_BUSES_DATA_OFFSETS_PLACEHOLDER  # [[[_; num_data]; num_buses]; N_TABLES]
 ONE_BUSES_NEW_COLS = ONE_BUSES_NEW_COLS_PLACEHOLDER  # [[[_; n_new]; num_buses]; N_TABLES]
-ONE_BUS_RUNS = ONE_BUS_RUNS_PLACEHOLDER  # [[[start, n]; num_runs]; N_TABLES]: runs of consecutive single-column One buses (same domsep) verified in batch
+ONE_BUS_RUNS = ONE_BUS_RUNS_PLACEHOLDER  # [[[start, n, batched]; num_runs]; N_TABLES]: batched = a run (n >= 1) of single-column One buses with one domsep
 
 NUM_COLS_AIR = NUM_COLS_AIR_PLACEHOLDER
 MAX_NUM_COLS_AIR = MAX_NUM_COLS_AIR_PLACEHOLDER  # max(NUM_COLS_AIR[t] for t in 0..N_TABLES)
@@ -331,7 +331,8 @@ def recursion(inner_public_memory, initial_fiat_shamir_cap):
         for run_idx in unroll(0, len(ONE_BUS_RUNS[table_index])):
             run_start = ONE_BUS_RUNS[table_index][run_idx][0]
             run_n = ONE_BUS_RUNS[table_index][run_idx][1]
-            if run_n == 1:
+            run_batched = ONE_BUS_RUNS[table_index][run_idx][2]
+            if run_batched == 0:
                 one_bus_idx = run_start
                 domsep = ONE_BUSES_DOMSEPS[table_index][one_bus_idx]
                 n_new = len(ONE_BUSES_NEW_COLS[table_index][one_bus_idx])
@@ -361,7 +362,7 @@ def recursion(inner_public_memory, initial_fiat_shamir_cap):
                     mul_extension_ret(pref, sub_extension_ret(logup_gamma, fingerp)),
                 )
                 offset += n_rows
-            if run_n != 1:
+            if run_batched != 0:
                 domsep = ONE_BUSES_DOMSEPS[table_index][run_start]
                 fs, chunks = fs_receive_chunks(fs, run_n)
                 vals = Array(run_n * DIM)
@@ -521,6 +522,10 @@ def recursion(inner_public_memory, initial_fiat_shamir_cap):
                 whir_sum,
             )
             curr_randomness += DIM
+    # the statement enumeration above must match TOTAL_WHIR_STATEMENTS (the same list is enumerated
+    # again for eval_weights below and counted a third time natively; drift shows here, not as a
+    # silent mismatch)
+    assert curr_randomness == combination_randomness_powers + (num_ood_at_commitment + TOTAL_WHIR_STATEMENTS) * DIM
 
     folding_randomness_global: Mut
     eval_weights: Mut

@@ -50,8 +50,7 @@ pub const MAX_XMSS_DUPLICATES: usize = 1 << 15; // ...same
 pub(crate) const SINGLE_MESSAGE_FLAG: usize = 1;
 pub(crate) const MULTI_MESSAGE_FLAG: usize = 0;
 pub(crate) const ED25519_LEAF_FLAG: usize = 2;
-pub(crate) const ED25519_BLOB_FLAG: usize = 3;
-pub(crate) const ED25519_EPOCH_FLAG: usize = 4;
+pub(crate) const ED25519_NODE_FLAG: usize = 3; // a node over K child proofs (leaves or nodes)
 
 pub(crate) const BYTECODE_CLAIM_OFFSET: usize = DIGEST_LEN;
 /// Single-message component data: pubkeys_hash | message | merkle_chunks | tweaks_hash.
@@ -368,7 +367,7 @@ fn build_replacements(log_inner_bytecode: usize, bytecode_zero_eval: F) -> BTree
                 if batchable {
                     while i + n < bus_specs.len() && bus_specs[i + n] == (ds, true) { n += 1; }
                 }
-                runs.push(format!("[{i}, {n}]"));
+                runs.push(format!("[{i}, {n}, {}]", batchable as u8));
                 i += n;
             }
             one_bus_runs.push(format!("[{}]", runs.join(", ")));
@@ -461,13 +460,7 @@ fn build_replacements(log_inner_bytecode: usize, bytecode_zero_eval: F) -> BTree
         "EVALUATE_AIR_FUNCTIONS_PLACEHOLDER".to_string(),
         all_air_evals_in_zk_dsl(),
     );
-    {
-        // One match arm per table so the dispatcher covers 0..N_TABLES (not just the stock 3).
-        let arms: Vec<String> = (0..N_TABLES).map(|i| format!("case {i}:
-            res = evaluate_air_constraints_table_{i}(inner_evals, air_alpha_powers, logup_beta_eq_poly)")).collect();
-        replacements.insert("AIR_DISPATCH_ARMS_PLACEHOLDER".to_string(), arms.join("
-        "));
-    }
+    replacements.insert("AIR_DISPATCH_ARMS_PLACEHOLDER".to_string(), air_dispatch_arms());
     replacements.insert(
         "N_INSTRUCTION_COLUMNS_PLACEHOLDER".to_string(),
         N_INSTRUCTION_COLUMNS.to_string(),
@@ -514,8 +507,7 @@ fn build_replacements(log_inner_bytecode: usize, bytecode_zero_eval: F) -> BTree
     );
     replacements.insert("MAX_RECURSIONS_PLACEHOLDER".to_string(), MAX_RECURSIONS.to_string());
     replacements.insert("ED25519_LEAF_FLAG_PLACEHOLDER".to_string(), ED25519_LEAF_FLAG.to_string());
-    replacements.insert("ED25519_BLOB_FLAG_PLACEHOLDER".to_string(), ED25519_BLOB_FLAG.to_string());
-    replacements.insert("ED25519_EPOCH_FLAG_PLACEHOLDER".to_string(), ED25519_EPOCH_FLAG.to_string());
+    replacements.insert("ED25519_NODE_FLAG_PLACEHOLDER".to_string(), ED25519_NODE_FLAG.to_string());
     replacements.insert("ED25519_LEAF_VERSION_PLACEHOLDER".to_string(), lean_prover::ed25519_leaf::LEAF_VERSION.to_string());
     for (k, v) in lean_prover::ed25519_leaf::leaf_program_replacements() { replacements.insert(k, v); }
 
@@ -672,6 +664,15 @@ where
 
 /// A limb vector as a zkDSL pointer: consecutive column openings are passed as `inner_evals + DIM*k`,
 /// anything else is materialized into a fresh buffer.
+/// One match arm per table, so every dispatcher (production and test) covers 0..N_TABLES from the
+/// same source (the stock program had 3 hand-written arms, which broke silently at 9 tables).
+fn air_dispatch_arms() -> String {
+    (0..N_TABLES)
+        .map(|i| format!("case {i}:\n            res = evaluate_air_constraints_table_{i}(inner_evals, air_alpha_powers, logup_beta_eq_poly)"))
+        .collect::<Vec<_>>()
+        .join("\n        ")
+}
+
 fn g8_operand(exprs: &[SymbolicExpression<F>], ctx: &mut AirCodegenCtx, res: &mut String) -> String {
     let consecutive = exprs.iter().enumerate().all(|(i, e)| matches!(e, SymbolicExpression::Variable(v) if v.index == match exprs[0] { SymbolicExpression::Variable(v0) => v0.index + i, _ => usize::MAX }));
     if consecutive && !exprs.is_empty() {
@@ -974,7 +975,8 @@ fn test_zk_dsl_air_evaluators_match_native() {
         replacements.insert("N_EVALS_PLACEHOLDER".to_string(), n_evals.to_string());
         replacements.insert("N_ALPHAS_PLACEHOLDER".to_string(), n_alphas.to_string());
         replacements.insert("N_BETAS_PLACEHOLDER".to_string(), n_betas.to_string());
-        replacements.insert("EVAL_FN_PLACEHOLDER".to_string(), format!("evaluate_air_constraints_table_{}", table.index()));
+        replacements.insert("N_TABLES_PLACEHOLDER".to_string(), N_TABLES.to_string());
+        replacements.insert("AIR_DISPATCH_ARMS_PLACEHOLDER".to_string(), air_dispatch_arms());
         let bytecode = compile_program_with_flags(&ProgramSource::Embedded { entry: "air_eval_test.py".to_string(), dir: &EMBEDDED_ZK_DSL }, CompilationFlags { replacements });
         let mut hints = Hints::default();
         hints.insert(&bytecode, "evals", arena_vec![ArenaVec::from_slice(&cells(&evals))]);

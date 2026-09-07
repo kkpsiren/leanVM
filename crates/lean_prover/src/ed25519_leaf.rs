@@ -90,7 +90,28 @@ fn ctx_seg(root: &[F; 8], meta: &[F; 8], rows: &[SigRow]) -> [F; 8] {
 fn rho_cells(ctx: &[F; 8], i: usize) -> [F; 4] { let mut r = [F::ZERO; 8]; r[0] = f(i); r[1] = f(DOMAIN_RHO); let o = permute(ctx, &r); [o[8], o[9], o[10], o[11]] }
 
 /// The reader side: recompute the public input from the decoded columns and the leaf parameters.
-pub fn expected_public_input(rows: &[SigRow], seg_index: usize, blob_id: &[F; 4]) -> [F; 8] { h_leaf(&root_seg(rows), &leaf_meta(rows.len(), seg_index, blob_id)) }
+/// READER CONTRACT — canonical row order. A leaf hashes its rows in this order: a STABLE sort by the
+/// 32 raw pubkey bytes (lexicographic), ties keeping the input order. The input order is the blob
+/// order of the segment. Every digest a reader recomputes must go through this function.
+pub fn canonical_rows(rows: &[SigRow]) -> Vec<SigRow> {
+    let mut sorted = rows.to_vec();
+    sorted.sort_by(|a, b| a.pubkey.cmp(&b.pubkey));
+    sorted
+}
+
+/// READER CONTRACT — blob id cells from the blob's 32-byte KZG versioned hash: 120 bits of the first
+/// 16 bytes, `cell[i] = u32_le(h[4i..4i+4]) & 0x3FFF_FFFF` (30 bits, so every cell is < p and
+/// canonical; a 31-bit mask could land in [p, 2^31) and wrap).
+pub fn blob_id_cells(versioned_hash: &[u8; 32]) -> [F; 4] {
+    std::array::from_fn(|i| F::from_u32(u32::from_le_bytes(versioned_hash[4 * i..4 * i + 4].try_into().unwrap()) & 0x3FFF_FFFF))
+}
+
+/// Public input of the STANDALONE leaf program (`LEAF_PROGRAM`, tests only). The production leaf
+/// digest is the recursion-mode input-data hash (`rec_aggregation::ed25519::expected_leaf_input_data`).
+pub fn expected_public_input(rows: &[SigRow], seg_index: usize, blob_id: &[F; 4]) -> [F; 8] {
+    let rows = canonical_rows(rows);
+    h_leaf(&root_seg(&rows), &leaf_meta(rows.len(), seg_index, blob_id))
+}
 
 fn cells(b: &[u8]) -> Vec<F> { b.iter().map(|x| f(*x as usize)).collect() }
 
@@ -124,6 +145,7 @@ pub fn leaf_program_replacements() -> Vec<(String, String)> {
         ("DOMAIN_ROOT_PLACEHOLDER".to_string(), DOMAIN_ROOT.to_string()),
         ("DOMAIN_CTX_PLACEHOLDER".to_string(), DOMAIN_CTX.to_string()),
         ("DOMAIN_RHO_PLACEHOLDER".to_string(), DOMAIN_RHO.to_string()),
+        ("MAX_LEAF_SIGS_PLACEHOLDER".to_string(), MAX_LEAF_SIGS.to_string()),
     ]
 }
 pub fn leaf_program() -> String {
@@ -136,7 +158,7 @@ pub fn leaf_program() -> String {
 /// leaf program and the recursion program's leaf mode.
 pub fn leaf_hint_buffers(rows_in: &[SigRow], seg_index: usize, blob_id: &[F; 4]) -> Result<(Vec<SigRow>, usize, [F; 8], [F; 8], Vec<(&'static str, Vec<F>)>), String> {
     let mut rows = rows_in.to_vec();
-    rows.sort_by(|a, b| a.pubkey.cmp(&b.pubkey));
+    let mut rows = canonical_rows(&rows);
     let n = rows.len();
     if n == 0 { return Err("empty leaf".into()); }
     if n > MAX_LEAF_SIGS { return Err(format!("leaf has {n} signatures; the table caps guarantee a fit only up to {MAX_LEAF_SIGS} (see MAX_LEAF_SIGS)")); }
@@ -150,6 +172,7 @@ pub fn leaf_hint_buffers(rows_in: &[SigRow], seg_index: usize, blob_id: &[F; 4])
         let r_pt = CompressedEdwardsY(r.sig[..32].try_into().unwrap()).decompress().ok_or_else(|| format!("signature {i}: R does not decompress"))?;
         if r_pt.compress().to_bytes() != r.sig[..32] { return Err(format!("signature {i}: R not canonical")); }
         if r_pt.is_small_order() { return Err(format!("signature {i}: R small order")); }
+        if !r_pt.is_torsion_free() { return Err(format!("signature {i}: R has a torsion component (dalek verify_strict may accept it; the R = 8·Q certificate cannot)")); }
         let qp = r_pt * inv8;
         let qa_ff = decompress_affine(&qp.compress().to_bytes()).ok_or("Q decode")?;
         q.extend(cells(&qa_ff.x)); q.extend(cells(&qa_ff.y));
@@ -161,6 +184,7 @@ pub fn leaf_hint_buffers(rows_in: &[SigRow], seg_index: usize, blob_id: &[F; 4])
             n_groups += 1;
             let a_pt = CompressedEdwardsY(r.pubkey).decompress().ok_or_else(|| format!("signer of {i}: A does not decompress"))?;
             if a_pt.is_small_order() { return Err(format!("signer of {i}: A small order")); }
+            if !a_pt.is_torsion_free() { return Err(format!("signer of {i}: A has a torsion component (dalek verify_strict may accept it; the A = 8·Q' certificate cannot)")); }
             let qap = decompress_affine(&(a_pt * inv8).compress().to_bytes()).ok_or("Q' decode")?;
             qa.extend(cells(&qap.x)); qa.extend(cells(&qap.y));
         } else { qa.extend(std::iter::repeat_n(F::ZERO, 64)); }
@@ -396,3 +420,44 @@ def main():
     signer_scalar(srec, sout, 0)
     return
 "#;
+
+#[cfg(test)]
+mod contract_tests {
+    use super::*;
+    /// Canonical order: stable sort by the 32 pubkey bytes; ties keep input (blob) order, even when the
+    /// repeated signer's rows are not adjacent in the input.
+    #[test]
+    fn canonical_order_is_a_stable_sort_by_pubkey() {
+        let row = |k: u8, d: u8| SigRow { pubkey: [k; 32], digest: [d; 20], sig: [0; 64] };
+        let input = vec![row(2, 1), row(1, 2), row(2, 3), row(1, 4)];
+        let c = canonical_rows(&input);
+        let key = |r: &SigRow| (r.pubkey[0], r.digest[0]);
+        assert_eq!(c.iter().map(key).collect::<Vec<_>>(), vec![(1, 2), (1, 4), (2, 1), (2, 3)]);
+        // the root depends on the order, so an unstable or unsorted reader would disagree
+        assert_ne!(root_seg(&input), root_seg(&c));
+    }
+    /// The leaf cap is derived from the table caps: EdAdd worst case (all-distinct signers) 39·N + 26,926
+    /// and SHA-512 21·N rows must fit their tables at MAX_LEAF_SIGS (and not at MAX_LEAF_SIGS + 1 for the
+    /// binding one).
+    #[test]
+    fn leaf_cap_matches_table_caps() {
+        use lean_vm::ed25519::{ed_add_table as t3, scalar_table as t4, signer_scalar_table as t7};
+        let ed_add = 1usize << lean_vm::max_log_n_rows_per_table(&Table::ed_add());
+        let sha = 1usize << lean_vm::max_log_n_rows_per_table(&Table::sha512());
+        // worst case, all-distinct signers (G = N): ρ·R routes per signature, K·A per signer plus the S
+        // row, the dense red1/red2 structure, and the Horner chain
+        let ed_add_rows = |n: usize| t4::WINDOWS * n + t7::T7_WINDOWS * (n + 1) + 2 * t3::N_WINDOWS * t3::N_BUCKETS + (t3::N_WINDOWS - 1) * (t3::N_DBL + 1) + 1;
+        assert_eq!(ed_add_rows(0), 26_926, "the constant model in the MAX_LEAF_SIGS doc drifted from the table constants");
+        assert!(ed_add_rows(MAX_LEAF_SIGS) < ed_add, "EdAdd worst case exceeds its cap at MAX_LEAF_SIGS");
+        assert!(21 * MAX_LEAF_SIGS < sha, "SHA-512 rows exceed its cap at MAX_LEAF_SIGS");
+        assert!(ed_add_rows(MAX_LEAF_SIGS + 1) >= ed_add || 21 * (MAX_LEAF_SIGS + 1) >= sha, "MAX_LEAF_SIGS is not tight against the table caps");
+    }
+    #[test]
+    fn blob_id_cells_are_30_bit_canonical() {
+        let mut h = [0u8; 32]; h[0] = 0x01; h[3] = 0xFF; h[4] = 0x12; h[7] = 0x80;
+        let c = blob_id_cells(&h);
+        assert_eq!(c[0], F::from_u32(0x3F00_0001));
+        assert_eq!(c[1], F::from_u32(0x0000_0012));
+        assert_eq!(c[2], F::ZERO);
+    }
+}
