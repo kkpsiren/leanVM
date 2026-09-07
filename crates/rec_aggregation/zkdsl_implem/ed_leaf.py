@@ -83,13 +83,14 @@ def ed25519_leaf(n, meta, root_expected):
         ed_sig(q + 64 * i, rrec + 97 * i, 0)
 
     # ---- ctx sponge: root, meta, then (R packed, s packed) per signature
-    cst = Array(16 * (3 * n + 2))
+    cst = Array(16 * (3 * n + 3))
     ivc = Array(8)
     ivc[0] = DOMAIN_CTX
     for t in unroll(1, 8):
         ivc[t] = 0
     poseidon16_permute(ivc, root, cst)
     poseidon16_permute(cst, meta, cst + 16)
+    poseidon16_permute(cst + 16, meta + 8, cst + 32)
     for i in range(0, n):
         rb = Array(32)
         for t in unroll(0, 31):
@@ -112,10 +113,10 @@ def ed25519_leaf(n, meta, root_expected):
             c2[t] = spk[5 + t]
         c2[6] = 0
         c2[7] = 0
-        poseidon16_permute(cst + 16 * (3 * i + 1), c0, cst + 16 * (3 * i + 2))
-        poseidon16_permute(cst + 16 * (3 * i + 2), c1, cst + 16 * (3 * i + 3))
-        poseidon16_permute(cst + 16 * (3 * i + 3), c2, cst + 16 * (3 * i + 4))
-    ctx = cst + 16 * (3 * n + 1) + 8
+        poseidon16_permute(cst + 16 * (3 * i + 2), c0, cst + 16 * (3 * i + 3))
+        poseidon16_permute(cst + 16 * (3 * i + 3), c1, cst + 16 * (3 * i + 4))
+        poseidon16_permute(cst + 16 * (3 * i + 4), c2, cst + 16 * (3 * i + 5))
+    ctx = cst + 16 * (3 * n + 2) + 8
 
     # ---- rho_i = P(ctx, [i, DOMAIN_RHO, 0..])[8..12]
     rho = Array(16 * n)

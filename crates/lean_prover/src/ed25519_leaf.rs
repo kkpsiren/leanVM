@@ -6,8 +6,9 @@
 //!   packed cells: 32 bytes → 11 cells of 3 bytes (little-endian, last cell 2 bytes); 20 bytes → 7 cells.
 //!   root_seg = chain over IV_ROOT=[DOMAIN_ROOT,0…] ‖ [n,0…], then per signature the 3 chunks
 //!             [A0..A7], [A8,A9,A10,D0..D4], [D5,D6,0×6] of (A packed 11 ‖ digest packed 7).
-//!   meta     = [n_seg, seg_index, version, 0 (H_excl, excl = ∅ in v1), blob_id0..3]
-//!   H_leaf   = P(root_seg ‖ meta)[8..16]  = the 8-cell public input.
+//!   meta     = [n_seg, seg_index, version, 0 (H_excl, excl = ∅), blob_id0..3] ‖ [blob_id4..8, 0×3]
+//!              (16 cells; blob_id = nine 30-bit chunks of the 32-byte versioned hash, all 256 bits — v2)
+//!   H_leaf   = step(P(root_seg ‖ meta[0..8]), meta[8..16])[8..16]  = the 8-cell public input.
 //!   ctx      = chain over IV_CTX=[DOMAIN_CTX,0…] ‖ root_seg, then meta, then per signature the 3 chunks
 //!             [R0..R7], [R8,R9,R10,s0..s4], [s5..s10,0,0] of (R packed 11 ‖ s packed 11) — R and s are
 //!             absorbed before ρ (spec §5, F2).
@@ -30,7 +31,7 @@ use lean_vm::*;
 pub const DOMAIN_ROOT: usize = 7002;
 pub const DOMAIN_CTX: usize = 7001;
 pub const DOMAIN_RHO: usize = 7003;
-pub const LEAF_VERSION: usize = 1;
+pub const LEAF_VERSION: usize = 2;
 /// Largest leaf that is guaranteed to fit the table caps for ANY signer diversity. EdAdd binds:
 /// worst-case rows 39·N + 26,926 (G = N distinct signers) must stay under 2^17; SHA-512 (21·N) under
 /// 2^16 is looser. Raising this needs EdAdd log 19 / SHA log 17 in MAX_LOG_N_ROWS_PER_TABLE.
@@ -56,8 +57,11 @@ fn rate(state: &[F; 16]) -> [F; 8] { state[8..].try_into().unwrap() }
 pub fn pack11(b: &[u8]) -> [F; 11] { let mut o = [F::ZERO; 11]; for k in 0..10 { o[k] = f(b[3 * k] as usize + 256 * b[3 * k + 1] as usize + 65536 * b[3 * k + 2] as usize); } o[10] = f(b[30] as usize + 256 * b[31] as usize); o }
 pub fn pack7(b: &[u8]) -> [F; 7] { let mut o = [F::ZERO; 7]; for k in 0..6 { o[k] = f(b[3 * k] as usize + 256 * b[3 * k + 1] as usize + 65536 * b[3 * k + 2] as usize); } o[6] = f(b[18] as usize + 256 * b[19] as usize); o }
 
-/// meta = [n_seg, seg_index, version, 0, blob_id0..3]
-pub fn leaf_meta(n_seg: usize, seg_index: usize, blob_id: &[F; 4]) -> [F; 8] { [f(n_seg), f(seg_index), f(LEAF_VERSION), F::ZERO, blob_id[0], blob_id[1], blob_id[2], blob_id[3]] }
+/// meta = [n_seg, seg_index, version, 0, blob_id0..3] ‖ [blob_id4..8, 0, 0, 0] (two 8-cell blocks)
+pub fn leaf_meta(n_seg: usize, seg_index: usize, blob_id: &[F; 9]) -> [F; 16] {
+    [f(n_seg), f(seg_index), f(LEAF_VERSION), F::ZERO, blob_id[0], blob_id[1], blob_id[2], blob_id[3], blob_id[4], blob_id[5], blob_id[6], blob_id[7], blob_id[8], F::ZERO, F::ZERO, F::ZERO]
+}
+fn meta_blocks(meta: &[F; 16]) -> ([F; 8], [F; 8]) { (meta[..8].try_into().unwrap(), meta[8..].try_into().unwrap()) }
 
 /// root_seg over the columns (what the indexer recomputes from the decoded blob).
 pub fn root_seg(rows: &[SigRow]) -> [F; 8] {
@@ -73,11 +77,12 @@ pub fn root_seg(rows: &[SigRow]) -> [F; 8] {
     }
     rate(&st)
 }
-pub fn h_leaf(root: &[F; 8], meta: &[F; 8]) -> [F; 8] { rate(&permute(root, meta)) }
-fn ctx_seg(root: &[F; 8], meta: &[F; 8], rows: &[SigRow]) -> [F; 8] {
+pub fn h_leaf(root: &[F; 8], meta: &[F; 16]) -> [F; 8] { let (m0, m1) = meta_blocks(meta); rate(&step(&permute(root, &m0), &m1)) }
+fn ctx_seg(root: &[F; 8], meta: &[F; 16], rows: &[SigRow]) -> [F; 8] {
     let mut iv = [F::ZERO; 8]; iv[0] = f(DOMAIN_CTX);
     let mut st = permute(&iv, root);
-    st = step(&st, meta);
+    let (m0, m1) = meta_blocks(meta);
+    st = step(&st, &m0); st = step(&st, &m1);
     for r in rows {
         let rp = pack11(&r.sig[..32]); let sp = pack11(&r.sig[32..]);
         let c0: [F; 8] = rp[..8].try_into().unwrap();
@@ -99,16 +104,24 @@ pub fn canonical_rows(rows: &[SigRow]) -> Vec<SigRow> {
     sorted
 }
 
-/// READER CONTRACT — blob id cells from the blob's 32-byte KZG versioned hash: 120 bits of the first
-/// 16 bytes, `cell[i] = u32_le(h[4i..4i+4]) & 0x3FFF_FFFF` (30 bits, so every cell is < p and
-/// canonical; a 31-bit mask could land in [p, 2^31) and wrap).
-pub fn blob_id_cells(versioned_hash: &[u8; 32]) -> [F; 4] {
-    std::array::from_fn(|i| F::from_u32(u32::from_le_bytes(versioned_hash[4 * i..4 * i + 4].try_into().unwrap()) & 0x3FFF_FFFF))
+/// READER CONTRACT (v2) — blob id cells from the blob's 32-byte KZG versioned hash: read the 32 bytes
+/// as a little-endian 256-bit integer and cut it into nine 30-bit chunks, `cell[i] = bits [30i, 30i+30)`
+/// (the last chunk carries bits 240..256). All 256 bits are bound; every cell is < 2^30 < p, canonical.
+/// (v1 bound only 120 bits — a 2^56 birthday bound for an attacker authoring both blobs.)
+pub fn blob_id_cells(versioned_hash: &[u8; 32]) -> [F; 9] {
+    std::array::from_fn(|i| {
+        let mut v: u32 = 0;
+        for bit in 0..30 {
+            let b = 30 * i + bit;
+            if b < 256 && (versioned_hash[b / 8] >> (b % 8)) & 1 == 1 { v |= 1 << bit; }
+        }
+        F::from_u32(v)
+    })
 }
 
 /// Public input of the STANDALONE leaf program (`LEAF_PROGRAM`, tests only). The production leaf
 /// digest is the recursion-mode input-data hash (`rec_aggregation::ed25519::expected_leaf_input_data`).
-pub fn expected_public_input(rows: &[SigRow], seg_index: usize, blob_id: &[F; 4]) -> [F; 8] {
+pub fn expected_public_input(rows: &[SigRow], seg_index: usize, blob_id: &[F; 9]) -> [F; 8] {
     let rows = canonical_rows(rows);
     h_leaf(&root_seg(&rows), &leaf_meta(rows.len(), seg_index, blob_id))
 }
@@ -117,7 +130,7 @@ fn cells(b: &[u8]) -> Vec<F> { b.iter().map(|x| f(*x as usize)).collect() }
 
 /// Build the hints and the public input for a leaf. Rows are sorted by signer (stable). Returns None
 /// if a signature is malformed for the statement (s ≥ L, R/A not decodable or small-order).
-pub fn build_leaf(rows_in: &[SigRow], seg_index: usize, blob_id: &[F; 4]) -> Result<LeafWitness, String> {
+pub fn build_leaf(rows_in: &[SigRow], seg_index: usize, blob_id: &[F; 9]) -> Result<LeafWitness, String> {
     let (rows, n_groups, meta, root, buffers) = leaf_hint_buffers(rows_in, seg_index, blob_id)?;
     let public_input = h_leaf(&root, &meta);
     let mut hints = Hints::default();
@@ -129,7 +142,7 @@ pub fn build_leaf(rows_in: &[SigRow], seg_index: usize, blob_id: &[F; 4]) -> Res
 }
 
 /// ρ_i as the driver derives it (for tests / the oracle).
-pub fn leaf_rhos(rows_sorted: &[SigRow], seg_index: usize, blob_id: &[F; 4]) -> Vec<[F; 4]> {
+pub fn leaf_rhos(rows_sorted: &[SigRow], seg_index: usize, blob_id: &[F; 9]) -> Vec<[F; 4]> {
     let root = root_seg(rows_sorted); let meta = leaf_meta(rows_sorted.len(), seg_index, blob_id);
     let ctx = ctx_seg(&root, &meta, rows_sorted);
     (0..rows_sorted.len()).map(|i| rho_cells(&ctx, i)).collect()
@@ -156,7 +169,7 @@ pub fn leaf_program() -> String {
 
 /// The leaf's hint buffers (without `meta`), the sorted rows, meta and root — shared by the standalone
 /// leaf program and the recursion program's leaf mode.
-pub fn leaf_hint_buffers(rows_in: &[SigRow], seg_index: usize, blob_id: &[F; 4]) -> Result<(Vec<SigRow>, usize, [F; 8], [F; 8], Vec<(&'static str, Vec<F>)>), String> {
+pub fn leaf_hint_buffers(rows_in: &[SigRow], seg_index: usize, blob_id: &[F; 9]) -> Result<(Vec<SigRow>, usize, [F; 16], [F; 8], Vec<(&'static str, Vec<F>)>), String> {
     let mut rows = rows_in.to_vec();
     let mut rows = canonical_rows(&rows);
     let n = rows.len();
@@ -232,7 +245,7 @@ def pack7(src, dst):
     return
 
 def main():
-    meta = Array(8)
+    meta = Array(16)
     hint_witness("meta", meta)
     n = meta[0]
     cols = Array(52 * n)
@@ -286,12 +299,13 @@ def main():
         poseidon16_permute(rst + 16 * (3 * i + 2), c2, rst + 16 * (3 * i + 3))
     root = rst + 16 * (3 * n) + 8
 
-    # ---- H_leaf = the public input
-    hl = Array(16)
+    # ---- H_leaf = the public input: P(root ‖ meta[0..8]), then absorb meta[8..16]
+    hl = Array(32)
     poseidon16_permute(root, meta, hl)
+    poseidon16_permute(hl, meta + 8, hl + 16)
     pub_in = 0
     for t in unroll(0, 8):
-        assert pub_in[t] == hl[8 + t]
+        assert pub_in[t] == hl[24 + t]
 
     # ---- R records (torsion certificates R = 8Q)
     rrec = Array(97 * n)
@@ -299,13 +313,14 @@ def main():
         ed_sig(q + 64 * i, rrec + 97 * i, 0)
 
     # ---- ctx sponge: root, meta, then (R packed, s packed) per signature
-    cst = Array(16 * (3 * n + 2))
+    cst = Array(16 * (3 * n + 3))
     ivc = Array(8)
     ivc[0] = DOMAIN_CTX
     for t in unroll(1, 8):
         ivc[t] = 0
     poseidon16_permute(ivc, root, cst)
     poseidon16_permute(cst, meta, cst + 16)
+    poseidon16_permute(cst + 16, meta + 8, cst + 32)
     for i in range(0, n):
         rb = Array(32)
         for t in unroll(0, 31):
@@ -328,10 +343,10 @@ def main():
             c2[t] = spk[5 + t]
         c2[6] = 0
         c2[7] = 0
-        poseidon16_permute(cst + 16 * (3 * i + 1), c0, cst + 16 * (3 * i + 2))
-        poseidon16_permute(cst + 16 * (3 * i + 2), c1, cst + 16 * (3 * i + 3))
-        poseidon16_permute(cst + 16 * (3 * i + 3), c2, cst + 16 * (3 * i + 4))
-    ctx = cst + 16 * (3 * n + 1) + 8
+        poseidon16_permute(cst + 16 * (3 * i + 2), c0, cst + 16 * (3 * i + 3))
+        poseidon16_permute(cst + 16 * (3 * i + 3), c1, cst + 16 * (3 * i + 4))
+        poseidon16_permute(cst + 16 * (3 * i + 4), c2, cst + 16 * (3 * i + 5))
+    ctx = cst + 16 * (3 * n + 2) + 8
 
     # ---- rho_i = P(ctx, [i, DOMAIN_RHO, 0..])[8..12]
     rho = Array(16 * n)
@@ -453,11 +468,17 @@ mod contract_tests {
         assert!(ed_add_rows(MAX_LEAF_SIGS + 1) >= ed_add || 21 * (MAX_LEAF_SIGS + 1) >= sha, "MAX_LEAF_SIGS is not tight against the table caps");
     }
     #[test]
-    fn blob_id_cells_are_30_bit_canonical() {
-        let mut h = [0u8; 32]; h[0] = 0x01; h[3] = 0xFF; h[4] = 0x12; h[7] = 0x80;
+    fn blob_id_cells_are_30_bit_canonical_and_bind_all_256_bits() {
+        let mut h = [0u8; 32]; h[0] = 0x01; h[3] = 0xFF; h[4] = 0x12; h[7] = 0x80; h[30] = 0xCD; h[31] = 0xAB;
         let c = blob_id_cells(&h);
-        assert_eq!(c[0], F::from_u32(0x3F00_0001));
-        assert_eq!(c[1], F::from_u32(0x0000_0012));
-        assert_eq!(c[2], F::ZERO);
+        assert_eq!(c[0], F::from_u32(0x3F00_0001), "bits 0..30: byte0 and the low 6 bits of byte3");
+        assert_eq!(c[1], F::from_u32(0x4B), "bits 30..60: the top 2 bits of byte3, then byte4 << 2");
+        assert_eq!(c[2], F::from_u32(8), "bits 60..90: bit 63 (byte7 = 0x80) lands at position 3");
+        for k in 3..8 { assert_eq!(c[k], F::ZERO); }
+        assert_eq!(c[8], F::from_u32(0xABCD), "bits 240..256: the last two bytes, all 256 bits bound");
+        // every cell is a 30-bit value
+        let mut hh = [0xFFu8; 32];
+        for c in blob_id_cells(&hh) { assert!(c.to_usize() < 1 << 30); }
+        hh[31] = 0x7F; assert_eq!(blob_id_cells(&hh)[8], F::from_u32(0x7FFF));
     }
 }

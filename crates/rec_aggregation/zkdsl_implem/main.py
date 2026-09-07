@@ -31,16 +31,16 @@ MULTI_MESSAGE_DIGESTS_OFFSET = COMPONENT_DATA_OFFSET
 BYTECODE_CLAIM_NUM_CHUNKS = BYTECODE_CLAIM_SIZE_PADDED / DIGEST_LEN
 MULTI_MESSAGE_BASE_NUM_CHUNKS = BYTECODE_CLAIM_NUM_CHUNKS + 2  # prefix chunk + domsep chunk
 
-# ed25519 leaf mode: [flag, n_seg, 0×6] [zero bytecode claim] [cap] [meta(8)] [root_seg(8)]
+# ed25519 leaf mode: [flag, n_seg, 0×6] [zero bytecode claim] [cap] [meta(16): 2 chunks] [root_seg(8)]
 ED25519_LEAF_FLAG = ED25519_LEAF_FLAG_PLACEHOLDER
 ED25519_NODE_FLAG = ED25519_NODE_FLAG_PLACEHOLDER
 MAX_LEAF_SIGS = MAX_LEAF_SIGS_PLACEHOLDER
 ED25519_LEAF_VERSION = ED25519_LEAF_VERSION_PLACEHOLDER
 ED_LEAF_META_OFFSET = COMPONENT_DATA_OFFSET
-ED_LEAF_ROOT_OFFSET = COMPONENT_DATA_OFFSET + DIGEST_LEN
-ED_LEAF_INPUT_DATA_SIZE = COMPONENT_DATA_OFFSET + 2 * DIGEST_LEN
+ED_LEAF_ROOT_OFFSET = COMPONENT_DATA_OFFSET + 2 * DIGEST_LEN
+ED_LEAF_INPUT_DATA_SIZE = COMPONENT_DATA_OFFSET + 3 * DIGEST_LEN
 ED_LEAF_NUM_CHUNKS = ED_LEAF_INPUT_DATA_SIZE / DIGEST_LEN
-# ed25519 blob mode: [flag, K, 0×6] [reduced bytecode claim] [cap] [K leaf digests] [n_total, blob_id×4, 0×3]
+# ed25519 node mode: [flag, K, 0×6] [reduced bytecode claim] [cap] [K child digests] (blob_id is bound in every leaf's meta)
 ED_NODE_DIGESTS_OFFSET = COMPONENT_DATA_OFFSET
 
 
@@ -93,6 +93,9 @@ def main():
         assert meta[0] == n_seg
         assert meta[2] == ED25519_LEAF_VERSION
         assert meta[3] == 0
+        assert meta[13] == 0
+        assert meta[14] == 0
+        assert meta[15] == 0
         ed25519_leaf(n_seg, meta, data_buf + ED_LEAF_ROOT_OFFSET)
         # no inner proofs: the zero bytecode claim
         for k in unroll(0, BYTECODE_POINT_N_VARS):
@@ -121,7 +124,7 @@ def main():
             n_chunks_buf = Array(1)
             hint_witness("component_num_chunks", n_chunks_buf)
             n_chunks = n_chunks_buf[0]
-            # bounded before allocation: a leaf is BASE + 2 chunks, a node BASE + K (K <= MAX_RECURSIONS);
+            # bounded before allocation: a leaf is BASE + 3 chunks, a node BASE + K (K <= MAX_RECURSIONS);
             # a count below BASE wraps the difference to a huge field value and fails the bound check
             n_rest = n_chunks - MULTI_MESSAGE_BASE_NUM_CHUNKS
             assert n_rest != 0

@@ -35,7 +35,7 @@ fn zero_bytecode_claim_flat() -> Vec<F> {
 }
 
 /// The leaf's input data (what the reader recomputes from the decoded columns and the leaf parameters).
-pub fn ed25519_leaf_input_data(n_seg: usize, meta: &[F; 8], root: &[F; 8]) -> Vec<F> {
+pub fn ed25519_leaf_input_data(n_seg: usize, meta: &[F; 16], root: &[F; 8]) -> Vec<F> {
     let bytecode = get_aggregation_bytecode();
     let claim = zero_bytecode_claim_flat();
     let mut data = Vec::new();
@@ -52,17 +52,17 @@ pub fn ed25519_leaf_input_data(n_seg: usize, meta: &[F; 8], root: &[F; 8]) -> Ve
 /// Reader side: the leaf input data from the rows (canonical order) and the leaf parameters.
 /// Bounded integers: `F::from_usize` reduces mod p, so counts/indices are validated here, on every
 /// reader entry point, or N and N + p would alias.
-pub fn expected_leaf_input_data(rows: &[SigRow], seg_index: usize, blob_id: &[F; 4]) -> Result<Vec<F>, ProofError> {
+pub fn expected_leaf_input_data(rows: &[SigRow], seg_index: usize, blob_id: &[F; 9]) -> Result<Vec<F>, ProofError> {
     if rows.is_empty() || rows.len() > MAX_LEAF_SIGS || seg_index >= (1 << 30) { return Err(ProofError::InvalidProof); }
     let sorted = canonical_rows(rows);
     Ok(ed25519_leaf_input_data(sorted.len(), &leaf_meta(sorted.len(), seg_index, blob_id), &root_seg(&sorted)))
 }
 /// Reader side: the leaf digest (what a parent node's input data carries for this leaf).
-pub fn expected_leaf_digest(rows: &[SigRow], seg_index: usize, blob_id: &[F; 4]) -> Result<[F; DIGEST_LEN], ProofError> {
+pub fn expected_leaf_digest(rows: &[SigRow], seg_index: usize, blob_id: &[F; 9]) -> Result<[F; DIGEST_LEN], ProofError> {
     Ok(poseidon_hash_slice(&expected_leaf_input_data(rows, seg_index, blob_id)?))
 }
 
-pub fn prove_ed25519_leaf(rows: &[SigRow], seg_index: usize, blob_id: &[F; 4], log_inv_rate: usize) -> Result<Ed25519LeafProof, String> {
+pub fn prove_ed25519_leaf(rows: &[SigRow], seg_index: usize, blob_id: &[F; 9], log_inv_rate: usize) -> Result<Ed25519LeafProof, String> {
     let bytecode = get_aggregation_bytecode();
     let (rows, n_groups, meta, root, buffers) = leaf_hint_buffers(rows, seg_index, blob_id)?;
     let input_data = ed25519_leaf_input_data(rows.len(), &meta, &root);
@@ -85,7 +85,7 @@ pub(crate) fn verify_ed25519_leaf(leaf: &Ed25519LeafProof) -> Result<InnerVerifi
 
 /// Verify a leaf proof AND bind it to the caller's statement: the proof must be for exactly these
 /// rows at this seg_index and blob_id.
-pub fn verify_ed25519_leaf_for(leaf: &Ed25519LeafProof, rows: &[SigRow], seg_index: usize, blob_id: &[F; 4]) -> Result<InnerVerified, ProofError> {
+pub fn verify_ed25519_leaf_for(leaf: &Ed25519LeafProof, rows: &[SigRow], seg_index: usize, blob_id: &[F; 9]) -> Result<InnerVerified, ProofError> {
     if leaf.input_data != expected_leaf_input_data(rows, seg_index, blob_id)? { return Err(ProofError::InvalidProof); }
     verify_ed25519_leaf(leaf)
 }
@@ -122,13 +122,13 @@ pub enum Ed25519Child<'a> {
 /// Reader-side statement tree: what the reader believes each child is. Leaves carry the rows the
 /// reader decoded from the blob, in blob order, with their position and blob id.
 pub enum Statement<'a> {
-    Leaf { rows: &'a [SigRow], seg_index: usize, blob_id: [F; 4] },
+    Leaf { rows: &'a [SigRow], seg_index: usize, blob_id: [F; 9] },
     Node(Vec<Statement<'a>>),
 }
 
 /// Leaf statements from explicit per-leaf slices (tests; a reader uses `verify_ed25519_blob`, which
 /// derives the leaves from the full decoded row list so no subset can be verified by accident).
-pub(crate) fn leaf_statements<'a>(rows_per_leaf: &[&'a [SigRow]], blob_id: &[F; 4]) -> Vec<Statement<'a>> {
+pub(crate) fn leaf_statements<'a>(rows_per_leaf: &[&'a [SigRow]], blob_id: &[F; 9]) -> Vec<Statement<'a>> {
     rows_per_leaf.iter().enumerate().map(|(k, rows)| Statement::Leaf { rows, seg_index: k, blob_id: *blob_id }).collect()
 }
 
@@ -136,11 +136,11 @@ pub(crate) fn leaf_statements<'a>(rows_per_leaf: &[&'a [SigRow]], blob_id: &[F; 
 /// leaf k = rows[k·S, (k+1)·S). The leaves are assigned to the proof's tree shape in pre-order, so
 /// leaf k always gets seg_index k whatever the shape; a shape with a different number of leaves is
 /// rejected, so every decoded row is covered by exactly one leaf.
-pub fn blob_statement_tree<'a>(rows: &'a [SigRow], leaf_size: usize, blob_id: &[F; 4], shape: &[NodeShape]) -> Result<Vec<Statement<'a>>, ProofError> {
+pub fn blob_statement_tree<'a>(rows: &'a [SigRow], leaf_size: usize, blob_id: &[F; 9], shape: &[NodeShape]) -> Result<Vec<Statement<'a>>, ProofError> {
     if rows.is_empty() || leaf_size == 0 || leaf_size > MAX_LEAF_SIGS { return Err(ProofError::InvalidProof); }
     let chunks: Vec<&'a [SigRow]> = rows.chunks(leaf_size).collect();
     const MAX_DEPTH: usize = 16; // an attacker-chosen shape must not drive the reader's recursion
-    fn build<'a>(shape: &NodeShape, chunks: &[&'a [SigRow]], next: &mut usize, blob_id: &[F; 4], depth: usize) -> Result<Statement<'a>, ProofError> {
+    fn build<'a>(shape: &NodeShape, chunks: &[&'a [SigRow]], next: &mut usize, blob_id: &[F; 9], depth: usize) -> Result<Statement<'a>, ProofError> {
         if depth > MAX_DEPTH { return Err(ProofError::InvalidProof); }
         match shape {
             NodeShape::Leaf => { let k = *next; *next += 1; let rows = *chunks.get(k).ok_or(ProofError::InvalidProof)?; Ok(Statement::Leaf { rows, seg_index: k, blob_id: *blob_id }) }
@@ -157,7 +157,7 @@ pub fn blob_statement_tree<'a>(rows: &'a [SigRow], leaf_size: usize, blob_id: &[
     Ok(stmts)
 }
 /// Verify a node proof as the proof of one whole blob (see `blob_statement_tree`).
-pub fn verify_ed25519_blob(node: &Ed25519NodeProof, rows: &[SigRow], leaf_size: usize, blob_id: &[F; 4]) -> Result<InnerVerified, ProofError> {
+pub fn verify_ed25519_blob(node: &Ed25519NodeProof, rows: &[SigRow], leaf_size: usize, blob_id: &[F; 9]) -> Result<InnerVerified, ProofError> {
     let stmts = blob_statement_tree(rows, leaf_size, blob_id, &node.shape)?;
     verify_ed25519_node(node, &stmts)
 }
@@ -267,11 +267,11 @@ mod tests {
 
     fn dataset() -> Vec<SigRow> { rows_from_json(&format!("{}/.cache/fb-stacks/datasets/sigs-25k-diverse.json", std::env::var("HOME").unwrap())) }
     fn env(name: &str, default: usize) -> usize { std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default) }
-    fn prove_leaves(rows: &[SigRow], per_leaf: usize, k: usize, first: usize, blob_id: &[F; 4]) -> Vec<Ed25519LeafProof> {
+    fn prove_leaves(rows: &[SigRow], per_leaf: usize, k: usize, first: usize, blob_id: &[F; 9]) -> Vec<Ed25519LeafProof> {
         (0..k).map(|c| {
             let chunk = &rows[(first + c) * per_leaf..(first + c + 1) * per_leaf];
             let t = std::time::Instant::now();
-            let leaf = prove_ed25519_leaf(chunk, c, blob_id, 1).expect("leaf proof");
+            let leaf = prove_ed25519_leaf(chunk, c, blob_id, env("LEAF_RATE", 1)).expect("leaf proof");
             println!("leaf {c}: {} sigs, {} signers, proof {:.1} s, {} cycles, {} KiB", leaf.n_seg, leaf.n_groups, t.elapsed().as_secs_f32(), leaf.proof.metadata.as_ref().map(|m| m.cycles).unwrap_or(0), leaf.proof.proof.proof_size_fe() * 4 / 1024);
             verify_ed25519_leaf_for(&leaf, chunk, c, blob_id).expect("leaf verifies and binds to its statement");
             leaf
@@ -286,12 +286,12 @@ mod tests {
         let rows = dataset();
         let per_leaf = env("NODE_LEAF_N", 16);
         let k = env("NODE_K", 2);
-        let blob_id = [F::from_usize(9), F::from_usize(8), F::from_usize(7), F::from_usize(6)];
+        let blob_id = std::array::from_fn(|i| F::from_usize(9 + i));
         let leaves = prove_leaves(&rows, per_leaf, k, 0, &blob_id);
         let t = std::time::Instant::now();
         let children: Vec<Ed25519Child<'_>> = leaves.iter().map(Ed25519Child::Leaf).collect();
-        let node = prove_ed25519_node(&children, 1).expect("node proof");
-        println!("node of {k} leaves: proof {:.1} s, {} cycles, {} KiB", t.elapsed().as_secs_f32(), node.proof.metadata.as_ref().map(|m| m.cycles).unwrap_or(0), node.proof.proof.proof_size_fe() * 4 / 1024);
+        let node = prove_ed25519_node(&children, env("NODE_RATE", 1)).expect("node proof");
+        println!("node of {k} leaves (rate 1/{}): proof {:.1} s, {} cycles, {} KiB", 1 << env("NODE_RATE", 1), t.elapsed().as_secs_f32(), node.proof.metadata.as_ref().map(|m| m.cycles).unwrap_or(0), node.proof.proof.proof_size_fe() * 4 / 1024);
         if let Some(report) = node.proof.metadata.as_ref().and_then(|m| m.profiling_report.as_ref()) { println!("=== VM PROFILE (node) ===\n{report}\n=== END PROFILE ==="); }
         let per: Vec<&[SigRow]> = (0..k).map(|c| &rows[c * per_leaf..(c + 1) * per_leaf]).collect();
         verify_ed25519_node(&node, &leaf_statements(&per, &blob_id)).expect("node verifies from reader-recomputed leaf digests");
@@ -300,7 +300,7 @@ mod tests {
         assert!(verify_ed25519_blob(&node, &rows[1..k * per_leaf + 1], per_leaf, &blob_id).is_err(), "shifted rows must be rejected");
         assert!(verify_ed25519_blob(&node, &rows[..(k + 1) * per_leaf], per_leaf, &blob_id).is_err(), "extra rows (an uncovered leaf) must be rejected");
         // wrong blob_id
-        assert!(verify_ed25519_node(&node, &leaf_statements(&per, &[F::ZERO; 4])).is_err(), "blob_id must be bound");
+        assert!(verify_ed25519_node(&node, &leaf_statements(&per, &[F::ZERO; 9])).is_err(), "blob_id must be bound");
         if k >= 2 {
             // two leaves swapped (positions are bound through seg_index in each leaf digest)
             let mut swapped = per.clone(); swapped.swap(0, 1);
@@ -324,7 +324,7 @@ mod tests {
         init_aggregation_bytecode();
         let rows = dataset();
         let per_leaf = env("NODE_LEAF_N", 16);
-        let blob_id = [F::from_usize(100), F::from_usize(8), F::from_usize(7), F::from_usize(6)];
+        let blob_id: [F; 9] = std::array::from_fn(|i| F::from_usize(100 + i));
         let leaves = prove_leaves(&rows, per_leaf, 4, 0, &blob_id);
         let t = std::time::Instant::now();
         let a = prove_ed25519_node(&[Ed25519Child::Leaf(&leaves[0]), Ed25519Child::Leaf(&leaves[1])], 1).expect("node A");
@@ -360,7 +360,7 @@ mod tests {
     }
 
     /// Golden vectors for the TypeScript reader port (docs/zk-reader-contract.md). Writes
-    /// `$FB_VECTORS_OUT` (default ~/projects/farcaster-blobs/zk-aggregate/vectors/leaf-v1.json).
+    /// `$FB_VECTORS_OUT` (default ~/projects/farcaster-blobs/zk-aggregate/vectors/leaf-v2.json).
     #[test]
     #[ignore = "writes the reader vector file; run on purpose"]
     fn write_reader_vectors() {
@@ -400,7 +400,7 @@ mod tests {
         let claim = rebuild_bytecode_claim(node.bytecode_claim.point.clone()).unwrap();
         let point_cells: Vec<F> = claim.point.0.iter().flat_map(|e| e.as_basis_coefficients_slice().to_vec()).collect();
         let json = format!(r#"{{
-  "contract": "docs/zk-reader-contract.md v1",
+  "contract": "docs/zk-reader-contract.md v2",
   "vk": {{ "n_vars": {}, "claim_len": {}, "claim_len_padded": {}, "domsep": {}, "zero_eval": {}, "leaf_version": {}, "max_leaf_sigs": {}, "bytecode_hash": {} }},
   "conventions": {{ "canonical_order": "canonical_order[i] = index in rows_blob_order of the i-th canonical row (stable sort by pubkey bytes, ties keep blob order)", "zero_eval": "read from vk, never hardcode" }},
   "poseidon16": {{ "input": {}, "output": {} }},
@@ -441,7 +441,7 @@ mod tests {
             cells(&leaf_digest), cells(&point_cells), cells(claim.value.as_basis_coefficients_slice()), cells(&node.input_data), cells(&poseidon_hash_slice(&node.input_data)),
             node.proof.proof.proof_size_fe() * 4 / 1024,
         );
-        let out = std::env::var("FB_VECTORS_OUT").unwrap_or(format!("{}/projects/farcaster-blobs/zk-aggregate/vectors/leaf-v1.json", std::env::var("HOME").unwrap()));
+        let out = std::env::var("FB_VECTORS_OUT").unwrap_or(format!("{}/projects/farcaster-blobs/zk-aggregate/vectors/leaf-v2.json", std::env::var("HOME").unwrap()));
         std::fs::create_dir_all(std::path::Path::new(&out).parent().unwrap()).unwrap();
         std::fs::write(&out, json).unwrap();
         println!("wrote {out}");
@@ -456,7 +456,7 @@ mod tests {
     fn test_ed25519_node_rejects_tampered_child_in_circuit() {
         init_aggregation_bytecode();
         let rows = dataset();
-        let blob_id = [F::from_usize(9), F::from_usize(8), F::from_usize(7), F::from_usize(6)];
+        let blob_id = std::array::from_fn(|i| F::from_usize(9 + i));
         let leaf = prove_ed25519_leaf(&rows[..16], 0, &blob_id, 1).expect("leaf proof");
         let good = verify_ed25519_leaf(&leaf).expect("honest leaf verifies natively");
         let n = good.raw_proof.transcript.len();
