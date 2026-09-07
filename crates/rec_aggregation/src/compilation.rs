@@ -51,6 +51,7 @@ pub(crate) const SINGLE_MESSAGE_FLAG: usize = 1;
 pub(crate) const MULTI_MESSAGE_FLAG: usize = 0;
 pub(crate) const ED25519_LEAF_FLAG: usize = 2;
 pub(crate) const ED25519_BLOB_FLAG: usize = 3;
+pub(crate) const ED25519_EPOCH_FLAG: usize = 4;
 
 pub(crate) const BYTECODE_CLAIM_OFFSET: usize = DIGEST_LEN;
 /// Single-message component data: pubkeys_hash | message | merkle_chunks | tweaks_hash.
@@ -294,6 +295,7 @@ fn build_replacements(log_inner_bytecode: usize, bytecode_zero_eval: F) -> BTree
     let mut n_air_shift_columns = vec![];
     let mut n_air_constraints = vec![];
     let mut one_buses_all_cols = vec![];
+    let mut one_bus_runs = vec![];
     let mut n_column_buses = vec![];
     let mut column_bus_pull = vec![];
     let mut column_bus_offsets = vec![];
@@ -311,6 +313,10 @@ fn build_replacements(log_inner_bytecode: usize, bytecode_zero_eval: F) -> BTree
         let mut table_data_cols = vec![];
         let mut table_data_offsets = vec![];
         let mut table_new_cols = vec![];
+        // (domsep, batchable): a bus is batchable when it opens exactly its one data column (offset 0);
+        // maximal runs of consecutive batchable buses with one domsep (the range pushes) are verified
+        // in batch by the recursion program.
+        let mut bus_specs: Vec<(usize, bool)> = vec![];
         let mut seen_cols: HashSet<ColIndex> = HashSet::new();
         for bus in table.bus_interactions() {
             if !matches!(bus.multiplicity, BusMultiplicity::One) {
@@ -334,6 +340,7 @@ fn build_replacements(log_inner_bytecode: usize, bytecode_zero_eval: F) -> BTree
                     new_cols.push(col);
                 }
             }
+            bus_specs.push((domsep, data_cols.len() == 1 && data_offsets[0] == 0 && new_cols.len() == 1 && new_cols[0] == data_cols[0]));
             table_domseps.push(domsep.to_string());
             table_data_cols.push(format!(
                 "[{}]",
@@ -352,6 +359,20 @@ fn build_replacements(log_inner_bytecode: usize, bytecode_zero_eval: F) -> BTree
         one_buses_data_cols.push(format!("[{}]", table_data_cols.join(", ")));
         one_buses_data_offsets.push(format!("[{}]", table_data_offsets.join(", ")));
         one_buses_new_cols.push(format!("[{}]", table_new_cols.join(", ")));
+        {
+            let mut runs: Vec<String> = vec![];
+            let mut i = 0;
+            while i < bus_specs.len() {
+                let (ds, batchable) = bus_specs[i];
+                let mut n = 1;
+                if batchable {
+                    while i + n < bus_specs.len() && bus_specs[i + n] == (ds, true) { n += 1; }
+                }
+                runs.push(format!("[{i}, {n}]"));
+                i += n;
+            }
+            one_bus_runs.push(format!("[{}]", runs.join(", ")));
+        }
 
         let mut sorted_seen: Vec<ColIndex> = seen_cols.iter().copied().collect();
         sorted_seen.sort();
@@ -377,6 +398,7 @@ fn build_replacements(log_inner_bytecode: usize, bytecode_zero_eval: F) -> BTree
         "ONE_BUSES_ALL_COLS_PLACEHOLDER".to_string(),
         format!("[{}]", one_buses_all_cols.join(", ")),
     );
+    replacements.insert("ONE_BUS_RUNS_PLACEHOLDER".to_string(), format!("[{}]", one_bus_runs.join(", ")));
     replacements.insert(
         "ONE_BUSES_DOMSEPS_PLACEHOLDER".to_string(),
         format!("[{}]", one_buses_domseps.join(", ")),
@@ -493,6 +515,7 @@ fn build_replacements(log_inner_bytecode: usize, bytecode_zero_eval: F) -> BTree
     replacements.insert("MAX_RECURSIONS_PLACEHOLDER".to_string(), MAX_RECURSIONS.to_string());
     replacements.insert("ED25519_LEAF_FLAG_PLACEHOLDER".to_string(), ED25519_LEAF_FLAG.to_string());
     replacements.insert("ED25519_BLOB_FLAG_PLACEHOLDER".to_string(), ED25519_BLOB_FLAG.to_string());
+    replacements.insert("ED25519_EPOCH_FLAG_PLACEHOLDER".to_string(), ED25519_EPOCH_FLAG.to_string());
     replacements.insert("ED25519_LEAF_VERSION_PLACEHOLDER".to_string(), lean_prover::ed25519_leaf::LEAF_VERSION.to_string());
     for (k, v) in lean_prover::ed25519_leaf::leaf_program_replacements() { replacements.insert(k, v); }
 

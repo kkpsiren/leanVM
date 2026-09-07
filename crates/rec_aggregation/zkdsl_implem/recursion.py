@@ -28,6 +28,7 @@ TOTAL_COLUMN_BUSES = TOTAL_COLUMN_BUSES_PLACEHOLDER
 ONE_BUSES_DATA_COLS = ONE_BUSES_DATA_COLS_PLACEHOLDER  # [[[_; num_data]; num_buses]; N_TABLES]
 ONE_BUSES_DATA_OFFSETS = ONE_BUSES_DATA_OFFSETS_PLACEHOLDER  # [[[_; num_data]; num_buses]; N_TABLES]
 ONE_BUSES_NEW_COLS = ONE_BUSES_NEW_COLS_PLACEHOLDER  # [[[_; n_new]; num_buses]; N_TABLES]
+ONE_BUS_RUNS = ONE_BUS_RUNS_PLACEHOLDER  # [[[start, n]; num_runs]; N_TABLES]: runs of consecutive single-column One buses (same domsep) verified in batch
 
 NUM_COLS_AIR = NUM_COLS_AIR_PLACEHOLDER
 MAX_NUM_COLS_AIR = MAX_NUM_COLS_AIR_PLACEHOLDER  # max(NUM_COLS_AIR[t] for t in 0..N_TABLES)
@@ -297,9 +298,14 @@ def recursion(inner_public_memory, initial_fiat_shamir_cap):
         inner_point = point_gkr + (n_vars_logup_gkr - log_n_rows) * DIM
         pcs_inner_points[table_index] = inner_point
 
+        # The table's buses occupy consecutive n_rows-blocks of the GKR layout, so all their location
+        # prefixes come from one eq-tensor (slot k = Column buses first, then One buses in order).
+        n_bus_slots = N_COLUMN_BUSES[table_index] + len(ONE_BUSES_DOMSEPS[table_index])
+        bus_prefixes = bus_slot_prefixes(offset / n_rows, n_vars_logup_gkr - log_n_rows, point_gkr, n_bus_slots)
+
         # Buses (data flow between tables — Multiplicity::Column), in bus order.
         for column_bus_idx in unroll(0, N_COLUMN_BUSES[table_index]):
-            prefix = multilinear_location_prefix(offset / n_rows, n_vars_logup_gkr - log_n_rows, point_gkr)
+            prefix = bus_prefixes + column_bus_idx * DIM
 
             fs, eval_on_selector = fs_receive_ef_inlined(fs, 1)
             retrieved_numerators_value = add_extension_ret(
@@ -317,36 +323,66 @@ def recursion(inner_public_memory, initial_fiat_shamir_cap):
 
             offset += n_rows
 
-        # Multiplicity::One buses (bytecode lookup + memory lookups).
-        for one_bus_idx in unroll(0, len(ONE_BUSES_DOMSEPS[table_index])):
-            domsep = ONE_BUSES_DOMSEPS[table_index][one_bus_idx]
-            n_new = len(ONE_BUSES_NEW_COLS[table_index][one_bus_idx])
-            n_data = len(ONE_BUSES_DATA_COLS[table_index][one_bus_idx])
+        # Multiplicity::One buses (bytecode lookup + memory lookups + range pushes), in bus order.
+        # A run of n >= 2 consecutive single-column buses with one domsep (the range pushes, thousands
+        # per wide table) is verified in batch: one transcript read of n chunks (each [v | 0 0 0], the
+        # same chunks the per-bus path would absorb one at a time), one tensor of location prefixes,
+        # and three dot products — instead of a bit decomposition, a receive and a fingerprint per bus.
+        for run_idx in unroll(0, len(ONE_BUS_RUNS[table_index])):
+            run_start = ONE_BUS_RUNS[table_index][run_idx][0]
+            run_n = ONE_BUS_RUNS[table_index][run_idx][1]
+            if run_n == 1:
+                one_bus_idx = run_start
+                domsep = ONE_BUSES_DOMSEPS[table_index][one_bus_idx]
+                n_new = len(ONE_BUSES_NEW_COLS[table_index][one_bus_idx])
+                n_data = len(ONE_BUSES_DATA_COLS[table_index][one_bus_idx])
 
-            if n_new != 0:  # a bus whose columns were all opened by earlier buses sends nothing
-                fs, new_evals = fs_receive_ef_inlined(fs, n_new)
-                for i in unroll(0, n_new):
-                    new_col = ONE_BUSES_NEW_COLS[table_index][one_bus_idx][i]
-                    pcs_vals_logup[COLS_AIR_OFFSETS[table_index] + new_col] = new_evals + i * DIM
+                if n_new != 0:  # a bus whose columns were all opened by earlier buses sends nothing
+                    fs, new_evals = fs_receive_ef_inlined(fs, n_new)
+                    for i in unroll(0, n_new):
+                        new_col = ONE_BUSES_NEW_COLS[table_index][one_bus_idx][i]
+                        pcs_vals_logup[COLS_AIR_OFFSETS[table_index] + new_col] = new_evals + i * DIM
 
-            data_evals = Array(n_data * DIM)
-            for i in unroll(0, n_data):
-                data_col = ONE_BUSES_DATA_COLS[table_index][one_bus_idx][i]
-                data_ofs = ONE_BUSES_DATA_OFFSETS[table_index][one_bus_idx][i]
-                src = pcs_vals_logup[COLS_AIR_OFFSETS[table_index] + data_col]
-                if data_ofs == 0:
-                    copy_ef(src, data_evals + i * DIM)
-                if data_ofs != 0:
-                    copy_ef(add_base_extension_ret(data_ofs, src), data_evals + i * DIM)
+                data_evals = Array(n_data * DIM)
+                for i in unroll(0, n_data):
+                    data_col = ONE_BUSES_DATA_COLS[table_index][one_bus_idx][i]
+                    data_ofs = ONE_BUSES_DATA_OFFSETS[table_index][one_bus_idx][i]
+                    src = pcs_vals_logup[COLS_AIR_OFFSETS[table_index] + data_col]
+                    if data_ofs == 0:
+                        copy_ef(src, data_evals + i * DIM)
+                    if data_ofs != 0:
+                        copy_ef(add_base_extension_ret(data_ofs, src), data_evals + i * DIM)
 
-            pref = multilinear_location_prefix(offset / n_rows, n_vars_logup_gkr - log_n_rows, point_gkr)
-            retrieved_numerators_value = add_extension_ret(retrieved_numerators_value, pref)
-            fingerp = fingerprint_n(domsep, data_evals, n_data, logup_beta_eq_poly)
-            retrieved_denominators_value = add_extension_ret(
-                retrieved_denominators_value,
-                mul_extension_ret(pref, sub_extension_ret(logup_gamma, fingerp)),
-            )
-            offset += n_rows
+                pref = bus_prefixes + (N_COLUMN_BUSES[table_index] + one_bus_idx) * DIM
+                retrieved_numerators_value = add_extension_ret(retrieved_numerators_value, pref)
+                fingerp = fingerprint_n(domsep, data_evals, n_data, logup_beta_eq_poly)
+                retrieved_denominators_value = add_extension_ret(
+                    retrieved_denominators_value,
+                    mul_extension_ret(pref, sub_extension_ret(logup_gamma, fingerp)),
+                )
+                offset += n_rows
+            if run_n != 1:
+                domsep = ONE_BUSES_DOMSEPS[table_index][run_start]
+                fs, chunks = fs_receive_chunks(fs, run_n)
+                vals = Array(run_n * DIM)
+                for i in unroll(0, run_n):
+                    for j in unroll(DIM, DIGEST_LEN):
+                        assert chunks[i * DIGEST_LEN + j] == 0
+                    copy_ef(chunks + i * DIGEST_LEN, vals + i * DIM)
+                    pcs_vals_logup[COLS_AIR_OFFSETS[table_index] + ONE_BUSES_NEW_COLS[table_index][run_start + i][0]] = vals + i * DIM
+                prefixes = bus_prefixes + (N_COLUMN_BUSES[table_index] + run_start) * DIM
+                s1 = sum_ef_long(prefixes, run_n)  # Σ_i prefix_i
+                s2 = dot_product_ee_ret(prefixes, vals, run_n)  # Σ_i prefix_i · v_i
+                # fingerprint_i = v_i·β[0] + domsep·β[top]  ⇒  Σ_i prefix_i·(γ − fingerprint_i) = (γ − domsep·β[top])·s1 − β[0]·s2
+                gamma_minus_ds = sub_extension_ret(
+                    logup_gamma, mul_base_extension_ret(domsep, logup_beta_eq_poly + (2 ** log2_ceil(MAX_BUS_WIDTH) - 1) * DIM)
+                )
+                retrieved_numerators_value = add_extension_ret(retrieved_numerators_value, s1)
+                retrieved_denominators_value = add_extension_ret(
+                    retrieved_denominators_value,
+                    sub_extension_ret(mul_extension_ret(gamma_minus_ds, s1), mul_extension_ret(logup_beta_eq_poly, s2)),
+                )
+                offset += n_rows * run_n
 
     # Final logup adjustment (padding)
     retrieved_denominators_value = add_extension_ret(
@@ -628,6 +664,13 @@ def recursion(inner_public_memory, initial_fiat_shamir_cap):
     copy_ef(mul_extension_ret(eval_weights, final_value), end_sum)
 
     return bytecode_claim
+
+
+def bus_slot_prefixes(first_slot, n_vars, point, n_slots: Const):
+    # location prefixes of n_slots consecutive GKR slots starting at first_slot (one eq-tensor)
+    if n_slots == 1:
+        return multilinear_location_prefix(first_slot, n_vars, point)
+    return compute_column_prefixes(first_slot, n_vars, point, n_slots)
 
 
 def multilinear_location_prefix(offset, n_vars, point):

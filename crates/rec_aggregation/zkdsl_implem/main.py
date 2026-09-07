@@ -34,6 +34,7 @@ MULTI_MESSAGE_BASE_NUM_CHUNKS = BYTECODE_CLAIM_NUM_CHUNKS + 2  # prefix chunk + 
 # ed25519 leaf mode: [flag, n_seg, 0×6] [zero bytecode claim] [cap] [meta(8)] [root_seg(8)]
 ED25519_LEAF_FLAG = ED25519_LEAF_FLAG_PLACEHOLDER
 ED25519_BLOB_FLAG = ED25519_BLOB_FLAG_PLACEHOLDER
+ED25519_EPOCH_FLAG = ED25519_EPOCH_FLAG_PLACEHOLDER
 ED25519_LEAF_VERSION = ED25519_LEAF_VERSION_PLACEHOLDER
 ED_LEAF_META_OFFSET = COMPONENT_DATA_OFFSET
 ED_LEAF_ROOT_OFFSET = COMPONENT_DATA_OFFSET + DIGEST_LEN
@@ -41,6 +42,7 @@ ED_LEAF_INPUT_DATA_SIZE = COMPONENT_DATA_OFFSET + 2 * DIGEST_LEN
 ED_LEAF_NUM_CHUNKS = ED_LEAF_INPUT_DATA_SIZE / DIGEST_LEN
 # ed25519 blob mode: [flag, K, 0×6] [reduced bytecode claim] [cap] [K leaf digests] [n_total, blob_id×4, 0×3]
 ED_BLOB_DIGESTS_OFFSET = COMPONENT_DATA_OFFSET
+ED_EPOCH_DIGESTS_OFFSET = COMPONENT_DATA_OFFSET
 
 
 def main():
@@ -132,6 +134,32 @@ def main():
             assert trailer[t] == 0
         reduce_bytecode_claims(bytecode_claims, n_bytecode_claims, bytecode_claim_output, initial_fiat_shamir_cap)
         slice_hash_range(data_buf, k_leaves + MULTI_MESSAGE_BASE_NUM_CHUNKS + 1, pub_mem)
+        return
+
+    if discriminator == ED25519_EPOCH_FLAG:
+        # ============ ed25519 epoch: K blob proofs; epoch_pub = hash(K blob digests) ============
+        # Each child is a blob-mode proof whose input data is variable-sized (it grows with its leaf
+        # count), so its chunk count is hinted and its buffer allocated at runtime; the recomputed
+        # digest must equal the epoch's public digest for that position. A blob digest already binds
+        # its blob_id, n_total and every leaf digest, so no trailer is needed here.
+        k_blobs = data_buf[1]
+        assert k_blobs != 0
+        assert k_blobs <= MAX_RECURSIONS
+        n_bytecode_claims = k_blobs * 2
+        bytecode_claims = Array(n_bytecode_claims)
+        for c in range(0, k_blobs):
+            digest = data_buf + ED_EPOCH_DIGESTS_OFFSET + c * DIGEST_LEN
+            n_chunks_buf = Array(1)
+            hint_witness("component_num_chunks", n_chunks_buf)
+            n_chunks = n_chunks_buf[0]
+            blob_buf = Array(n_chunks * DIGEST_LEN)
+            hint_witness("component_layout", blob_buf)
+            ensure_well_formed_input_data(blob_buf, initial_fiat_shamir_cap, ED25519_BLOB_FLAG)
+            slice_hash_range(blob_buf, n_chunks, digest)
+            bytecode_claims[2 * c] = blob_buf + BYTECODE_CLAIM_OFFSET
+            bytecode_claims[2 * c + 1] = recursion(digest, initial_fiat_shamir_cap)
+        reduce_bytecode_claims(bytecode_claims, n_bytecode_claims, bytecode_claim_output, initial_fiat_shamir_cap)
+        slice_hash_range(data_buf, k_blobs + MULTI_MESSAGE_BASE_NUM_CHUNKS, pub_mem)
         return
 
     assert discriminator == SINGLE_MESSAGE_FLAG

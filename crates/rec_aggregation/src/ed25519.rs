@@ -6,7 +6,7 @@
 //! same blob_id, version, Σ n_seg = n_total) and reduces their bytecode claims.
 
 use crate::bytecode_claims::{flatten_bytecode_claim, reduce_bytecode_claims};
-use crate::compilation::{BYTECODE_CLAIM_OFFSET, ED25519_BLOB_FLAG, ED25519_LEAF_FLAG, MAX_RECURSIONS, PREAMBLE_MEMORY_LEN, get_aggregation_bytecode};
+use crate::compilation::{BYTECODE_CLAIM_OFFSET, ED25519_BLOB_FLAG, ED25519_EPOCH_FLAG, ED25519_LEAF_FLAG, MAX_RECURSIONS, PREAMBLE_MEMORY_LEN, get_aggregation_bytecode};
 use crate::single_message_aggregation::{extract_merkle_hint_blobs, rebuild_bytecode_claim};
 use crate::{InnerVerified, verify_inner};
 use backend::*;
@@ -125,7 +125,7 @@ pub fn prove_ed25519_blob(leaves: &[Ed25519LeafProof], blob_id: &[F; 4], log_inv
     hints.insert(bytecode, "merkle_path", merkle_path_blobs);
     hints.insert(bytecode, "bytecode_sumcheck_proof", arena_vec![ArenaVec::from_slice(&reduced.sumcheck_transcript)]);
     let witness = ExecutionWitness { preamble_memory_len: PREAMBLE_MEMORY_LEN, hints, min_table_log_n_rows: Default::default() };
-    let proof = prove_execution(bytecode, &public_input, &witness, &default_whir_config(log_inv_rate), false).map_err(|e| format!("{e:?}"))?;
+    let proof = prove_execution(bytecode, &public_input, &witness, &default_whir_config(log_inv_rate), vm_profiler()).map_err(|e| format!("{e:?}"))?;
     Ok(Ed25519BlobProof { input_data, bytecode_claim: reduced.final_claim, proof })
 }
 
@@ -136,6 +136,105 @@ pub fn verify_ed25519_blob(blob: &Ed25519BlobProof, leaf_digests: &[[F; DIGEST_L
     let input_data = ed25519_blob_input_data(leaf_digests, n_total, blob_id, &flatten_bytecode_claim(&claim));
     if input_data != blob.input_data { return Err(ProofError::InvalidProof); }
     verify_inner(input_data, blob.proof.proof.clone())
+}
+
+/// The statement a blob proof's input data encodes: (leaf digests, n_total, blob_id).
+pub fn ed25519_blob_statement(input_data: &[F]) -> Option<(Vec<[F; DIGEST_LEN]>, usize, [F; 4])> {
+    if input_data.first() != Some(&F::from_usize(ED25519_BLOB_FLAG)) { return None; }
+    let k = input_data.get(1)?.as_canonical_u64() as usize;
+    // digests start right after the domsep chunk; the layout is fixed by `ed25519_blob_input_data`
+    let digests_offset = input_data.len().checked_sub((k + 1) * DIGEST_LEN)?;
+    let digests: Vec<[F; DIGEST_LEN]> = (0..k).map(|i| input_data[digests_offset + i * DIGEST_LEN..][..DIGEST_LEN].try_into().unwrap()).collect();
+    let trailer = digests_offset + k * DIGEST_LEN;
+    let n_total = input_data[trailer].as_canonical_u64() as usize;
+    let blob_id: [F; 4] = input_data[trailer + 1..trailer + 5].try_into().unwrap();
+    Some((digests, n_total, blob_id))
+}
+
+/// Verify a blob proof against the statement its own input data encodes (used by the epoch prover;
+/// a reader who cares which blob it is must use `verify_ed25519_blob` with their own statement).
+pub fn verify_ed25519_blob_self(blob: &Ed25519BlobProof) -> Result<InnerVerified, ProofError> {
+    let (digests, n_total, blob_id) = ed25519_blob_statement(&blob.input_data).ok_or(ProofError::InvalidProof)?;
+    verify_ed25519_blob(blob, &digests, n_total, &blob_id)
+}
+
+/// `ED_VM_PROFILE=1` turns on the VM's per-function cycle profiler for node proofs (report in
+/// `proof.metadata.profiling_report`).
+fn vm_profiler() -> bool { std::env::var("ED_VM_PROFILE").is_ok() }
+
+// ============================ epoch: K blob proofs ============================
+
+/// An epoch proof verifies K blob proofs in-circuit. Its input data is
+/// `[EPOCH_FLAG, K, 0×6] ‖ reduced claim ‖ domsep ‖ K blob digests`; each blob digest is the hash of
+/// that blob's full input data, which a reader rebuilds from recomputed leaf digests, the blob's
+/// (n_total, blob_id) and the blob's carried bytecode-claim point (`child_claims`).
+pub struct Ed25519EpochProof {
+    pub input_data: Vec<F>,
+    pub bytecode_claim: Evaluation<EF>,
+    /// Each child blob's bytecode claim (its point is what a reader needs to rebuild the blob digest).
+    pub child_claims: Vec<Evaluation<EF>>,
+    pub proof: ExecutionProof,
+}
+
+pub fn ed25519_epoch_input_data(blob_digests: &[[F; DIGEST_LEN]], bytecode_claim_flat: &[F]) -> Vec<F> {
+    let claim_padded = bytecode_claim_flat.len().next_multiple_of(DIGEST_LEN);
+    let domsep_offset = BYTECODE_CLAIM_OFFSET + claim_padded;
+    let digests_offset = domsep_offset + DIGEST_LEN;
+    let mut data = vec![F::ZERO; digests_offset + blob_digests.len() * DIGEST_LEN];
+    data[0] = F::from_usize(ED25519_EPOCH_FLAG);
+    data[1] = F::from_usize(blob_digests.len());
+    data[BYTECODE_CLAIM_OFFSET..][..bytecode_claim_flat.len()].copy_from_slice(bytecode_claim_flat);
+    data[domsep_offset..][..DIGEST_LEN].copy_from_slice(&fiat_shamir_domain_sep(get_aggregation_bytecode()));
+    for (i, d) in blob_digests.iter().enumerate() { data[digests_offset + i * DIGEST_LEN..][..DIGEST_LEN].copy_from_slice(d); }
+    data
+}
+
+pub fn prove_ed25519_epoch(blobs: &[Ed25519BlobProof], log_inv_rate: usize) -> Result<Ed25519EpochProof, String> {
+    if blobs.is_empty() || blobs.len() > MAX_RECURSIONS { return Err("epoch: 1..=MAX_RECURSIONS blobs".into()); }
+    let bytecode = get_aggregation_bytecode();
+    let verified: Vec<InnerVerified> = blobs.iter().map(|b| verify_ed25519_blob_self(b).map_err(|e| format!("blob: {e:?}"))).collect::<Result<_, _>>()?;
+    let reduced = reduce_bytecode_claims(&verified);
+    let digests: Vec<[F; DIGEST_LEN]> = verified.iter().map(|v| v.input_data_hash).collect();
+    let input_data = ed25519_epoch_input_data(&digests, &flatten_bytecode_claim(&reduced.final_claim));
+    let public_input = poseidon_hash_slice(&input_data);
+    let bytecode_value_hint_blobs: ArenaVec<ArenaVec<F>> = verified.iter().map(|v| ArenaVec::from_slice(v.bytecode_evaluation.value.as_basis_coefficients_slice())).collect();
+    let component_num_chunks_blobs: ArenaVec<ArenaVec<F>> = verified.iter().map(|v| arena_vec![F::from_usize(v.input_data.len() / DIGEST_LEN)]).collect();
+    let component_layout_blobs: ArenaVec<ArenaVec<F>> = verified.iter().map(|v| ArenaVec::from_slice(&v.input_data)).collect();
+    let proof_transcript_blobs: ArenaVec<ArenaVec<F>> = verified.iter().map(|v| ArenaVec::from_slice(&v.raw_proof.transcript)).collect();
+    let table_sort_perm_blobs: ArenaVec<ArenaVec<F>> = verified.iter().map(|v| v.sorted_table_perm.iter().map(|&i| F::from_usize(i)).collect()).collect();
+    let (merkle_leaf_blobs, merkle_path_blobs) = extract_merkle_hint_blobs(verified.iter().map(|v| &v.raw_proof));
+    let mut hints = Hints::default();
+    hints.insert(bytecode, "input_data_num_chunks", arena_vec![arena_vec![F::from_usize(input_data.len() / DIGEST_LEN)]]);
+    hints.insert(bytecode, "input_data", arena_vec![ArenaVec::from_slice(&input_data)]);
+    hints.insert(bytecode, "bytecode_value_hint", bytecode_value_hint_blobs);
+    hints.insert(bytecode, "component_num_chunks", component_num_chunks_blobs);
+    hints.insert(bytecode, "component_layout", component_layout_blobs);
+    hints.insert(bytecode, "proof_transcript_size", proof_transcript_blobs.iter().map(|b| arena_vec![F::from_usize(b.len())]).collect());
+    hints.insert(bytecode, "proof_transcript", proof_transcript_blobs);
+    hints.insert(bytecode, "table_sort_perm", table_sort_perm_blobs);
+    hints.insert(bytecode, "merkle_leaf", merkle_leaf_blobs);
+    hints.insert(bytecode, "merkle_path", merkle_path_blobs);
+    hints.insert(bytecode, "bytecode_sumcheck_proof", arena_vec![ArenaVec::from_slice(&reduced.sumcheck_transcript)]);
+    let witness = ExecutionWitness { preamble_memory_len: PREAMBLE_MEMORY_LEN, hints, min_table_log_n_rows: Default::default() };
+    let proof = prove_execution(bytecode, &public_input, &witness, &default_whir_config(log_inv_rate), vm_profiler()).map_err(|e| format!("{e:?}"))?;
+    Ok(Ed25519EpochProof { input_data, bytecode_claim: reduced.final_claim, child_claims: blobs.iter().map(|b| b.bytecode_claim.clone()).collect(), proof })
+}
+
+/// Reader-side epoch verification: `blob_statements[c]` = (leaf digests, n_total, blob_id) of the c-th
+/// blob, each recomputed by the reader from the decoded blob. Rebuilds every blob digest (with the
+/// carried child claim point, value recomputed from the real bytecode), the epoch input data and the
+/// reduced claim, then verifies the proof.
+pub fn verify_ed25519_epoch(epoch: &Ed25519EpochProof, blob_statements: &[(Vec<[F; DIGEST_LEN]>, usize, [F; 4])]) -> Result<InnerVerified, ProofError> {
+    if blob_statements.len() != epoch.child_claims.len() { return Err(ProofError::InvalidProof); }
+    let mut digests = Vec::with_capacity(blob_statements.len());
+    for ((leaf_digests, n_total, blob_id), child) in blob_statements.iter().zip(&epoch.child_claims) {
+        let child_claim = rebuild_bytecode_claim(child.point.clone()).map_err(|_| ProofError::InvalidProof)?;
+        digests.push(poseidon_hash_slice(&ed25519_blob_input_data(leaf_digests, *n_total, blob_id, &flatten_bytecode_claim(&child_claim))));
+    }
+    let claim = rebuild_bytecode_claim(epoch.bytecode_claim.point.clone()).map_err(|_| ProofError::InvalidProof)?;
+    let input_data = ed25519_epoch_input_data(&digests, &flatten_bytecode_claim(&claim));
+    if input_data != epoch.input_data { return Err(ProofError::InvalidProof); }
+    verify_inner(input_data, epoch.proof.proof.clone())
 }
 
 #[cfg(test)]
@@ -169,10 +268,56 @@ mod tests {
         let t = std::time::Instant::now();
         let blob = prove_ed25519_blob(&leaves, &blob_id, 1).expect("blob proof");
         println!("blob of {k} leaves: proof {:.1} s, {} cycles", t.elapsed().as_secs_f32(), blob.proof.metadata.as_ref().map(|m| m.cycles).unwrap_or(0));
+        if let Some(report) = blob.proof.metadata.as_ref().and_then(|m| m.profiling_report.as_ref()) { println!("=== VM PROFILE (blob) ===\n{report}\n=== END PROFILE ==="); }
         let digests: Vec<[F; DIGEST_LEN]> = (0..k).map(|c| poseidon_hash_slice(&expected_leaf_input_data(&rows[c * per_leaf..(c + 1) * per_leaf], c, &blob_id))).collect();
         let n_total: usize = leaves.iter().map(|l| l.n_seg).sum();
         verify_ed25519_blob(&blob, &digests, n_total, &blob_id).expect("blob verifies");
         // a wrong blob_id must not verify
         assert!(verify_ed25519_blob(&blob, &digests, n_total, &[F::ZERO; 4]).is_err());
+    }
+
+    /// leaves → blobs → epoch: the three-level aggregation of the spec (`epoch_pub` over blob digests),
+    /// verified reader-side from recomputed leaf digests + the blobs' (n_total, blob_id). ~3 min.
+    #[test]
+    fn test_ed25519_blobs_then_epoch() {
+        init_aggregation_bytecode();
+        let path = format!("{}/.cache/fb-stacks/datasets/sigs-25k-diverse.json", std::env::var("HOME").unwrap());
+        let rows = rows_from_json(&path);
+        let per_leaf: usize = std::env::var("BLOB_LEAF_N").ok().and_then(|v| v.parse().ok()).unwrap_or(16);
+        let kb: usize = std::env::var("BLOB_K").ok().and_then(|v| v.parse().ok()).unwrap_or(2);
+        let ke: usize = std::env::var("EPOCH_K").ok().and_then(|v| v.parse().ok()).unwrap_or(2);
+        let mut blobs = vec![];
+        let mut statements = vec![];
+        for b in 0..ke {
+            let blob_id = [F::from_usize(100 + b), F::from_usize(8), F::from_usize(7), F::from_usize(6)];
+            let mut leaves = vec![];
+            let mut digests = vec![];
+            for c in 0..kb {
+                let chunk = &rows[(b * kb + c) * per_leaf..(b * kb + c + 1) * per_leaf];
+                let t = std::time::Instant::now();
+                let leaf = prove_ed25519_leaf(chunk, c, &blob_id, 1).expect("leaf proof");
+                println!("blob {b} leaf {c}: {} sigs, proof {:.1} s", leaf.n_seg, t.elapsed().as_secs_f32());
+                digests.push(poseidon_hash_slice(&expected_leaf_input_data(chunk, c, &blob_id)));
+                leaves.push(leaf);
+            }
+            let n_total: usize = leaves.iter().map(|l| l.n_seg).sum();
+            let t = std::time::Instant::now();
+            let blob = prove_ed25519_blob(&leaves, &blob_id, 1).expect("blob proof");
+            println!("blob {b} of {kb} leaves: proof {:.1} s", t.elapsed().as_secs_f32());
+            blobs.push(blob);
+            statements.push((digests, n_total, blob_id));
+        }
+        let t = std::time::Instant::now();
+        let epoch = prove_ed25519_epoch(&blobs, 1).expect("epoch proof");
+        println!("epoch of {ke} blobs: proof {:.1} s, {} cycles", t.elapsed().as_secs_f32(), epoch.proof.metadata.as_ref().map(|m| m.cycles).unwrap_or(0));
+        verify_ed25519_epoch(&epoch, &statements).expect("epoch verifies from reader-recomputed blob statements");
+        // swapping two blobs' statements (positions) must not verify
+        let mut swapped = statements.clone();
+        swapped.swap(0, 1);
+        assert!(verify_ed25519_epoch(&epoch, &swapped).is_err(), "blob position must be bound");
+        // a wrong blob_id in one statement must not verify
+        let mut wrong = statements.clone();
+        wrong[0].2 = [F::ZERO; 4];
+        assert!(verify_ed25519_epoch(&epoch, &wrong).is_err(), "blob_id must be bound");
     }
 }

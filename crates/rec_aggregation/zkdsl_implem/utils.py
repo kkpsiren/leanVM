@@ -45,8 +45,15 @@ def powers_runtime(alpha, n):
     buf = Array(n * DIM)
     set_to_one(buf)
     copy_ef(alpha, buf + DIM)
-    for i in range(1, n - 1):
-        mul_extension(buf + i * DIM, alpha, buf + (i + 1) * DIM)
+    # buf[k] = buf[k-1]·alpha for k in [2, n): 8 writes per loop iteration to amortize the loop overhead
+    n_blocks, tail = euclidean_div_runtime(n - 2, 8)
+    for b in range(0, n_blocks):
+        base = buf + (2 + b * 8) * DIM
+        for j in unroll(0, 8):
+            mul_extension(base + (j - 1) * DIM, alpha, base + j * DIM)
+    tail_base = buf + (2 + n_blocks * 8) * DIM
+    for j in range(0, tail):
+        mul_extension(tail_base + (j - 1) * DIM, alpha, tail_base + j * DIM)
     return buf
 
 
@@ -382,8 +389,7 @@ def sub_extension_base_ret(a, b):
 @inline
 def sub_extension_ret(a, b):
     c = Array(DIM)
-    for i in unroll(0, DIM):
-        c[i] = a[i] - b[i]
+    sub_extension(a, b, c)  # one precompile op instead of five scalar subtractions
     return c
 
 
@@ -656,6 +662,18 @@ def dot_product_ee_ret(a, b, n):
     res = Array(DIM)
     dot_product_ee(a, b, res, n)
     return res
+
+
+def sum_ef_long(slice_ef, n: Const):
+    # Σ of n contiguous EF values, any n: blocks of NUM_REPEATED_ONES via dot_product_be, then the tail.
+    tail = n % NUM_REPEATED_ONES
+    n_blocks = (n - tail) / NUM_REPEATED_ONES
+    acc: Mut = ZERO_VEC_PTR
+    for b in unroll(0, n_blocks):
+        acc = add_extension_ret(acc, sum_continuous_ef(slice_ef + b * NUM_REPEATED_ONES * DIM, NUM_REPEATED_ONES))
+    if tail != 0:
+        acc = add_extension_ret(acc, sum_continuous_ef(slice_ef + n_blocks * NUM_REPEATED_ONES * DIM, tail))
+    return acc
 
 
 @inline
