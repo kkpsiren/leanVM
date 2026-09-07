@@ -146,11 +146,9 @@ mod tests {
 
     /// Two real leaves (16 signatures each) proven in leaf mode, then a blob proof verifying both in-circuit,
     /// verified natively against reader-recomputed leaf digests.
-    // The leaf half proves+verifies+binds; the blob half runs the recursion verifier in-circuit, which
-    // is currently blocked for 9 wide tables (recursion `powers()` caps at 400 WHIR statements, and the
-    // proof exceeds ~8 GB). Ignored until the recursion/WHIR verifier is scaled. Run with --ignored.
+    // In-circuit blob aggregation: K leaf proofs verified inside one blob proof, then checked natively
+    // against reader-recomputed leaf digests. ~2 min (two leaf proofs + the recursion proof).
     #[test]
-    #[ignore = "blob mode blocked on recursion powers() cap + RAM for 9 wide tables; leaf half is exercised by lean_prover::ed25519_leaf tests"]
     fn test_ed25519_leaves_then_blob() {
         init_aggregation_bytecode();
         let path = format!("{}/.cache/fb-stacks/datasets/sigs-25k-diverse.json", std::env::var("HOME").unwrap());

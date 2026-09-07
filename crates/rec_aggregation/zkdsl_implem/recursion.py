@@ -437,7 +437,7 @@ def recursion(inner_public_memory, initial_fiat_shamir_cap):
     fs = fs_duplex(fs)
     combination_randomness_gen: Mut
     fs, combination_randomness_gen = fs_sample_ef(fs)
-    combination_randomness_powers: Mut = powers(
+    combination_randomness_powers: Mut = powers_runtime(
         combination_randomness_gen, num_ood_at_commitment + TOTAL_WHIR_STATEMENTS
     )
     whir_sum: Mut = Array(DIM)

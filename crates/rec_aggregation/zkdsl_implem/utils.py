@@ -36,6 +36,20 @@ def div_ceil_dynamic(a, b: Const):
 
 
 @inline
+def powers_runtime(alpha, n):
+    # alpha: EF; n: runtime count. Returns n contiguous EF powers alpha^0..alpha^{n-1} in a fresh
+    # buffer, built by a runtime loop (write-once: each iteration writes a distinct cell). Use this
+    # where n can exceed the ~400 unroll budget of `powers` (e.g. the WHIR combination randomness,
+    # which scales with the number of committed statements across all tables).
+    debug_assert(1 < n)
+    buf = Array(n * DIM)
+    set_to_one(buf)
+    copy_ef(alpha, buf + DIM)
+    for i in range(1, n - 1):
+        mul_extension(buf + i * DIM, alpha, buf + (i + 1) * DIM)
+    return buf
+
+
 def powers(alpha, n):
     # alpha: EF
     # n: F
