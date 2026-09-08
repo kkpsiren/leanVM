@@ -22,6 +22,7 @@ backend.workspace = true
 parallel.workspace = true
 postcard.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2.workspace = true

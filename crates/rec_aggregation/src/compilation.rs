@@ -85,7 +85,9 @@ fn compile_main_program(program_log_size: usize, bytecode_zero_eval: F) -> Bytec
 
 #[instrument(skip_all)]
 fn compile_main_program_self_referential() -> Bytecode {
-    let mut log_size_guess = 18;
+    // The fixed point is 2^20 today; starting there saves one full compile (≈ 29 s) per process.
+    // FB_BYTECODE_LOG_SIZE overrides the first guess (the loop still converges to the true size).
+    let mut log_size_guess = std::env::var("FB_BYTECODE_LOG_SIZE").ok().and_then(|v| v.parse().ok()).unwrap_or(20);
     let bytecode_zero_eval = F::ZERO;
     for _ in 0..10 {
         let bytecode = compile_main_program(log_size_guess, bytecode_zero_eval);
