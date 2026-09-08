@@ -59,8 +59,7 @@ pub fn stacked_pcs_global_statements(
     }
 
     let mut global_statements = previous_statements;
-    for table in ALL_TABLES {
-        let n_vars = tables_heights[&table];
+    for (&table, &n_vars) in tables_heights {
         let offset = table_offsets[&table];
         if table.is_execution_table() {
             // Important: ensure both initial and final PC conditions are correct
@@ -217,8 +216,11 @@ pub fn range_acc_stacked_offset(memory_n_vars: usize, bytecode_n_vars: usize, ma
 }
 
 pub fn total_whir_statements() -> usize {
+    total_whir_statements_for(&ALL_TABLES)
+}
+pub fn total_whir_statements_for(tables: &[Table]) -> usize {
     6 + N_RANGE_SECTIONS // memory + memory_acc + public_memory + bytecode_acc + pc_start + pc_end + range accs
-     + ALL_TABLES
+     + tables
         .iter()
         .map(|table| {
             let mut seen_cols = std::collections::HashSet::<ColIndex>::new();

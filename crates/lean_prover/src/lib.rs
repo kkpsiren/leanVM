@@ -31,6 +31,18 @@ pub fn fiat_shamir_domain_sep(bytecode: &Bytecode) -> [F; 8] {
     poseidon16_compress_pair(bytecode.hash(), &SNARK_DOMAIN_SEP)
 }
 
+/// The domain separator of a proof under `profile`: the full profile keeps the historical value;
+/// any other profile mixes its id in, so a transcript of one profile cannot be re-parsed as another
+/// (the dims header length is the only structural difference between them).
+pub fn fiat_shamir_domain_sep_for(bytecode: &Bytecode, profile: &Profile) -> [F; 8] {
+    let base = fiat_shamir_domain_sep(bytecode);
+    if profile.id == 0 { return base; }
+    let mut tag = [F::ZERO; 8];
+    tag[0] = F::from_u32(profile.id);
+    tag[1] = F::from_usize(profile.tables.len());
+    poseidon16_compress_pair(&base, &tag)
+}
+
 pub fn default_whir_config(starting_log_inv_rate: usize) -> WhirConfigBuilder {
     assert!(0 < starting_log_inv_rate);
     assert!(starting_log_inv_rate <= MAX_WHIR_LOG_INV_RATE);
@@ -62,6 +74,9 @@ pub enum ProverError {
     TooBigTable(TooBigTableError),
     Runner(RunnerError),
     InvalidRate,
+    /// The execution used a table the profile does not commit to (e.g. an ed25519 precompile in a
+    /// terminal-profile proof). Fail loud: dropping the rows would leave an unbalanced LogUp sum.
+    TableNotInProfile(Table),
 }
 
 impl From<TooBigTableError> for ProverError {
@@ -85,6 +100,7 @@ impl Display for ProverError {
                 f,
                 "LeanVM supports rate 1/2, 1/4, 1/8 and 1/16 (log_inv_rate in {{1, 2, 3, 4}})"
             ),
+            Self::TableNotInProfile(t) => write!(f, "the execution used table {} which the proof profile does not commit to", t.name()),
         }
     }
 }

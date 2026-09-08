@@ -14,8 +14,8 @@ pub use compilation::{
 };
 pub use error::AggregationError;
 pub use lean_prover::ProverError;
-use lean_prover::verify_execution::verify_execution;
-use lean_vm::{DIGEST_LEN, EF, F};
+use lean_prover::verify_execution::verify_execution_with_profile;
+use lean_vm::{DIGEST_LEN, EF, F, PROFILE_FULL, Profile};
 pub use multi_message_aggregation::{
     MultiMessageAggregateSignature, merge_single_message_aggregates, split_multi_message_aggregate,
     split_multi_message_aggregate_by_message, verify_multi_message_aggregate,
@@ -35,9 +35,15 @@ pub struct InnerVerified {
 }
 
 pub(crate) fn verify_inner(input_data: Vec<F>, proof: Proof<F>) -> Result<InnerVerified, ProofError> {
+    verify_inner_with(&PROFILE_FULL, input_data, proof)
+}
+
+/// `profile` comes from the CONTEXT of the call (published top = terminal, children = full), never
+/// from the proof.
+pub(crate) fn verify_inner_with(profile: &Profile, input_data: Vec<F>, proof: Proof<F>) -> Result<InnerVerified, ProofError> {
     let input_data_hash = poseidon_hash_slice(&input_data);
     let bytecode = get_aggregation_bytecode();
-    let (verif, raw_proof) = verify_execution(bytecode, &input_data_hash, proof)?;
+    let (verif, raw_proof) = verify_execution_with_profile(profile, bytecode, &input_data_hash, proof)?;
     Ok(InnerVerified {
         input_data,
         input_data_hash,

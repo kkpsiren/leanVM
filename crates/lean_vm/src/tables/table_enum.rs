@@ -6,6 +6,26 @@ use crate::tables::ed25519::{EdAddTable, EdDecompressTable, EdSigTable, ScalarLT
 
 pub const N_TABLES: usize = 9;
 pub const ALL_TABLES: [Table; N_TABLES] = [Table::execution(), Table::extension_op(), Table::poseidon16(), Table::ed_sig(), Table::ed_decompress(), Table::sha512(), Table::scalar_l(), Table::signer_scalar(), Table::ed_add()];
+
+/// The set of tables a proof commits to and opens. `PROFILE_FULL` is every table (leaves, inner
+/// nodes, everything the recursion program verifies in-circuit). `PROFILE_TERMINAL` is the three
+/// base tables only: for the PUBLISHED top node of an epoch, which runs the VM and never an ed25519
+/// precompile, so its proof need not carry the column openings of six empty tables (≈ 253 KiB of a
+/// 588 KiB proof). A profile is always a PREFIX of `ALL_TABLES` (indices, alpha offsets and the
+/// sorted-table permutation stay aligned), its `id` is mixed into the Fiat-Shamir domain separator
+/// (a transcript of one profile cannot be re-parsed under another), and the terminal profile is
+/// bound to the published-top verification entry point only — a proof never chooses its profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Profile {
+    pub id: u32,
+    pub tables: &'static [Table],
+}
+pub const PROFILE_FULL: Profile = Profile { id: 0, tables: &ALL_TABLES };
+pub const PROFILE_TERMINAL: Profile = Profile { id: 1, tables: &[Table::execution(), Table::extension_op(), Table::poseidon16()] };
+impl Profile {
+    pub fn contains(&self, table: &Table) -> bool { self.tables.contains(table) }
+    pub fn is_full(&self) -> bool { self.tables.len() == N_TABLES }
+}
 pub const MAX_BUS_WIDTH: usize = 16; // ≥ bytecode (N_INSTRUCTION_COLUMNS + 2) and the 15-entry chunk tuples of EdAdd
 pub const LOG_MAX_BUS_WIDTH: usize = log2_ceil_usize(MAX_BUS_WIDTH);
 
@@ -142,7 +162,10 @@ impl Air for Table {
 }
 
 pub fn total_air_constraints() -> usize {
-    ALL_TABLES.iter().map(|table| table.n_constraints()).sum()
+    total_air_constraints_for(&ALL_TABLES)
+}
+pub fn total_air_constraints_for(tables: &[Table]) -> usize {
+    tables.iter().map(|table| table.n_constraints()).sum()
 }
 
 #[cfg(test)]

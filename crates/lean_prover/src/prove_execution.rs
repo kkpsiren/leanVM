@@ -47,9 +47,23 @@ pub fn prove_execution(
     whir_config: &WhirConfigBuilder,
     vm_profiler: bool,
 ) -> Result<ExecutionProof, ProverError> {
+    prove_execution_with_profile(&PROFILE_FULL, bytecode, public_input, witness, whir_config, vm_profiler)
+}
+
+/// Prove under a table `profile` (see `Profile`). Tables outside the profile must be empty in the
+/// execution (else `ProverError::TableNotInProfile`); they are not committed, not opened, and absent
+/// from the dims header. The verifier must be invoked with the same profile.
+pub fn prove_execution_with_profile(
+    profile: &Profile,
+    bytecode: &Bytecode,
+    public_input: &[F; PUBLIC_INPUT_LEN],
+    witness: &ExecutionWitness,
+    whir_config: &WhirConfigBuilder,
+    vm_profiler: bool,
+) -> Result<ExecutionProof, ProverError> {
     check_rate(whir_config.starting_log_inv_rate).map_err(|_| ProverError::InvalidRate)?;
     let ExecutionTrace {
-        traces,
+        mut traces,
         mut memory, // padded with zeros to next power of two
         metadata,
     } = info_span!("Witness generation").in_scope(|| -> Result<_, ProverError> {
@@ -59,13 +73,21 @@ pub fn prove_execution(
             .in_scope(|| get_execution_trace(bytecode, execution_result, &witness.min_table_log_n_rows)))
     })?;
 
+    // Tables outside the profile: must be empty (fail loud), then dropped from the commitment.
+    for table in ALL_TABLES {
+        if profile.contains(&table) { continue; }
+        let trace = traces.remove(&table).expect("every table is traced");
+        if trace.non_padded_n_rows != 0 { return Err(ProverError::TableNotInProfile(table)); }
+    }
+    debug_assert_eq!(traces.len(), profile.tables.len());
+
     // Memory must be at least MIN_LOG_MEMORY_SIZE and at least bytecode size
     // (required by the stacked polynomial ordering)
     let min_memory_size = (1 << MIN_LOG_MEMORY_SIZE).max(1 << bytecode.log_size());
     if memory.len() < min_memory_size {
         memory.resize(min_memory_size, F::ZERO);
     }
-    let mut prover_state = ProverState::new(get_poseidon16().clone(), fiat_shamir_domain_sep(bytecode));
+    let mut prover_state = ProverState::new(get_poseidon16().clone(), fiat_shamir_domain_sep_for(bytecode, profile));
     prover_state.observe_scalars(public_input);
     prover_state.add_base_scalars(
         &[
@@ -179,7 +201,7 @@ pub fn prove_execution(
     );
     let gkr_point = &logup_statements.gkr_point;
     let mut committed_statements: CommittedStatements = Default::default();
-    for table in ALL_TABLES {
+    for &table in profile.tables {
         let log_n_rows = traces[&table].log_n_rows;
         committed_statements.insert(
             table,
@@ -192,12 +214,12 @@ pub fn prove_execution(
     }
 
     let air_alpha = prover_state.sample();
-    let air_alpha_powers: Vec<EF> = air_alpha.powers().collect_n(total_air_constraints());
+    let air_alpha_powers: Vec<EF> = air_alpha.powers().collect_n(total_air_constraints_for(profile.tables));
 
     let tables_log_heights: BTreeMap<Table, VarCount> =
         traces.iter().map(|(table, trace)| (*table, trace.log_n_rows)).collect();
 
-    let column_refs: Vec<Vec<&[F]>> = ALL_TABLES
+    let column_refs: Vec<Vec<&[F]>> = profile.tables
         .iter()
         .map(|table| {
             traces[table].columns[..table.n_columns()]
@@ -207,15 +229,15 @@ pub fn prove_execution(
         })
         .collect();
     let _span = info_span!("Computing shifted columns for AIR sumcheck").entered();
-    let shifted_rows: Vec<Vec<ArenaVec<F>>> = ALL_TABLES
+    let shifted_rows: Vec<Vec<ArenaVec<F>>> = profile.tables
         .iter()
         .zip(&column_refs)
         .map(|(table, cols)| compute_shifted_columns(table.n_shift_columns(), cols))
         .collect();
     std::mem::drop(_span);
-    let mut sessions = Vec::with_capacity(ALL_TABLES.len());
+    let mut sessions = Vec::with_capacity(profile.tables.len());
     let mut alpha_offset = 0;
-    for (idx, table) in ALL_TABLES.iter().enumerate() {
+    for (idx, table) in profile.tables.iter().enumerate() {
         let log_n_rows = tables_log_heights[table];
         let n_constraints = table.n_constraints();
         // Each table consumes a disjoint range of alpha powers; for its j-th Column-multiplicity bus,
@@ -253,7 +275,7 @@ pub fn prove_execution(
     let sumcheck_air_point =
         info_span!("batched AIR sumcheck").in_scope(|| prove_batched_air_sumcheck(&mut prover_state, &mut sessions));
 
-    for (idx, table) in ALL_TABLES.iter().enumerate() {
+    for (idx, table) in profile.tables.iter().enumerate() {
         let col_evals = sessions[idx].final_column_evals();
         prover_state.add_extension_scalars(&col_evals);
 

@@ -14,10 +14,10 @@
 use crate::bytecode_claims::{flatten_bytecode_claim, reduce_bytecode_claims};
 use crate::compilation::{BYTECODE_CLAIM_OFFSET, ED25519_LEAF_FLAG, ED25519_NODE_FLAG, MAX_RECURSIONS, PREAMBLE_MEMORY_LEN, get_aggregation_bytecode};
 use crate::single_message_aggregation::{extract_merkle_hint_blobs, rebuild_bytecode_claim};
-use crate::{InnerVerified, verify_inner};
+use crate::{InnerVerified, verify_inner, verify_inner_with};
 use backend::*;
 use lean_prover::ed25519_leaf::{MAX_LEAF_SIGS, SigRow, canonical_rows, leaf_hint_buffers, leaf_meta, root_seg};
-use lean_prover::prove_execution::{ExecutionProof, prove_execution};
+use lean_prover::prove_execution::{ExecutionProof, prove_execution, prove_execution_with_profile};
 use lean_prover::*;
 use lean_vm::*;
 
@@ -192,16 +192,22 @@ pub fn expected_digest(stmt: &Statement<'_>, shape: &NodeShape) -> Result<[F; DI
     }
 }
 
-/// Reader-side verification of a node proof against the reader's own statement tree: rebuilds every
-/// child digest (leaves from data, inner nodes from their children + carried claim point with the
-/// value recomputed), the node's input data and its reduced claim, then verifies the proof.
+/// Reader-side verification of the PUBLISHED top node against the reader's own statement tree:
+/// rebuilds every child digest (leaves from data, inner nodes from their children + carried claim
+/// point with the value recomputed), the node's input data and its reduced claim, then verifies the
+/// proof under the TERMINAL profile (three base tables; a top node never runs an ed25519
+/// precompile). A proof made under the full profile does not verify here, by domain separation.
 pub fn verify_ed25519_node(node: &Ed25519NodeProof, children: &[Statement<'_>]) -> Result<InnerVerified, ProofError> {
+    verify_ed25519_node_with(&PROFILE_TERMINAL, node, children)
+}
+
+pub(crate) fn verify_ed25519_node_with(profile: &Profile, node: &Ed25519NodeProof, children: &[Statement<'_>]) -> Result<InnerVerified, ProofError> {
     if children.len() != node.shape.len() || children.is_empty() || children.len() > MAX_RECURSIONS { return Err(ProofError::InvalidProof); }
     let digests: Vec<[F; DIGEST_LEN]> = children.iter().zip(&node.shape).map(|(c, s)| expected_digest(c, s)).collect::<Result<_, _>>()?;
     let claim = rebuild_bytecode_claim(node.bytecode_claim.point.clone()).map_err(|_| ProofError::InvalidProof)?;
     let input_data = ed25519_node_input_data(&digests, &flatten_bytecode_claim(&claim));
     if input_data != node.input_data { return Err(ProofError::InvalidProof); }
-    verify_inner(input_data, node.proof.proof.clone())
+    verify_inner_with(profile, input_data, node.proof.proof.clone())
 }
 
 /// Verify a node proof against the statement its own input data encodes (the node prover uses it for
@@ -214,7 +220,65 @@ pub(crate) fn verify_ed25519_node_self(node: &Ed25519NodeProof) -> Result<InnerV
     verify_inner(node.input_data.clone(), node.proof.proof.clone())
 }
 
+/// Production defaults (measured 2026-09-07, M3 Max): a 2,048-signature leaf proves in ≈ 28 s at
+/// ≈ 13 GB peak RSS (13.8 ms/signature; 256-signature leaves cost 25.8 ms/signature); the top node at
+/// WHIR rate 1/8 is 443 KiB (588 KiB at rate 1/2) for 1.8× its proving time, and nobody verifies it
+/// in-circuit, so only the published proof pays. Inner nodes stay at the leaf rate.
+pub const DEFAULT_LEAF_SIGS: usize = 2048;
+pub const DEFAULT_LEAF_LOG_INV_RATE: usize = 1;
+pub const DEFAULT_TOP_LOG_INV_RATE: usize = 3;
+pub const NODE_FAN_IN: usize = 4;
+
+/// PROVER API for one blob (the relayer's entry point): `rows` = every signed message of the blob in
+/// blob order, `blob_id` = `blob_id_cells(versioned_hash)`. Leaves of `leaf_size` rows (the last one
+/// shorter) are proved in order, then reduced by nodes of `NODE_FAN_IN` children until one node
+/// remains, which is proved at `top_log_inv_rate`. The returned node's shape is exactly what
+/// `verify_ed25519_blob(node, rows, leaf_size, blob_id)` rebuilds on the reader side (pre-order
+/// leaf assignment), so the reader needs nothing from the prover but the proof and `leaf_size`.
+/// A single leaf still gets a top node, so the published artifact is always a node proof.
+pub fn prove_ed25519_blob(rows: &[SigRow], blob_id: &[F; 9], leaf_size: usize, leaf_log_inv_rate: usize, top_log_inv_rate: usize, log: &dyn Fn(String)) -> Result<Ed25519NodeProof, String> {
+    if rows.is_empty() { return Err("prove_ed25519_blob: no rows".into()); }
+    if leaf_size == 0 || leaf_size > MAX_LEAF_SIGS { return Err(format!("prove_ed25519_blob: leaf_size must be 1..={MAX_LEAF_SIGS}")); }
+    let leaves: Vec<Ed25519LeafProof> = rows.chunks(leaf_size).enumerate().map(|(k, chunk)| {
+        let t = std::time::Instant::now();
+        let leaf = prove_ed25519_leaf(chunk, k, blob_id, leaf_log_inv_rate)?;
+        log(format!("leaf {k}: {} sigs, {} signers, {:.1} s, {} KiB", leaf.n_seg, leaf.n_groups, t.elapsed().as_secs_f32(), leaf.proof.proof.proof_size_fe() * 4 / 1024));
+        Ok(leaf)
+    }).collect::<Result<_, String>>()?;
+    // level 0 = the leaves; each further level groups NODE_FAN_IN consecutive children into a node
+    let mut level: Vec<Ed25519NodeProof> = Vec::new();
+    let mut first = true;
+    loop {
+        let n_children = if first { leaves.len() } else { level.len() };
+        let top = n_children <= NODE_FAN_IN;
+        let rate = if top { top_log_inv_rate } else { leaf_log_inv_rate };
+        let mut next: Vec<Ed25519NodeProof> = Vec::new();
+        for g in 0..n_children.div_ceil(NODE_FAN_IN) {
+            let lo = g * NODE_FAN_IN;
+            let hi = (lo + NODE_FAN_IN).min(n_children);
+            let children: Vec<Ed25519Child<'_>> = if first { leaves[lo..hi].iter().map(Ed25519Child::Leaf).collect() } else { level[lo..hi].iter().map(Ed25519Child::Node).collect() };
+            let t = std::time::Instant::now();
+            let node = if top { prove_ed25519_top(&children, rate)? } else { prove_ed25519_node(&children, rate)? };
+            log(format!("node over {} {}: rate 1/{}, {:.1} s, {} cycles, {} KiB{}", hi - lo, if first { "leaves" } else { "nodes" }, 1 << rate, t.elapsed().as_secs_f32(), node.proof.metadata.as_ref().map(|m| m.cycles).unwrap_or(0), node.proof.proof.proof_size_fe() * 4 / 1024, if top { " (top, terminal profile)" } else { "" }));
+            next.push(node);
+        }
+        first = false;
+        if next.len() == 1 { return Ok(next.pop().unwrap()); }
+        level = next;
+    }
+}
+
+/// An INNER node (full profile: it is verified in-circuit by its parent).
 pub fn prove_ed25519_node(children: &[Ed25519Child<'_>], log_inv_rate: usize) -> Result<Ed25519NodeProof, String> {
+    prove_ed25519_node_with(&PROFILE_FULL, children, log_inv_rate)
+}
+
+/// The PUBLISHED top node (terminal profile: verified natively by readers, never in-circuit).
+pub fn prove_ed25519_top(children: &[Ed25519Child<'_>], log_inv_rate: usize) -> Result<Ed25519NodeProof, String> {
+    prove_ed25519_node_with(&PROFILE_TERMINAL, children, log_inv_rate)
+}
+
+pub fn prove_ed25519_node_with(profile: &Profile, children: &[Ed25519Child<'_>], log_inv_rate: usize) -> Result<Ed25519NodeProof, String> {
     if children.is_empty() || children.len() > MAX_RECURSIONS { return Err(format!("node: 1..={MAX_RECURSIONS} children")); }
     let mut verified = Vec::with_capacity(children.len());
     let mut shape = Vec::with_capacity(children.len());
@@ -224,13 +288,16 @@ pub fn prove_ed25519_node(children: &[Ed25519Child<'_>], log_inv_rate: usize) ->
             Ed25519Child::Node(n) => { verified.push(verify_ed25519_node_self(n).map_err(|e| format!("child {i} (node): {e:?}"))?); shape.push(NodeShape::Node { claim: n.bytecode_claim.clone(), children: n.shape.clone() }); }
         }
     }
-    prove_node_from_verified(verified, shape, log_inv_rate)
+    prove_node_from_verified(profile, verified, shape, log_inv_rate)
 }
 
 /// The node prover proper, from natively verified children. Separate so a test can feed it a
-/// tampered child and check the IN-CIRCUIT verifier rejects it.
-pub(crate) fn prove_node_from_verified(verified: Vec<InnerVerified>, shape: Vec<NodeShape>, log_inv_rate: usize) -> Result<Ed25519NodeProof, String> {
+/// tampered child and check the IN-CIRCUIT verifier rejects it. Children are always verified under
+/// the FULL profile (their transcripts are re-verified in-circuit by the full-set recursion program);
+/// `profile` is the profile of THIS node's proof.
+pub(crate) fn prove_node_from_verified(profile: &Profile, verified: Vec<InnerVerified>, shape: Vec<NodeShape>, log_inv_rate: usize) -> Result<Ed25519NodeProof, String> {
     if verified.len() != shape.len() || verified.is_empty() || verified.len() > MAX_RECURSIONS { return Err("node: children and shape must match, 1..=MAX_RECURSIONS".into()); }
+    for v in &verified { assert_eq!(v.sorted_table_perm.len(), N_TABLES, "a child must be a full-profile proof"); }
     let bytecode = get_aggregation_bytecode();
     let reduced = reduce_bytecode_claims(&verified);
     let digests: Vec<[F; DIGEST_LEN]> = verified.iter().map(|v| v.input_data_hash).collect();
@@ -255,7 +322,7 @@ pub(crate) fn prove_node_from_verified(verified: Vec<InnerVerified>, shape: Vec<
     hints.insert(bytecode, "merkle_path", merkle_path_blobs);
     hints.insert(bytecode, "bytecode_sumcheck_proof", arena_vec![ArenaVec::from_slice(&reduced.sumcheck_transcript)]);
     let witness = ExecutionWitness { preamble_memory_len: PREAMBLE_MEMORY_LEN, hints, min_table_log_n_rows: Default::default() };
-    let proof = prove_execution(bytecode, &public_input, &witness, &default_whir_config(log_inv_rate), vm_profiler()).map_err(|e| format!("{e:?}"))?;
+    let proof = prove_execution_with_profile(profile, bytecode, &public_input, &witness, &default_whir_config(log_inv_rate), vm_profiler()).map_err(|e| format!("{e:?}"))?;
     Ok(Ed25519NodeProof { input_data, bytecode_claim: reduced.final_claim, shape, proof })
 }
 
@@ -267,13 +334,16 @@ mod tests {
 
     fn dataset() -> Vec<SigRow> { rows_from_json(&format!("{}/.cache/fb-stacks/datasets/sigs-25k-diverse.json", std::env::var("HOME").unwrap())) }
     fn env(name: &str, default: usize) -> usize { std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default) }
+    fn per_for_neg(rows: &[SigRow], per_leaf: usize, k: usize) -> Vec<&[SigRow]> { (0..k).map(|c| &rows[c * per_leaf..(c + 1) * per_leaf]).collect() }
     fn prove_leaves(rows: &[SigRow], per_leaf: usize, k: usize, first: usize, blob_id: &[F; 9]) -> Vec<Ed25519LeafProof> {
         (0..k).map(|c| {
             let chunk = &rows[(first + c) * per_leaf..(first + c + 1) * per_leaf];
             let t = std::time::Instant::now();
             let leaf = prove_ed25519_leaf(chunk, c, blob_id, env("LEAF_RATE", 1)).expect("leaf proof");
             println!("leaf {c}: {} sigs, {} signers, proof {:.1} s, {} cycles, {} KiB", leaf.n_seg, leaf.n_groups, t.elapsed().as_secs_f32(), leaf.proof.metadata.as_ref().map(|m| m.cycles).unwrap_or(0), leaf.proof.proof.proof_size_fe() * 4 / 1024);
+            let tv = std::time::Instant::now();
             verify_ed25519_leaf_for(&leaf, chunk, c, blob_id).expect("leaf verifies and binds to its statement");
+            println!("verify leaf {c} (native, reader-side): {:.3} s", tv.elapsed().as_secs_f32());
             leaf
         }).collect()
     }
@@ -290,11 +360,17 @@ mod tests {
         let leaves = prove_leaves(&rows, per_leaf, k, 0, &blob_id);
         let t = std::time::Instant::now();
         let children: Vec<Ed25519Child<'_>> = leaves.iter().map(Ed25519Child::Leaf).collect();
-        let node = prove_ed25519_node(&children, env("NODE_RATE", 1)).expect("node proof");
+        let node = prove_ed25519_top(&children, env("NODE_RATE", 1)).expect("node proof");
+        // a full-profile proof of the same statement must NOT verify as a published top (domain separation)
+        let inner = prove_ed25519_node(&children, 1).expect("inner node proof");
+        assert!(verify_ed25519_node(&inner, &leaf_statements(&per_for_neg(&rows, per_leaf, k), &blob_id)).is_err(), "a full-profile proof must not pass the terminal verifier");
+        println!("full-profile node (inner): {} KiB; terminal top: {} KiB", inner.proof.proof.proof_size_fe() * 4 / 1024, node.proof.proof.proof_size_fe() * 4 / 1024);
         println!("node of {k} leaves (rate 1/{}): proof {:.1} s, {} cycles, {} KiB", 1 << env("NODE_RATE", 1), t.elapsed().as_secs_f32(), node.proof.metadata.as_ref().map(|m| m.cycles).unwrap_or(0), node.proof.proof.proof_size_fe() * 4 / 1024);
         if let Some(report) = node.proof.metadata.as_ref().and_then(|m| m.profiling_report.as_ref()) { println!("=== VM PROFILE (node) ===\n{report}\n=== END PROFILE ==="); }
         let per: Vec<&[SigRow]> = (0..k).map(|c| &rows[c * per_leaf..(c + 1) * per_leaf]).collect();
+        let tv = std::time::Instant::now();
         verify_ed25519_node(&node, &leaf_statements(&per, &blob_id)).expect("node verifies from reader-recomputed leaf digests");
+        println!("verify node (native, reader-side, incl. leaf digests + top bytecode claim): {:.3} s", tv.elapsed().as_secs_f32());
         verify_ed25519_blob(&node, &rows[..k * per_leaf], per_leaf, &blob_id).expect("the blob reader API verifies from the full row list");
         assert!(verify_ed25519_blob(&node, &rows[..k * per_leaf - 1], per_leaf, &blob_id).is_err(), "a missing row must be rejected");
         assert!(verify_ed25519_blob(&node, &rows[1..k * per_leaf + 1], per_leaf, &blob_id).is_err(), "shifted rows must be rejected");
@@ -329,7 +405,7 @@ mod tests {
         let t = std::time::Instant::now();
         let a = prove_ed25519_node(&[Ed25519Child::Leaf(&leaves[0]), Ed25519Child::Leaf(&leaves[1])], 1).expect("node A");
         let b = prove_ed25519_node(&[Ed25519Child::Leaf(&leaves[2]), Ed25519Child::Leaf(&leaves[3])], 1).expect("node B");
-        let top = prove_ed25519_node(&[Ed25519Child::Node(&a), Ed25519Child::Node(&b)], 1).expect("top node");
+        let top = prove_ed25519_top(&[Ed25519Child::Node(&a), Ed25519Child::Node(&b)], 1).expect("top node");
         println!("tree 4 leaves → 2 nodes → top: {:.1} s (top {} cycles, {} KiB)", t.elapsed().as_secs_f32(), top.proof.metadata.as_ref().map(|m| m.cycles).unwrap_or(0), top.proof.proof.proof_size_fe() * 4 / 1024);
         let per: Vec<&[SigRow]> = (0..4).map(|c| &rows[c * per_leaf..(c + 1) * per_leaf]).collect();
         let leaf = |k: usize| Statement::Leaf { rows: per[k], seg_index: k, blob_id };
@@ -354,7 +430,7 @@ mod tests {
         verify_ed25519_node(&top, &stmt).expect("restored again");
         // mixed node: (A, l2, l3)
         let t = std::time::Instant::now();
-        let mixed = prove_ed25519_node(&[Ed25519Child::Node(&a), Ed25519Child::Leaf(&leaves[2]), Ed25519Child::Leaf(&leaves[3])], 1).expect("mixed node");
+        let mixed = prove_ed25519_top(&[Ed25519Child::Node(&a), Ed25519Child::Leaf(&leaves[2]), Ed25519Child::Leaf(&leaves[3])], 1).expect("mixed node");
         println!("mixed node (A, l2, l3): {:.1} s", t.elapsed().as_secs_f32());
         verify_ed25519_node(&mixed, &[Statement::Node(vec![leaf(0), leaf(1)]), leaf(2), leaf(3)]).expect("mixed tree verifies");
     }
@@ -396,7 +472,7 @@ mod tests {
         let p16_out = poseidon16_permute(p16_in.clone().try_into().unwrap());
         // a real node over this leaf, for the claim point / recomputed value and the node layout
         let leaf = prove_ed25519_leaf(seg, 0, &blob_id, 1).expect("leaf proof");
-        let node = prove_ed25519_node(&[Ed25519Child::Leaf(&leaf)], 1).expect("node proof");
+        let node = prove_ed25519_top(&[Ed25519Child::Leaf(&leaf)], DEFAULT_TOP_LOG_INV_RATE).expect("node proof");
         let claim = rebuild_bytecode_claim(node.bytecode_claim.point.clone()).unwrap();
         let point_cells: Vec<F> = claim.point.0.iter().flat_map(|e| e.as_basis_coefficients_slice().to_vec()).collect();
         let json = format!(r#"{{
@@ -447,6 +523,27 @@ mod tests {
         println!("wrote {out}");
     }
 
+    /// One whole blob through the production driver: BLOB_N rows (default one blob's worth) at
+    /// DEFAULT_LEAF_SIGS, top at DEFAULT_TOP_LOG_INV_RATE; reader-verified through `verify_ed25519_blob`
+    /// with nothing but the proof and the leaf size; a shifted row list is rejected.
+    #[test]
+    fn test_ed25519_prove_blob() {
+        init_aggregation_bytecode();
+        let rows = dataset();
+        let n = env("BLOB_N", 6745).min(rows.len());
+        let leaf_size = env("LEAF_SIZE", DEFAULT_LEAF_SIGS);
+        let top_rate = env("TOP_RATE", DEFAULT_TOP_LOG_INV_RATE);
+        let blob_id: [F; 9] = std::array::from_fn(|i| F::from_usize(0x1234 + i));
+        let t = std::time::Instant::now();
+        let top = prove_ed25519_blob(&rows[..n], &blob_id, leaf_size, DEFAULT_LEAF_LOG_INV_RATE, top_rate, &|m| println!("  {m}")).expect("blob proof");
+        println!("BLOB {n} rows, leaves of {leaf_size}: proved in {:.1} s, published proof {} KiB", t.elapsed().as_secs_f32(), top.proof.proof.proof_size_fe() * 4 / 1024);
+        let tv = std::time::Instant::now();
+        verify_ed25519_blob(&top, &rows[..n], leaf_size, &blob_id).expect("reader verifies the blob from the proof + leaf size");
+        println!("BLOB verified reader-side in {:.3} s", tv.elapsed().as_secs_f32());
+        assert!(verify_ed25519_blob(&top, &rows[1..n + 1], leaf_size, &blob_id).is_err(), "shifted rows must be rejected");
+        assert!(verify_ed25519_blob(&top, &rows[..n], leaf_size + 1, &blob_id).is_err(), "a wrong leaf size must be rejected");
+    }
+
     /// IN-CIRCUIT negative: a child proof tampered after native verification must be rejected by the
     /// recursion program itself (not only by the native pre-check). Tampers a cell in the middle of the
     /// transcript, then a cell inside an 8-cell region shaped like a padded opening ([v v v v v 0 0 0];
@@ -463,15 +560,15 @@ mod tests {
         // (a) a value cell in the middle of the transcript
         let mut v = verify_ed25519_leaf(&leaf).unwrap();
         v.raw_proof.transcript[n / 2] += F::ONE;
-        assert!(prove_node_from_verified(vec![v], vec![NodeShape::Leaf], 1).is_err(), "a tampered transcript value must not prove");
+        assert!(prove_node_from_verified(&PROFILE_FULL, vec![v], vec![NodeShape::Leaf], 1).is_err(), "a tampered transcript value must not prove");
         // (b) a pad cell of an 8-cell chunk shaped [v v v v v 0 0 0] (a One-bus opening in a range run)
         let mut v = verify_ed25519_leaf(&leaf).unwrap();
         let tr = &v.raw_proof.transcript;
         let pad = (n / 4..n - 8).step_by(8).find(|&i| tr[i + 5] == F::ZERO && tr[i + 6] == F::ZERO && tr[i + 7] == F::ZERO && tr[i..i + 5].iter().all(|x| *x != F::ZERO)).expect("a padded EF chunk in the transcript");
         v.raw_proof.transcript[pad + 7] = F::ONE;
-        assert!(prove_node_from_verified(vec![v], vec![NodeShape::Leaf], 1).is_err(), "a nonzero pad cell must not prove");
+        assert!(prove_node_from_verified(&PROFILE_FULL, vec![v], vec![NodeShape::Leaf], 1).is_err(), "a nonzero pad cell must not prove");
         // control: the untampered child still proves
-        let node = prove_node_from_verified(vec![good], vec![NodeShape::Leaf], 1).expect("honest child proves");
+        let node = prove_node_from_verified(&PROFILE_TERMINAL, vec![good], vec![NodeShape::Leaf], 1).expect("honest child proves");
         verify_ed25519_node(&node, &leaf_statements(&[&rows[..16]], &blob_id)).expect("and verifies");
     }
 }

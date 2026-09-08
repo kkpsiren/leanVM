@@ -18,6 +18,18 @@ pub fn verify_execution(
     public_input: &[F; PUBLIC_INPUT_LEN],
     proof: Proof<F>,
 ) -> Result<(ProofVerificationDetails, RawProof<F>), ProofError> {
+    verify_execution_with_profile(&PROFILE_FULL, bytecode, public_input, proof)
+}
+
+/// Verify under a table `profile`: the dims header carries one height per profile table, and the
+/// Fiat-Shamir domain separator is the profile's. The caller chooses the profile from the CONTEXT
+/// (published top proof = terminal, in-circuit children = full), never from the proof.
+pub fn verify_execution_with_profile(
+    profile: &Profile,
+    bytecode: &Bytecode,
+    public_input: &[F; PUBLIC_INPUT_LEN],
+    proof: Proof<F>,
+) -> Result<(ProofVerificationDetails, RawProof<F>), ProofError> {
     if bytecode.log_size() > MAX_BYTECODE_LOG_SIZE {
         return Err(ProofError::TooBigBytecode {
             current_log_size: bytecode.log_size(),
@@ -25,16 +37,16 @@ pub fn verify_execution(
         });
     }
     let mut verifier_state =
-        VerifierState::<EF, _>::new(proof, get_poseidon16().clone(), fiat_shamir_domain_sep(bytecode))?;
+        VerifierState::<EF, _>::new(proof, get_poseidon16().clone(), fiat_shamir_domain_sep_for(bytecode, profile))?;
     verifier_state.observe_scalars(public_input);
     let dims = verifier_state
-        .next_base_scalars_vec(2 + N_TABLES)?
+        .next_base_scalars_vec(2 + profile.tables.len())?
         .into_iter()
         .map(|x| x.to_usize())
         .collect::<Vec<_>>();
     let log_inv_rate = dims[0];
     let log_memory = dims[1];
-    let table_n_vars: BTreeMap<Table, VarCount> = (0..N_TABLES).map(|i| (ALL_TABLES[i], dims[i + 2])).collect();
+    let table_n_vars: BTreeMap<Table, VarCount> = profile.tables.iter().enumerate().map(|(i, t)| (*t, dims[i + 2])).collect();
     check_rate(log_inv_rate)?;
     let whir_config = default_whir_config(log_inv_rate);
     for (table, &log_n_rows) in &table_n_vars {
@@ -88,7 +100,7 @@ pub fn verify_execution(
     )?;
     let gkr_point = &logup_statements.gkr_point;
     let mut committed_statements: CommittedStatements = Default::default();
-    for table in ALL_TABLES {
+    for &table in profile.tables {
         let log_n = table_n_vars[&table];
         committed_statements.insert(
             table,
@@ -101,7 +113,7 @@ pub fn verify_execution(
     }
 
     let air_alpha = verifier_state.sample();
-    let air_alpha_powers: Vec<EF> = air_alpha.powers().collect_n(total_air_constraints());
+    let air_alpha_powers: Vec<EF> = air_alpha.powers().collect_n(total_air_constraints_for(profile.tables));
 
     struct TableVerifyData {
         table: Table,
@@ -111,7 +123,7 @@ pub fn verify_execution(
     let mut initial_sum = EF::ZERO;
     let mut alpha_offset = 0;
 
-    for table in ALL_TABLES {
+    for &table in profile.tables {
         let n_constraints = table.n_constraints();
         initial_sum += column_buses_initial_value(
             &table,
@@ -130,7 +142,7 @@ pub fn verify_execution(
         alpha_offset += n_constraints;
     }
 
-    let max_full_degree = ALL_TABLES.iter().map(|t| t.degree_air() + 1).max().unwrap();
+    let max_full_degree = profile.tables.iter().map(|t| t.degree_air() + 1).max().unwrap();
 
     let n_max = *table_n_vars.values().max().unwrap();
     let Evaluation {
@@ -213,7 +225,7 @@ pub fn verify_execution(
 
     // sanity check (not necessary for soundness)
     let num_whir_statements = global_statements_base.iter().map(|s| s.values.len()).sum::<usize>();
-    assert_eq!(num_whir_statements, total_whir_statements());
+    assert_eq!(num_whir_statements, total_whir_statements_for(profile.tables));
 
     WhirConfig::new(&whir_config, parsed_commitment.num_variables).verify(
         &mut verifier_state,

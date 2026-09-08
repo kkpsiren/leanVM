@@ -300,8 +300,7 @@ pub fn prove_generic_logup(
     let mut bus_numerators_values = BTreeMap::new();
     let mut bus_denominators_values = BTreeMap::new();
     let mut columns_values = BTreeMap::new();
-    for table in ALL_TABLES {
-        let trace = &traces[&table];
+    for (&table, trace) in traces {
         let log_n_rows = trace.log_n_rows;
 
         let inner_point = MultilinearPoint(from_end(&claim_point_gkr, log_n_rows).to_vec());
@@ -485,8 +484,7 @@ pub fn verify_generic_logup(
     let mut bus_numerators_values = BTreeMap::new();
     let mut bus_denominators_values = BTreeMap::new();
     let mut columns_values = BTreeMap::new();
-    for table in ALL_TABLES {
-        let log_n_rows = table_log_n_rows[&table];
+    for (&table, &log_n_rows) in table_log_n_rows {
         let mut offset_within_table = layout_offsets[&table];
         let mut table_values = BTreeMap::<ColIndex, EF>::new();
         bus_numerators_values.insert(table, Vec::new());
