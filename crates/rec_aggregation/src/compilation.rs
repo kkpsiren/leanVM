@@ -41,6 +41,47 @@ pub fn init_aggregation_bytecode() {
     BYTECODE.get_or_init(compile_main_program_self_referential);
 }
 
+/// Like `init_aggregation_bytecode`, but through a disk cache keyed by this executable's bytes and
+/// the embedded zkDSL sources (any rebuild or source change misses). A cache hit rebuilds the
+/// bytecode with `Bytecode::new`, which recomputes the hash and the multilinear, so a corrupt or
+/// foreign cache file cannot change what is proved or verified — it can only fail to match.
+/// Returns whether the cache was hit.
+pub fn init_aggregation_bytecode_cached(cache_dir: &std::path::Path) -> bool {
+    if BYTECODE.get().is_some() { return true; }
+    let key = cache_key();
+    let path = cache_dir.join(format!("aggregation-bytecode-{key:016x}.bin"));
+    if let Ok(bytes) = std::fs::read(&path) {
+        if let Ok(parts) = postcard::from_bytes::<lean_vm::BytecodeCacheParts>(&bytes) {
+            let bc = Bytecode::from_cache_parts(parts);
+            let _ = BYTECODE.set(bc);
+            return true;
+        }
+    }
+    init_aggregation_bytecode();
+    if let Ok(bytes) = postcard::to_allocvec(&get_aggregation_bytecode().cache_parts()) {
+        let _ = std::fs::create_dir_all(cache_dir);
+        let tmp = path.with_extension("tmp");
+        if std::fs::write(&tmp, bytes).is_ok() { let _ = std::fs::rename(&tmp, &path); }
+    }
+    false
+}
+
+/// FNV-1a over the running executable and every embedded zkDSL source (a cache key, not a security
+/// boundary: the loaded bytecode is re-hashed by `Bytecode::new`).
+fn cache_key() -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    let mut feed = |bytes: &[u8]| { for &b in bytes { h ^= b as u64; h = h.wrapping_mul(0x100000001b3); } };
+    if let Ok(exe) = std::env::current_exe().and_then(std::fs::read) { feed(&exe); }
+    fn walk(dir: &include_dir::Dir<'_>, feed: &mut dyn FnMut(&[u8])) {
+        let mut files: Vec<_> = dir.files().collect();
+        files.sort_by_key(|f| f.path().to_path_buf());
+        for f in files { feed(f.path().to_string_lossy().as_bytes()); feed(f.contents()); }
+        for d in dir.dirs() { walk(d, feed); }
+    }
+    walk(&EMBEDDED_ZK_DSL, &mut feed);
+    h
+}
+
 static EMBEDDED_ZK_DSL: include_dir::Dir<'_> = include_dir::include_dir!("$CARGO_MANIFEST_DIR/zkdsl_implem");
 
 pub const MAX_RECURSIONS: usize = 16;

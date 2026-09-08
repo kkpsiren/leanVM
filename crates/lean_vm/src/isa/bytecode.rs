@@ -9,19 +9,28 @@ use super::encoder::field_representation;
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CodeEntry {
     pub hints: Box<[Hint]>, // executed before the instruction
     pub instruction: Instruction,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BytecodeDebugInfo {
     pub function_locations: BTreeMap<SourceLocation, FunctionName>,
     pub filepaths: BTreeMap<FileId, String>,
     pub source_code: BTreeMap<FileId, String>,
     /// Maps each pc to its source location
     pub pc_to_location: Vec<SourceLocation>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct BytecodeCacheParts {
+    pub code: Vec<CodeEntry>,
+    pub unpadded_size: usize,
+    pub starting_frame_memory: usize,
+    pub hint_name_to_index: BTreeMap<String, usize>,
+    pub debug_info: BytecodeDebugInfo,
 }
 
 /// `instructions_multilinear`, `hash`, and `ending_pc` must be checked at initialization to match `code`.
@@ -76,6 +85,15 @@ impl Bytecode {
 
     /// Number of instructions before padding to a power of two.
     #[inline]
+    /// The constructor inputs, for a disk cache (`Bytecode::new` recomputes the multilinear and the
+    /// hash on load, so a cache can only cost time, never change what is verified).
+    pub fn cache_parts(&self) -> BytecodeCacheParts {
+        BytecodeCacheParts { code: self.code.clone(), unpadded_size: self.unpadded_size, starting_frame_memory: self.starting_frame_memory, hint_name_to_index: self.hint_name_to_index.clone(), debug_info: self.debug_info.clone() }
+    }
+    pub fn from_cache_parts(p: BytecodeCacheParts) -> Self {
+        Self::new(p.code, p.unpadded_size, p.starting_frame_memory, p.hint_name_to_index, p.debug_info)
+    }
+
     pub fn unpadded_size(&self) -> usize {
         self.unpadded_size
     }

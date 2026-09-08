@@ -16,7 +16,7 @@
 use backend::*;
 use lean_prover::ed25519_leaf::{SigRow, blob_id_cells};
 use lean_vm::*;
-use rec_aggregation::init_aggregation_bytecode;
+use rec_aggregation::init_aggregation_bytecode_cached;
 use rec_aggregation::ed25519::*;
 use serde::{Deserialize, Serialize};
 use std::time::Instant;
@@ -35,7 +35,8 @@ struct Envelope {
     input_data: Vec<F>,
     top_claim_flat: Vec<F>,
     shape: Vec<ShapeNode>,
-    proof: lean_prover::prove_execution::ExecutionProof,
+    /// `Proof::to_bytes`: fixed 4-byte cells (postcard's varints would add ≈ 20 %)
+    proof_bytes: Vec<u8>,
 }
 
 fn ef_dim() -> usize { <EF as BasedVectorSpace<F>>::as_basis_coefficients_slice(&EF::ZERO).len() }
@@ -94,11 +95,11 @@ fn run() -> Result<(), String> {
             let top_rate = arg_n(&args, "--top-rate", DEFAULT_TOP_LOG_INV_RATE)?;
             eprintln!("fb-zk prove: {} rows, leaves of {leaf_size}, leaf rate 1/{}, top rate 1/{} (terminal profile)", rows.len(), 1 << leaf_rate, 1 << top_rate);
             let t = Instant::now();
-            init_aggregation_bytecode();
-            eprintln!("  recursion bytecode ready ({:.1} s)", t.elapsed().as_secs_f32());
+            let hit = init_aggregation_bytecode_cached(&cache_dir());
+            eprintln!("  recursion bytecode ready ({:.1} s, cache {})", t.elapsed().as_secs_f32(), if hit { "hit" } else { "miss -> written" });
             let t = Instant::now();
             let top = prove_ed25519_blob(&rows, &blob_id_cells(&vh), leaf_size, leaf_rate, top_rate, &|m| eprintln!("  {m}"))?;
-            let env = Envelope { version: ENVELOPE_VERSION, leaf_size: leaf_size as u32, n_rows: rows.len() as u32, blob_id: vh, input_data: top.input_data.clone(), top_claim_flat: flatten(&top.bytecode_claim), shape: top.shape.iter().map(shape_out).collect(), proof: top.proof };
+            let env = Envelope { version: ENVELOPE_VERSION, leaf_size: leaf_size as u32, n_rows: rows.len() as u32, blob_id: vh, input_data: top.input_data.clone(), top_claim_flat: flatten(&top.bytecode_claim), shape: top.shape.iter().map(shape_out).collect(), proof_bytes: top.proof.proof.to_bytes() };
             let bytes = postcard::to_allocvec(&env).map_err(|e| e.to_string())?;
             std::fs::write(&out, &bytes).map_err(|e| format!("{out}: {e}"))?;
             eprintln!("  proved in {:.1} s; envelope {} bytes ({} KiB) -> {out}", t.elapsed().as_secs_f32(), bytes.len(), bytes.len() / 1024);
@@ -115,9 +116,10 @@ fn run() -> Result<(), String> {
             if env.n_rows as usize != rows.len() { return Err(format!("the envelope claims {} rows, the blob has {}", env.n_rows, rows.len())); }
             let leaf_size = env.leaf_size as usize;
             let t = Instant::now();
-            init_aggregation_bytecode();
+            init_aggregation_bytecode_cached(&cache_dir());
             let t_bc = t.elapsed().as_secs_f32();
-            let node = Ed25519NodeProof { input_data: env.input_data, bytecode_claim: unflatten(&env.top_claim_flat)?, shape: env.shape.iter().map(shape_in).collect::<Result<_, _>>()?, proof: env.proof };
+            let proof = lean_prover::prove_execution::ExecutionProof { proof: backend::Proof::from_bytes(&env.proof_bytes).map_err(|e| format!("bad proof bytes: {e}"))?, metadata: None };
+            let node = Ed25519NodeProof { input_data: env.input_data, bytecode_claim: unflatten(&env.top_claim_flat)?, shape: env.shape.iter().map(shape_in).collect::<Result<_, _>>()?, proof };
             let t = Instant::now();
             verify_ed25519_blob(&node, &rows, leaf_size, &blob_id_cells(&vh)).map_err(|e| format!("PROOF REJECTED: {e:?}"))?;
             println!("OK: every one of the {} messages in blob 0x{} is validly signed by its signer (leaf size {leaf_size}, envelope {} KiB; bytecode {:.1} s, verify {:.3} s)", rows.len(), hexs(&vh), bytes.len() / 1024, t_bc, t.elapsed().as_secs_f32());
@@ -129,10 +131,17 @@ fn run() -> Result<(), String> {
             let env: Envelope = postcard::from_bytes(&bytes).map_err(|e| format!("bad envelope: {e}"))?;
             fn count(s: &[ShapeNode]) -> (usize, usize) { s.iter().fold((0, 0), |(l, n), x| { let (cl, cn) = count(&x.children); if x.claim_flat.is_none() { (l + 1, n) } else { (l + cl, n + 1 + cn) } }) }
             let (leaves, inner) = count(&env.shape);
-            println!("envelope v{}: blob 0x{}, {} rows, leaf size {}, {} leaves, {} inner nodes, proof {} field elements ({} KiB), file {} KiB", env.version, hexs(&env.blob_id), env.n_rows, env.leaf_size, leaves, inner, env.proof.proof.proof_size_fe(), env.proof.proof.proof_size_fe() * 4 / 1024, bytes.len() / 1024);
+            let proof: backend::Proof<F> = backend::Proof::from_bytes(&env.proof_bytes).map_err(|e| format!("bad proof bytes: {e}"))?;
+            println!("envelope v{}: blob 0x{}, {} rows, leaf size {}, {} leaves, {} inner nodes, proof {} field elements ({} KiB), file {} KiB", env.version, hexs(&env.blob_id), env.n_rows, env.leaf_size, leaves, inner, proof.proof_size_fe(), proof.proof_size_fe() * 4 / 1024, bytes.len() / 1024);
             Ok(())
         }
         _ => Err("usage: fb-zk prove --rows rows.json --blob-id <hex32> --out proof.bin [--leaf-size N] [--leaf-rate R] [--top-rate R]\n       fb-zk verify --rows rows.json --blob-id <hex32> --proof proof.bin\n       fb-zk info --proof proof.bin".into()),
     }
+}
+/// FB_ZK_CACHE, else ~/.cache/fb-zk (the compiled recursion bytecode, keyed by executable + sources).
+fn cache_dir() -> std::path::PathBuf {
+    if let Ok(d) = std::env::var("FB_ZK_CACHE") { return d.into(); }
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    std::path::PathBuf::from(home).join(".cache/fb-zk")
 }
 fn hexs(b: &[u8]) -> String { b.iter().map(|x| format!("{x:02x}")).collect() }

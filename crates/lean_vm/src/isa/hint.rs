@@ -11,7 +11,7 @@ use std::hash::Hash;
 
 /// VM hints provide execution guidance and debugging information, but does not appear
 /// in the verified bytecode.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Hint {
     /// Compute the inverse of a field element
     Inverse {
@@ -78,7 +78,7 @@ pub enum Hint {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
 pub enum HintWitnessDestination<T> {
     /// Write directly at `m[fp + fp_offset ..]
     Inline { offset: T },
@@ -97,7 +97,7 @@ impl<T> HintWitnessDestination<T> {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
 pub enum CustomHint {
     // Decompose values into their custom representations:
     /// each field element x is decomposed to: (a0, a1, a2, ..., a11, b) where:
@@ -233,7 +233,7 @@ impl CustomHint {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Boolean {
     Equal,
     Different,
@@ -241,7 +241,7 @@ pub enum Boolean {
     LessOrEqual,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
 pub struct BooleanExpr<E> {
     pub left: E,
     pub right: E,

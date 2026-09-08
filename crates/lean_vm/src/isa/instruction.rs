@@ -18,7 +18,7 @@ use std::fmt::{Display, Formatter};
 use std::ops::AddAssign;
 
 /// Complete set of VM instruction types with comprehensive operation support
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Instruction {
     /// Basic arithmetic computation instruction (ADD, MUL)
     Computation {
@@ -56,7 +56,7 @@ pub enum Instruction {
     Precompile(PrecompileInstruction),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
 pub struct PrecompileArgs<V, S> {
     pub arg_0: V,
     pub arg_1: V,
@@ -64,7 +64,7 @@ pub struct PrecompileArgs<V, S> {
     pub data: PrecompileCompTimeArgs<S>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
 pub enum PrecompileCompTimeArgs<S> {
     Poseidon16 {
         half_output: bool,
