@@ -508,7 +508,7 @@ impl BlobProofEnvelope {
     /// is used for v3; all child digests and the top value are reconstructed by this reader.
     pub fn verify(self, rows: &[SigRow], blob_id: &[u8; 32]) -> Result<(), String> {
         self.check_statement(rows.len(), blob_id)?;
-        let n_vars = get_aggregation_bytecode().cumulated_n_vars();
+        let n_vars = crate::get_aggregation_verifier_program().cumulated_n_vars();
         let proof = ExecutionProof {
             proof: Proof::from_bytes(&self.proof_bytes).map_err(str::to_string)?,
             metadata: None,

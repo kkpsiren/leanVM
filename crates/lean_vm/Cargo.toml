@@ -7,6 +7,7 @@ edition.workspace = true
 workspace = true
 
 [features]
+init-profile = []
 # A second and third Column-multiplicity bus on the ExtensionOp table (a committed toy column pulls what the
 # multiplicity pushes), used to validate the k-buses-per-table machinery end to end. Test-only.
 multibus-toy = []

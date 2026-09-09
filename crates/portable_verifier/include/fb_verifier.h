@@ -16,6 +16,11 @@ extern "C" {
 uint32_t fb_abi_version(void);
 uint8_t *fb_alloc(size_t size); /* 1..32 MiB, NULL outside bounds */
 void fb_free(uint8_t *pointer, size_t size);
+/* Prefer the FBVK0001 verifier artifact: every byte is SHA-512 authenticated against a
+ * release pin linked offline to the original Poseidon VK. Legacy instruction caches
+ * remain supported through reconstruction and a full Poseidon hash check (slow).
+ * The input may be freed after initialization; the library owns its immutable table.
+ */
 int32_t fb_init(const uint8_t *bytecode_cache, size_t size); /* immutable pinned VK, once */
 /* Envelope v3; rows are contiguous pubkey[32] || digest[20] in blob order.
  * blob_id is independently obtained by the reader, exactly 32 bytes.

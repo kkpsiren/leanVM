@@ -383,11 +383,11 @@ pub fn verify_generic_logup(
     alphas: &[EF],
     alphas_eq_poly: &[EF],
     log_memory: usize,
-    bytecode_multilinear: &[F],
+    bytecode: &dyn VerifierProgram,
     table_log_n_rows: &BTreeMap<Table, VarCount>,
 ) -> ProofResult<GenericLogupStatements> {
     let tables_heights_sorted = sort_tables_by_height(table_log_n_rows);
-    let log_bytecode = log2_strict_usize(bytecode_multilinear.len() / N_INSTRUCTION_COLUMNS.next_power_of_two());
+    let log_bytecode = bytecode.log_size();
     let total_gkr_n_vars = compute_total_logup_log_size(log_memory, log_bytecode, &tables_heights_sorted);
 
     let (sum, point_gkr, numerators_value, denominators_value) = verify_gkr_quotient(verifier_state, total_gkr_n_vars)?;
@@ -435,7 +435,7 @@ pub fn verify_generic_logup(
     let mut bytecode_point = bytecode_and_acc_point.0.clone();
     bytecode_point.extend(from_end(alphas, log2_ceil_usize(N_INSTRUCTION_COLUMNS)));
     let bytecode_point = MultilinearPoint(bytecode_point);
-    let bytecode_value = bytecode_multilinear.evaluate_sequential(&bytecode_point);
+    let bytecode_value = bytecode.evaluate(&bytecode_point);
     let bytecode_value_corrected = bytecode_value
         * alphas[..alphas.len() - log2_ceil_usize(N_INSTRUCTION_COLUMNS)]
             .iter()

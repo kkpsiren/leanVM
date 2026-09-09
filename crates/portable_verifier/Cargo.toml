@@ -6,6 +6,9 @@ edition.workspace = true
 [lib]
 crate-type = ["cdylib", "staticlib"]
 
+[features]
+init-profile = ["rec_aggregation/init-profile"]
+
 [dependencies]
 rec_aggregation.workspace = true
 lean_prover.workspace = true

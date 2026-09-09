@@ -23,13 +23,7 @@ pub(crate) fn flatten_bytecode_claim(claim: &Evaluation<EF>) -> Vec<F> {
 }
 
 pub(crate) fn compute_bytecode_value_at(point: &MultilinearPoint<EF>) -> EF {
-    let bytecode = get_aggregation_bytecode();
-    if point.iter().all(|x| x.is_zero()) {
-        // fast path for multi-signatures coming from 100% raw XMSS (no recursion):
-        EF::from(bytecode.instructions_multilinear()[0])
-    } else {
-        bytecode.instructions_multilinear().evaluate_sequential(point)
-    }
+    crate::get_aggregation_verifier_program().evaluate(point)
 }
 
 pub(crate) fn reduce_bytecode_claims(verified: &[InnerVerified]) -> ReducedBytecodeClaims {

@@ -26,6 +26,16 @@ pub(crate) const MERKLE_LEVELS_PER_CHUNK_FOR_SLOT: usize = 4;
 pub(crate) const N_MERKLE_CHUNKS_FOR_SLOT: usize = LOG_LIFETIME / MERKLE_LEVELS_PER_CHUNK_FOR_SLOT;
 
 static BYTECODE: OnceLock<Bytecode> = OnceLock::new();
+static VERIFIER_BYTECODE: OnceLock<DictionaryProgram> = OnceLock::new();
+
+pub fn try_get_aggregation_verifier_program() -> Option<&'static dyn VerifierProgram> {
+    VERIFIER_BYTECODE.get().map(|p| p as &dyn VerifierProgram)
+        .or_else(|| try_get_aggregation_bytecode().map(|p| p as &dyn VerifierProgram))
+}
+
+pub fn get_aggregation_verifier_program() -> &'static dyn VerifierProgram {
+    try_get_aggregation_verifier_program().expect("initialize the aggregation program first")
+}
 
 pub fn get_aggregation_bytecode() -> &'static Bytecode {
     BYTECODE
@@ -66,13 +76,24 @@ pub fn init_aggregation_bytecode_cached(cache_dir: &std::path::Path) -> bool {
     false
 }
 
-/// Load a caller-supplied cache only after reconstructing and authenticating its instruction table.
-/// Used by the portable verifier; the CLI cache/compiler path remains unchanged.
+/// Authenticate a caller-supplied verifier artifact against the trusted release digest, or
+/// reconstruct a legacy cache and check its full Poseidon hash. The release digest's linkage
+/// to the original VK is audited by `export-verifier-artifact`. Used by the portable verifier;
+/// the CLI cache/compiler path remains unchanged. Calls must be serialized during initialization.
 pub fn init_aggregation_bytecode_pinned(bytes: &[u8], expected_hash: [u32; 8]) -> Result<(), String> {
-    if BYTECODE.get().is_some() { return Err("bytecode already initialized".into()); }
+    init_profile_mark(0);
+    if try_get_aggregation_verifier_program().is_some() { return Err("bytecode already initialized".into()); }
     if bytes.len() > 32 * 1024 * 1024 { return Err("bytecode cache exceeds limit".into()); }
+    if bytes.starts_with(VERIFIER_ARTIFACT_MAGIC) {
+        if expected_hash != crate::verifier_artifact::VK_HASH { return Err("unsupported release pin".into()); }
+        let program = DictionaryProgram::from_pinned_bytes(bytes, &crate::verifier_artifact::ARTIFACT_SHA512, expected_hash)?;
+        let result = VERIFIER_BYTECODE.set(program).map_err(|_| "bytecode already initialized".into());
+        init_profile_mark(6);
+        return result;
+    }
     let (parts, rest) = postcard::take_from_bytes::<lean_vm::BytecodeCacheParts>(bytes)
         .map_err(|e| format!("bytecode cache: {e}"))?;
+    init_profile_mark(1);
     if !rest.is_empty() || parts.code.len() != 1 << 20
         || parts.unpadded_size > parts.code.len()
         || parts.debug_info.pc_to_location.len() != parts.code.len() {
@@ -82,7 +103,9 @@ pub fn init_aggregation_bytecode_pinned(bytes: &[u8], expected_hash: [u32; 8]) -
     if bytecode.hash().map(|f| f.as_canonical_u32()) != expected_hash {
         return Err("bytecode hash differs from the pinned VK".into());
     }
-    BYTECODE.set(bytecode).map_err(|_| "bytecode already initialized".into())
+    let result = BYTECODE.set(bytecode).map_err(|_| "bytecode already initialized".into());
+    init_profile_mark(6);
+    result
 }
 
 /// FNV-1a over the running executable and every embedded zkDSL source (a cache key, not a security

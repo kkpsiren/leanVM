@@ -26,7 +26,7 @@ pub fn verify_execution(
 /// (published top proof = terminal, in-circuit children = full), never from the proof.
 pub fn verify_execution_with_profile(
     profile: &Profile,
-    bytecode: &Bytecode,
+    bytecode: &dyn VerifierProgram,
     public_input: &[F; PUBLIC_INPUT_LEN],
     proof: Proof<F>,
 ) -> Result<(ProofVerificationDetails, RawProof<F>), ProofError> {
@@ -95,7 +95,7 @@ pub fn verify_execution_with_profile(
         &logup_alphas,
         &logup_alphas_eq_poly,
         log_memory,
-        bytecode.instructions_multilinear(),
+        bytecode,
         &table_n_vars,
     )?;
     let gkr_point = &logup_statements.gkr_point;

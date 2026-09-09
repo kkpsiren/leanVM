@@ -7,6 +7,7 @@ edition.workspace = true
 workspace = true
 
 [features]
+init-profile = ["lean_vm/init-profile"]
 prox-gaps-conjecture = ["lean_prover/prox-gaps-conjecture"]
 multibus-toy = ["lean_prover/multibus-toy", "lean_vm/multibus-toy"]
 

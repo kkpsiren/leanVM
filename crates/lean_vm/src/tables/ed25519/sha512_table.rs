@@ -84,16 +84,39 @@ pub fn pad_single_block(msg: &[u8]) -> [u8; 128] {
 pub fn block_words(block: &[u8; 128]) -> [u64; 16] { std::array::from_fn(|i| u64::from_be_bytes(block[8 * i..8 * i + 8].try_into().unwrap())) }
 /// Native SHA-512 of one padded block from the IV.
 pub fn sha512_block(words: &[u64; 16]) -> [u64; 8] {
+    sha512_compress(words, &SHA512_H)
+}
+fn sha512_compress(words: &[u64; 16], initial: &[u64; 8]) -> [u64; 8] {
     let mut w = [0u64; 80];
     w[..16].copy_from_slice(words);
     for t in 16..80 { w[t] = small_sig1(w[t - 2]).wrapping_add(w[t - 7]).wrapping_add(small_sig0(w[t - 15])).wrapping_add(w[t - 16]); }
-    let mut s = SHA512_H;
+    let mut s = *initial;
     for t in 0..80 {
         let t1 = s[7].wrapping_add(big_sig1(s[4])).wrapping_add(ch(s[4], s[5], s[6])).wrapping_add(SHA512_K[t]).wrapping_add(w[t]);
         let t2 = big_sig0(s[0]).wrapping_add(maj(s[0], s[1], s[2]));
         s = [t1.wrapping_add(t2), s[0], s[1], s[2], s[3].wrapping_add(t1), s[4], s[5], s[6]];
     }
-    std::array::from_fn(|i| SHA512_H[i].wrapping_add(s[i]))
+    std::array::from_fn(|i| initial[i].wrapping_add(s[i]))
+}
+
+/// Standard SHA-512 for arbitrary byte strings, reusing the VM's compression implementation.
+/// The input is borrowed; padding uses at most two stack blocks.
+pub fn sha512_bytes(bytes: &[u8]) -> [u8; 64] {
+    let mut state = SHA512_H;
+    let mut chunks = bytes.chunks_exact(128);
+    for block in &mut chunks {
+        state = sha512_compress(&block_words(block.try_into().unwrap()), &state);
+    }
+    let tail = chunks.remainder();
+    let mut padding = [0u8; 256];
+    padding[..tail.len()].copy_from_slice(tail);
+    padding[tail.len()] = 0x80;
+    let padded_len = if tail.len() < 112 { 128 } else { 256 };
+    padding[padded_len - 16..padded_len].copy_from_slice(&((bytes.len() as u128) * 8).to_be_bytes());
+    for block in padding[..padded_len].chunks_exact(128) {
+        state = sha512_compress(&block_words(block.try_into().unwrap()), &state);
+    }
+    digest_bytes(&state)
 }
 /// The digest in standard byte order (big-endian words).
 pub fn digest_bytes(final_hash: &[u64; 8]) -> [u8; 64] { let mut d = [0u8; 64]; for i in 0..8 { d[8 * i..8 * i + 8].copy_from_slice(&final_hash[i].to_be_bytes()); } d }

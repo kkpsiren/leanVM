@@ -30,14 +30,14 @@ pub struct Ed25519LeafProof {
 }
 
 fn zero_bytecode_claim_flat() -> Vec<F> {
-    let bytecode = get_aggregation_bytecode();
+    let bytecode = crate::get_aggregation_verifier_program();
     let point = MultilinearPoint(vec![EF::ZERO; bytecode.cumulated_n_vars()]);
     flatten_bytecode_claim(&rebuild_bytecode_claim(point).expect("zero claim"))
 }
 
 /// The leaf's input data (what the reader recomputes from the decoded columns and the leaf parameters).
 pub fn ed25519_leaf_input_data(n_seg: usize, meta: &[F; 16], root: &[F; 8]) -> Vec<F> {
-    let bytecode = get_aggregation_bytecode();
+    let bytecode = crate::get_aggregation_verifier_program();
     let claim = zero_bytecode_claim_flat();
     let mut data = Vec::new();
     data.push(F::from_usize(ED25519_LEAF_FLAG));
@@ -179,7 +179,7 @@ pub fn ed25519_node_input_data(child_digests: &[[F; DIGEST_LEN]], bytecode_claim
     data[0] = F::from_usize(ED25519_NODE_FLAG);
     data[1] = F::from_usize(child_digests.len());
     data[BYTECODE_CLAIM_OFFSET..][..bytecode_claim_flat.len()].copy_from_slice(bytecode_claim_flat);
-    data[domsep_offset..][..DIGEST_LEN].copy_from_slice(&fiat_shamir_domain_sep(get_aggregation_bytecode()));
+    data[domsep_offset..][..DIGEST_LEN].copy_from_slice(&fiat_shamir_domain_sep(crate::get_aggregation_verifier_program()));
     for (i, d) in child_digests.iter().enumerate() { data[digests_offset + i * DIGEST_LEN..][..DIGEST_LEN].copy_from_slice(d); }
     data
 }
@@ -190,7 +190,7 @@ pub fn expected_digest(stmt: &Statement<'_>, shape: &NodeShape) -> Result<[F; DI
         (Statement::Leaf { rows, seg_index, blob_id }, NodeShape::Leaf) => expected_leaf_digest(rows, *seg_index, blob_id),
         (Statement::Node(children), NodeShape::Node { claim, children: shapes }) => {
             if children.len() != shapes.len() || children.is_empty() || children.len() > MAX_RECURSIONS { return Err(ProofError::InvalidProof); }
-            if claim.point.0.len() != get_aggregation_bytecode().cumulated_n_vars() { return Err(ProofError::InvalidProof); }
+            if claim.point.0.len() != crate::get_aggregation_verifier_program().cumulated_n_vars() { return Err(ProofError::InvalidProof); }
             let digests: Vec<[F; DIGEST_LEN]> = children.iter().zip(shapes).map(|(c, s)| expected_digest(c, s)).collect::<Result<_, _>>()?;
             // the carried inner (point, value) is what the child committed to; a wrong pair changes this
             // digest (rejected at the top), and a false value would propagate into the top value, which

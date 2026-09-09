@@ -21,7 +21,6 @@ use crate::bytecode_claims::reduce_bytecode_claims;
 use crate::compilation::{
     BYTECODE_CLAIM_OFFSET, MAX_RECURSIONS, MAX_XMSS_AGGREGATED, MAX_XMSS_DUPLICATES, N_MERKLE_CHUNKS_FOR_SLOT,
     PREAMBLE_MEMORY_LEN, SINGLE_MESSAGE_FLAG, get_aggregation_bytecode, single_message_input_data_size_padded,
-    try_get_aggregation_bytecode,
 };
 use crate::verify_inner;
 
@@ -96,7 +95,7 @@ impl SingleMessageCore {
 }
 
 pub(crate) fn rebuild_bytecode_claim(point: MultilinearPoint<EF>) -> Result<Evaluation<EF>, &'static str> {
-    let bytecode = try_get_aggregation_bytecode().ok_or("bytecode not initialized")?;
+    let bytecode = crate::compilation::try_get_aggregation_verifier_program().ok_or("bytecode not initialized")?;
     if point.len() != bytecode.cumulated_n_vars() {
         return Err("invalid bytecode point");
     }

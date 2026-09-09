@@ -9,6 +9,25 @@ use super::encoder::field_representation;
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
 
+/// Diagnostic builds only: one host timestamp per phase, never per instruction/hash round.
+#[inline]
+pub fn init_profile_mark(phase: u32) {
+    #[cfg(all(feature = "init-profile", target_arch = "wasm32"))]
+    {
+        #[link(wasm_import_module = "fb_profile")]
+        unsafe extern "C" { fn mark(phase: u32); }
+        unsafe { mark(phase); }
+    }
+    #[cfg(all(feature = "init-profile", not(target_arch = "wasm32")))]
+    {
+        static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        let start = START.get_or_init(std::time::Instant::now);
+        eprintln!("init_profile {phase} {:.6}", start.elapsed().as_secs_f64() * 1000.0);
+    }
+    #[cfg(not(feature = "init-profile"))]
+    let _ = phase;
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CodeEntry {
     pub hints: Box<[Hint]>, // executed before the instruction
@@ -61,14 +80,18 @@ impl Bytecode {
         assert!(unpadded_size <= code.len());
         assert_eq!(debug_info.pc_to_location.len(), code.len());
 
+        init_profile_mark(2);
         let encoded: Vec<[F; N_INSTRUCTION_COLUMNS]> =
             parallel::par_map_collect(code.len(), |i| field_representation(&code[i].instruction));
+        init_profile_mark(3);
         let row_width = N_INSTRUCTION_COLUMNS.next_power_of_two();
         let mut instructions_multilinear = F::zero_vec(code.len() * row_width);
         for (row, fields) in instructions_multilinear.chunks_exact_mut(row_width).zip(&encoded) {
             row[..N_INSTRUCTION_COLUMNS].copy_from_slice(fields);
         }
+        init_profile_mark(4);
         let hash = poseidon_hash_slice(&instructions_multilinear);
+        init_profile_mark(5);
         let ending_pc = code.len() - 1;
 
         Self {

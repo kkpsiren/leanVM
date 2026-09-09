@@ -27,14 +27,14 @@ pub const SNARK_DOMAIN_SEP: [F; 8] = F::new_array([
     130704175, 1303721200, 493664240, 1035493700, 2063844858, 1410214009, 1938905908, 1696767928,
 ]);
 
-pub fn fiat_shamir_domain_sep(bytecode: &Bytecode) -> [F; 8] {
+pub fn fiat_shamir_domain_sep(bytecode: &dyn VerifierProgram) -> [F; 8] {
     poseidon16_compress_pair(bytecode.hash(), &SNARK_DOMAIN_SEP)
 }
 
 /// The domain separator of a proof under `profile`: the full profile keeps the historical value;
 /// any other profile mixes its id in, so a transcript of one profile cannot be re-parsed as another
 /// (the dims header length is the only structural difference between them).
-pub fn fiat_shamir_domain_sep_for(bytecode: &Bytecode, profile: &Profile) -> [F; 8] {
+pub fn fiat_shamir_domain_sep_for(bytecode: &dyn VerifierProgram, profile: &Profile) -> [F; 8] {
     let base = fiat_shamir_domain_sep(bytecode);
     if profile.id == 0 { return base; }
     let mut tag = [F::ZERO; 8];

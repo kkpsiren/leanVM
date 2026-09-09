@@ -5,6 +5,7 @@ pub mod ed25519;
 pub mod ed25519_envelope;
 pub mod ed25519_tree;
 mod compilation;
+pub mod verifier_artifact;
 mod error;
 mod multi_message_aggregation;
 mod single_message_aggregation;
@@ -13,6 +14,7 @@ use backend::{Evaluation, Proof, ProofError, RawProof, poseidon_hash_slice};
 pub use compilation::{
     MAX_RECURSIONS, MAX_XMSS_AGGREGATED, MAX_XMSS_DUPLICATES, NUM_REPEATED_ONES, PREAMBLE_MEMORY_LEN, ZERO_VEC_LEN,
     get_aggregation_bytecode, init_aggregation_bytecode, init_aggregation_bytecode_cached, init_aggregation_bytecode_pinned,
+    get_aggregation_verifier_program,
 };
 pub use error::AggregationError;
 pub use lean_prover::ProverError;
@@ -44,7 +46,7 @@ pub(crate) fn verify_inner(input_data: Vec<F>, proof: Proof<F>) -> Result<InnerV
 /// from the proof.
 pub(crate) fn verify_inner_with(profile: &Profile, input_data: Vec<F>, proof: Proof<F>) -> Result<InnerVerified, ProofError> {
     let input_data_hash = poseidon_hash_slice(&input_data);
-    let bytecode = get_aggregation_bytecode();
+    let bytecode = get_aggregation_verifier_program();
     let (verif, raw_proof) = verify_execution_with_profile(profile, bytecode, &input_data_hash, proof)?;
     Ok(InnerVerified {
         input_data,
