@@ -11,6 +11,32 @@ mod syscall;
 pub use arena_cow::ArenaCow;
 pub use arena_vec::{ArenaVec, OwnedBuffer};
 
+// ArenaVec's System calls bypass #[global_allocator]. Diagnostics must observe them explicitly.
+static SYSTEM_OBSERVER: std::sync::OnceLock<fn(usize, bool)> = std::sync::OnceLock::new();
+
+/// Observe System allocation requests (`true`) and frees (`false`). Called before allocation,
+/// with a matching free notification on failure. The callback must not allocate or panic.
+/// Arena bump allocations are excluded; use only with the arena disabled for live-heap accounting.
+pub fn set_system_allocation_observer(observer: fn(usize, bool)) {
+    SYSTEM_OBSERVER.set(observer).expect("allocation observer already installed");
+}
+
+unsafe fn observed_system_alloc(layout: std::alloc::Layout) -> *mut u8 {
+    use std::alloc::GlobalAlloc;
+    if let Some(observer) = SYSTEM_OBSERVER.get() { observer(layout.size(), true); }
+    let ptr = unsafe { std::alloc::System.alloc(layout) };
+    if ptr.is_null() {
+        if let Some(observer) = SYSTEM_OBSERVER.get() { observer(layout.size(), false); }
+    }
+    ptr
+}
+
+unsafe fn observed_system_dealloc(ptr: *mut u8, layout: std::alloc::Layout) {
+    use std::alloc::GlobalAlloc;
+    unsafe { std::alloc::System.dealloc(ptr, layout); }
+    if let Some(observer) = SYSTEM_OBSERVER.get() { observer(layout.size(), false); }
+}
+
 /// Build an [`ArenaVec`], mirroring [`std::vec!`]:
 #[macro_export]
 macro_rules! arena_vec {

@@ -276,6 +276,25 @@ fn test_zk_vm_all_precompiles() {
     test_zk_vm_helper_with_bytecode(&bytecode, &public_input, witness);
 }
 
+/// Exercise the published profile at its production rate without compiling recursion bytecode
+/// or proving ed25519 leaves. Covers trace cleanup before WHIR on the three-table path.
+#[test]
+fn test_zk_vm_terminal_profile_memory_lifetimes() {
+    let ext_len = 2;
+    let bytecode = compile_program_with_flags(
+        &ProgramSource::Raw(ALL_PRECOMPILES_PROGRAM.to_string()),
+        sweep_flags(100, 2, ext_len, 4),
+    );
+    let (public_input, witness) = all_precompiles_witness(ext_len, &bytecode);
+    let proof = crate::prove_execution::prove_execution_with_profile(
+        &PROFILE_TERMINAL, &bytecode, &public_input, &witness, &default_whir_config(3), false,
+    ).unwrap();
+    crate::verify_execution::verify_execution_with_profile(
+        &PROFILE_TERMINAL, &bytecode, &public_input, proof.proof.clone(),
+    ).unwrap();
+    assert!(verify_execution(&bytecode, &public_input, proof.proof).is_err());
+}
+
 // Python-verifier test vectors: compile ALL_PRECOMPILES_PROGRAM with different runtime flavours (table sizes, etc)
 
 /// One flavour: (loop_iters, n_poseidon, ext_len, bytecode_pad, log_inv_rate).

@@ -135,6 +135,7 @@ impl TableT for Table {
         args: PrecompileCompTimeArgs<usize>,
         ctx: &mut InstructionContext<'_, M>,
     ) -> Result<(), RunnerError> {
+        let _p = backend::prover_profile_span("precompile_witness_trace", self.name());
         delegate_to_inner!(self, execute, arg_a, arg_b, arg_c, args, ctx)
     }
     fn n_columns_total(&self) -> usize {

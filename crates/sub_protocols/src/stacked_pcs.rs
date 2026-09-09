@@ -108,6 +108,7 @@ pub fn stack_polynomials_and_commit(
     range_accs: &[Vec<F>],
     traces: &BTreeMap<Table, TableTrace>,
 ) -> StackedPcsWitness {
+    let stack_span = prover_profile_span("pcs_stack", "all");
     assert_eq!(memory.len(), memory_acc.len());
     let tables_heights = traces.iter().map(|(table, trace)| (*table, trace.log_n_rows)).collect();
     let tables_heights_sorted = sort_tables_by_height(&tables_heights);
@@ -152,7 +153,10 @@ pub fn stack_polynomials_and_commit(
         .green()
     );
 
+    prover_profile_value("pcs_active_cells", "all", offset);
+    prover_profile_value("pcs_padded_cells", "all", 1 << stacked_n_vars);
     let global_polynomial = MleOwned::Base(global_polynomial);
+    drop(stack_span);
 
     let inner_witness =
         WhirConfig::new(whir_config_builder, stacked_n_vars).commit(prover_state, &global_polynomial, offset);

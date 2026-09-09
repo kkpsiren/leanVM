@@ -268,10 +268,12 @@ where
 }
 
 /// Algo 3 of https://eprint.iacr.org/2024/1046.pdf. Requires n_rounds >= 3.
+/// Pass owned weights to release their allocation after the first fold. Borrowed slices remain
+/// supported, but their caller retains the allocation for the duration of this call.
 #[allow(clippy::too_many_arguments)]
 pub fn run_product_sumcheck_from_round1_delayed<EF: KoalaBearExtension>(
     evals: &[PFPacking<EF>],
-    weights: &[EFPacking<EF>],
+    weights: impl AsRef<[EFPacking<EF>]>,
     prover_state: &mut impl FSProver<EF>,
     r1: EF,
     sum_after_r1: EF,
@@ -280,7 +282,8 @@ pub fn run_product_sumcheck_from_round1_delayed<EF: KoalaBearExtension>(
 ) -> (MultilinearPoint<EF>, EF, MleOwned<EF>, MleOwned<EF>) {
     assert!(n_rounds >= 3);
     let n = evals.len();
-    assert_eq!(n, weights.len());
+    let weights_ref = weights.as_ref();
+    assert_eq!(n, weights_ref.len());
     let q = n / 4;
     type Quad<EF> = (EFPacking<EF>, EFPacking<EF>, EFPacking<EF>, EFPacking<EF>);
     let quad_add = |(a, b, c, d): Quad<EF>, (e, f, g, h): Quad<EF>| (a + e, b + f, c + g, d + h);
@@ -299,8 +302,8 @@ pub fn run_product_sumcheck_from_round1_delayed<EF: KoalaBearExtension>(
         q,
         Default::default,
         |i| {
-            let y_0 = r1p * (weights[2 * q + i] - weights[i]) + weights[i];
-            let y_1 = r1p * (weights[3 * q + i] - weights[q + i]) + weights[q + i];
+            let y_0 = r1p * (weights_ref[2 * q + i] - weights_ref[i]) + weights_ref[i];
+            let y_1 = r1p * (weights_ref[3 * q + i] - weights_ref[q + i]) + weights_ref[q + i];
             unsafe {
                 *wf.add(i) = y_0;
                 *wf.add(q + i) = y_1;
@@ -316,6 +319,9 @@ pub fn run_product_sumcheck_from_round1_delayed<EF: KoalaBearExtension>(
         quad_add,
     );
     let second_poly = make_poly(partials, sum_after_r1);
+    // Pass A is the last read of the original weights. Keeping them through later folds
+    // overlaps a full extension-field vector with all of its descendants.
+    drop(weights);
 
     prover_state.add_sumcheck_polynomial(&second_poly.coeffs, None);
     prover_state.pow_grinding(pow_bits);
@@ -357,6 +363,9 @@ pub fn run_product_sumcheck_from_round1_delayed<EF: KoalaBearExtension>(
         quad_add,
     );
     let third_poly = make_poly(partials, sum_after_r2);
+    // Pass B is the last read of the half-size weights. The remaining sumcheck owns only
+    // the two quarter-size vectors, and need not keep their parent allocation resident.
+    drop(w_folded);
 
     prover_state.add_sumcheck_polynomial(&third_poly.coeffs, None);
     prover_state.pow_grinding(pow_bits);
@@ -380,4 +389,63 @@ pub fn run_product_sumcheck_from_round1_delayed<EF: KoalaBearExtension>(
     challenges.splice(0..0, [r1, r2, r3]);
     let [pol_a, pol_b] = folds.split().try_into().unwrap();
     (challenges, sum, pol_a, pol_b)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use koala_bear::{KoalaBear, QuinticExtensionFieldKB, default_koalabear_poseidon1_16};
+
+    type F = KoalaBear;
+    type EF = QuinticExtensionFieldKB;
+
+    fn ext(i: usize) -> EF {
+        EF::from_basis_coefficients_fn(|j| F::from_usize((i + 11) * (j + 3) * (i % 19 + 1)))
+    }
+
+    fn unpack(polynomial: &MleOwned<EF>) -> Vec<EF> {
+        match polynomial.by_ref().unpack().by_ref() {
+            MleRef::Extension(v) => v.to_vec(),
+            _ => panic!("a bound product-sumcheck polynomial must be in the extension field"),
+        }
+    }
+
+    /// Compare all folded cells and exact transcripts with the ordinary (non-delayed) algorithm.
+    /// Covers owned and borrowed inputs, zero/one challenges, and packed/unpacked transitions.
+    #[test]
+    fn delayed_owned_weights_match_reference() {
+        for log_n in [8, 12] {
+            let evals: Vec<F> = (0..1 << log_n).map(|i| F::from_usize(i * i + 3)).collect();
+            let weights: Vec<EF> = (0..evals.len()).map(ext).collect();
+            let packed_evals = PFPacking::<EF>::pack_slice(&evals);
+            let packed_weights: ArenaVec<EFPacking<EF>> = pack_extension(&weights);
+            let claimed_sum: EF = evals.iter().zip(&weights).map(|(&e, &w)| w * e).sum();
+            let first = compute_product_sumcheck_polynomial(packed_evals, &packed_weights, claimed_sum,
+                |p| <EFPacking<EF> as PackedFieldExtension<F, EF>>::to_ext_lanes(p).collect());
+            for rounds in [3, 4, 7] {
+                for r1 in [EF::ZERO, EF::ONE, ext(37)] {
+                    let mut reference = ProverState::new(default_koalabear_poseidon1_16(), Default::default());
+                    let (point, sum, x, w) = run_product_sumcheck_from_round1(
+                        &MleRef::BasePacked(packed_evals), &MleRef::ExtensionPacked(&packed_weights),
+                        &mut reference, r1, first.evaluate(r1), rounds, 0);
+                    let reference_bytes = reference.into_proof().to_bytes();
+                    for owned in [false, true] {
+                        let mut prover = ProverState::new(default_koalabear_poseidon1_16(), Default::default());
+                        let got = if owned {
+                            run_product_sumcheck_from_round1_delayed(packed_evals, packed_weights.clone(),
+                                &mut prover, r1, first.evaluate(r1), rounds, 0)
+                        } else {
+                            run_product_sumcheck_from_round1_delayed(packed_evals, &packed_weights,
+                                &mut prover, r1, first.evaluate(r1), rounds, 0)
+                        };
+                        assert_eq!(got.0, point);
+                        assert_eq!(got.1, sum);
+                        assert_eq!(unpack(&got.2), unpack(&x));
+                        assert_eq!(unpack(&got.3), unpack(&w));
+                        assert_eq!(prover.into_proof().to_bytes(), reference_bytes);
+                    }
+                }
+            }
+        }
+    }
 }

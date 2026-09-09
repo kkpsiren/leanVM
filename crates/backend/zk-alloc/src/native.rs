@@ -1,4 +1,4 @@
-use std::alloc::{GlobalAlloc, Layout};
+use std::alloc::{Layout};
 use std::cell::Cell;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -121,7 +121,7 @@ unsafe fn arena_alloc_cold(size: usize, align: usize) -> *mut u8 {
             let idx = THREAD_IDX.fetch_add(1, Ordering::Relaxed);
             if idx >= max_threads() {
                 ARENA_NO_SLAB.set(true);
-                return unsafe { std::alloc::System.alloc(Layout::from_size_align_unchecked(size, align)) };
+                return unsafe { crate::observed_system_alloc(Layout::from_size_align_unchecked(size, align)) };
             }
             base = region + idx * SLAB_SIZE;
             ARENA_BASE.set(base);
@@ -136,7 +136,7 @@ unsafe fn arena_alloc_cold(size: usize, align: usize) -> *mut u8 {
             return aligned as *mut u8;
         }
     }
-    unsafe { std::alloc::System.alloc(Layout::from_size_align_unchecked(size, align)) }
+    unsafe { crate::observed_system_alloc(Layout::from_size_align_unchecked(size, align)) }
 }
 
 /// [`ArenaVec`]'s allocator: bump the thread's slab in an active phase, else System. The cursor is
@@ -163,7 +163,7 @@ pub(crate) unsafe fn raw_alloc(size: usize, align: usize) -> *mut u8 {
         }
         return unsafe { arena_alloc_cold(size, align) };
     }
-    unsafe { std::alloc::System.alloc(Layout::from_size_align_unchecked(size, align)) }
+    unsafe { crate::observed_system_alloc(Layout::from_size_align_unchecked(size, align)) }
 }
 
 /// Free for [`raw_alloc`]: no-op for arena pointers (reclaimed at the next `begin_phase()`), else System.
@@ -179,5 +179,5 @@ pub(crate) unsafe fn raw_dealloc(ptr: *mut u8, size: usize, align: usize) {
     {
         return; // arena pointer — free is a no-op
     }
-    unsafe { std::alloc::System.dealloc(ptr, Layout::from_size_align_unchecked(size, align)) };
+    unsafe { crate::observed_system_dealloc(ptr, Layout::from_size_align_unchecked(size, align)) };
 }

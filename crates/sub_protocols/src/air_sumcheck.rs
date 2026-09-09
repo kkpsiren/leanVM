@@ -225,6 +225,7 @@ where
     }
 
     fn compute_bare_round_poly(&mut self) -> DensePolynomial<EF> {
+        let _p = prover_profile_span("air_evaluate", std::any::type_name::<A>());
         let split_eq = SplitEq::new(&self.permuted_alphas(self.initial_n_vars - self.rounds_done - 1));
         let active_count_pairs = self.active_count_pairs();
         let storage_shift = if self.in_phase_1() {
@@ -268,6 +269,7 @@ where
     }
 
     fn process_challenge(&mut self, challenge: EF, bare_poly: &DensePolynomial<EF>) {
+        let _p = prover_profile_span("air_fold", std::any::type_name::<A>());
         let alpha_fold = self.eq_alpha();
         let eq_eval = (EF::ONE - alpha_fold) * (EF::ONE - challenge) + alpha_fold * challenge;
         self.sum = bare_poly.evaluate(challenge) * eq_eval;

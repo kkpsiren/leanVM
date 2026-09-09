@@ -66,6 +66,7 @@ where
         polynomial: &MleOwned<EF>,
         actual_data_len: usize, // polynomial[actual_data_len..] is zero
     ) -> Witness<EF> {
+        let _p = ::utils::prover_profile_span("whir_commit", "all");
         let n_blocks = 1usize << self.folding_factor.at_round(0);
         let evals_len = 1usize << self.num_variables;
         let effective_n_cols = actual_data_len.div_ceil(evals_len / n_blocks);

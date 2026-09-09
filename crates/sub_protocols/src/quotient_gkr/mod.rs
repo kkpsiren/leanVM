@@ -32,6 +32,8 @@ pub fn prove_gkr_quotient<'a, EF: KoalaBearExtension>(
     dens_br: &'a [EFPacking<EF>], // same as above
     pivot: usize,
 ) -> (EF, MultilinearPoint<EF>) {
+    let _p = prover_profile_span("gkr", "all");
+    let layers_span = prover_profile_span("gkr_layers", "all");
     let w = packing_log_width::<EF>();
     let total_n_vars = log2_ceil_usize(nums_br.len()) + w;
     assert!(total_n_vars > N_VARS_TO_SEND_GKR_COEFFS);
@@ -59,6 +61,7 @@ pub fn prove_gkr_quotient<'a, EF: KoalaBearExtension>(
         current_n_vars -= 1;
     }
 
+    drop(layers_span);
     let (top_nums, top_dens) = layers.pop().unwrap().materialise_in_full();
     prover_state.add_extension_scalars(&top_nums);
     prover_state.add_extension_scalars(&top_dens);
@@ -68,8 +71,10 @@ pub fn prove_gkr_quotient<'a, EF: KoalaBearExtension>(
     let mut claim_num = top_nums.evaluate(&point);
     let mut claim_den = top_dens.evaluate(&point);
 
-    for layer in layers.iter().rev() {
-        (point, claim_num, claim_den) = prove_gkr_layer(prover_state, layer, &point, claim_num, claim_den);
+    // Each layer is read exactly once, from smallest to largest. Consume the iterator so
+    // already-proven layers are freed before the next layer allocates its folding scratch.
+    for layer in layers.into_iter().rev() {
+        (point, claim_num, claim_den) = prove_gkr_layer(prover_state, &layer, &point, claim_num, claim_den);
     }
 
     (quotient, point)
@@ -82,6 +87,7 @@ fn prove_gkr_layer<EF: KoalaBearExtension>(
     claim_num: EF,
     claim_den: EF,
 ) -> (MultilinearPoint<EF>, EF, EF) {
+    let _p = prover_profile_span("gkr_sumcheck", "all");
     prover_state.duplex();
     let alpha = prover_state.sample();
     let expected_sum = claim_num + alpha * claim_den;

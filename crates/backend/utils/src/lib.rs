@@ -7,6 +7,8 @@ use std::{
 pub mod array_serialization;
 
 pub mod ansi;
+mod prover_profile;
+pub use prover_profile::*;
 
 mod misc;
 pub use misc::*;

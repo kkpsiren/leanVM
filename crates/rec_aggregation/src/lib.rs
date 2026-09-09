@@ -6,6 +6,7 @@ pub mod ed25519_envelope;
 pub mod ed25519_tree;
 mod compilation;
 pub mod verifier_artifact;
+pub mod prover_artifact;
 mod error;
 mod multi_message_aggregation;
 mod single_message_aggregation;

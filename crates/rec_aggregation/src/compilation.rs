@@ -51,16 +51,25 @@ pub fn init_aggregation_bytecode() {
     BYTECODE.get_or_init(compile_main_program_self_referential);
 }
 
-/// Like `init_aggregation_bytecode`, but through a disk cache keyed by this executable's bytes and
-/// the embedded zkDSL sources (any rebuild or source change misses). A cache hit rebuilds the
-/// bytecode with `Bytecode::new`, which recomputes the hash and the multilinear, so a corrupt or
-/// foreign cache file cannot change what is proved or verified — it can only fail to match.
+/// Prefer the authenticated full release cache at `PROVER_CACHE_FILENAME`, independent of the
+/// executable's cache key. Otherwise use the existing executable/source-keyed cache or compiler.
+/// Exact pinned release bytes skip Poseidon; other legacy caches still compute their table hash.
 /// Returns whether the cache was hit.
 pub fn init_aggregation_bytecode_cached(cache_dir: &std::path::Path) -> bool {
     if BYTECODE.get().is_some() { return true; }
+    if let Ok(bytes) = read_cache_bounded(&cache_dir.join(crate::prover_artifact::PROVER_CACHE_FILENAME)) {
+        if let Ok(bc) = crate::prover_artifact::load_prover_cache(&bytes) {
+            let _ = BYTECODE.set(bc);
+            return true;
+        }
+    }
     let key = cache_key();
     let path = cache_dir.join(format!("aggregation-bytecode-{key:016x}.bin"));
-    if let Ok(bytes) = std::fs::read(&path) {
+    if let Ok(bytes) = read_cache_bounded(&path) {
+        if let Ok(bc) = crate::prover_artifact::load_prover_cache(&bytes) {
+            let _ = BYTECODE.set(bc);
+            return true;
+        }
         if let Ok(parts) = postcard::from_bytes::<lean_vm::BytecodeCacheParts>(&bytes) {
             let bc = Bytecode::from_cache_parts(parts);
             let _ = BYTECODE.set(bc);
@@ -76,10 +85,20 @@ pub fn init_aggregation_bytecode_cached(cache_dir: &std::path::Path) -> bool {
     false
 }
 
+fn read_cache_bounded(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)?.take(crate::prover_artifact::MAX_PROVER_CACHE_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > crate::prover_artifact::MAX_PROVER_CACHE_BYTES {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "prover cache exceeds limit"));
+    }
+    Ok(bytes)
+}
+
 /// Authenticate a caller-supplied verifier artifact against the trusted release digest, or
-/// reconstruct a legacy cache and check its full Poseidon hash. The release digest's linkage
-/// to the original VK is audited by `export-verifier-artifact`. Used by the portable verifier;
-/// the CLI cache/compiler path remains unchanged. Calls must be serialized during initialization.
+/// authenticate the full release cache, or reconstruct a legacy cache and check its Poseidon hash.
+/// Linkage audits: `export-verifier-artifact` and `audit-prover-cache`. Calls must be serialized.
 pub fn init_aggregation_bytecode_pinned(bytes: &[u8], expected_hash: [u32; 8]) -> Result<(), String> {
     init_profile_mark(0);
     if try_get_aggregation_verifier_program().is_some() { return Err("bytecode already initialized".into()); }
@@ -90,6 +109,13 @@ pub fn init_aggregation_bytecode_pinned(bytes: &[u8], expected_hash: [u32; 8]) -
         let result = VERIFIER_BYTECODE.set(program).map_err(|_| "bytecode already initialized".into());
         init_profile_mark(6);
         return result;
+    }
+    if expected_hash == crate::verifier_artifact::VK_HASH {
+        if let Ok(bytecode) = crate::prover_artifact::load_prover_cache(bytes) {
+            let result = BYTECODE.set(bytecode).map_err(|_| "bytecode already initialized".into());
+            init_profile_mark(6);
+            return result;
+        }
     }
     let (parts, rest) = postcard::take_from_bytes::<lean_vm::BytecodeCacheParts>(bytes)
         .map_err(|e| format!("bytecode cache: {e}"))?;
@@ -108,8 +134,8 @@ pub fn init_aggregation_bytecode_pinned(bytes: &[u8], expected_hash: [u32; 8]) -
     result
 }
 
-/// FNV-1a over the running executable and every embedded zkDSL source (a cache key, not a security
-/// boundary: the loaded bytecode is re-hashed by `Bytecode::new`).
+/// FNV-1a over the executable and embedded zkDSL sources. This is only a cache key: release
+/// bytes are authenticated independently, and other cached bytecode recomputes its table hash.
 fn cache_key() -> u64 {
     let mut h: u64 = 0xcbf29ce484222325;
     let mut feed = |bytes: &[u8]| { for &b in bytes { h ^= b as u64; h = h.wrapping_mul(0x100000001b3); } };

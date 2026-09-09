@@ -4,7 +4,8 @@ use std::fmt::Display;
 
 pub mod ed25519_leaf;
 pub mod prove_execution;
-mod trace_gen;
+/// Witness/trace construction exposed for diagnostics that must not allocate PCS or GKR buffers.
+pub mod trace_gen;
 pub mod verify_execution;
 
 use backend::*;

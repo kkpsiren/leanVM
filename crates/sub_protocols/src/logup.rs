@@ -38,6 +38,8 @@ pub fn prove_generic_logup(
     range_accs: &[Vec<F>],
     traces: &BTreeMap<Table, TableTrace>,
 ) -> GenericLogupStatements {
+    let _p = prover_profile_span("logup", "all");
+    let fill_span = prover_profile_span("logup_fill", "all");
     assert!(memory.len().is_power_of_two());
     assert_eq!(range_accs.len(), N_RANGE_SECTIONS);
     assert!(log2_strict_usize(memory.len()) >= RANGE_LOG_TOTAL, "memory must be ≥ 2^RANGE_LOG_TOTAL for the range region alignment");
@@ -54,6 +56,7 @@ pub fn prove_generic_logup(
         &tables_log_heights_sorted,
     );
     let total_gkr_n_vars = log2_ceil_usize(total_active_len);
+    prover_profile_value("logup_active_fractions", "all", total_active_len);
     let mut numerators: ArenaVec<F> = unsafe { ArenaVec::<F>::uninitialized(total_active_len) };
     let width = packing_width::<EF>();
     let mut denominators: ArenaVec<EFPacking<EF>> =
@@ -157,6 +160,7 @@ pub fn prove_generic_logup(
     offset = region_start + region_len;
 
     for (table, _) in &tables_log_heights_sorted {
+        let _p = prover_profile_span("logup_fill_table", table.name());
         let trace = &traces[table];
         let log_n_rows = trace.log_n_rows;
         let buses = table.bus_interactions();
@@ -262,6 +266,7 @@ pub fn prove_generic_logup(
         .blue()
     );
 
+    drop(fill_span);
     let (sum, claim_point_gkr) = prove_gkr_quotient::<EF>(
         prover_state,
         PFPacking::<EF>::pack_slice(&numerators),
@@ -275,6 +280,7 @@ pub fn prove_generic_logup(
         assert_eq!(sum, EF::ZERO);
     }
 
+    let _eval_span = prover_profile_span("logup_evals", "all");
     // Memory: ...
     let memory_and_acc_point = MultilinearPoint(from_end(&claim_point_gkr, log2_strict_usize(memory.len())).to_vec());
     let value_memory_acc = eval_base_packed::<EF, true>(memory_acc, &memory_and_acc_point.0);
@@ -301,6 +307,7 @@ pub fn prove_generic_logup(
     let mut bus_denominators_values = BTreeMap::new();
     let mut columns_values = BTreeMap::new();
     for (&table, trace) in traces {
+        let _p = prover_profile_span("logup_eval_table", table.name());
         let log_n_rows = trace.log_n_rows;
 
         let inner_point = MultilinearPoint(from_end(&claim_point_gkr, log_n_rows).to_vec());

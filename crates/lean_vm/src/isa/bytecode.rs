@@ -52,7 +52,8 @@ pub struct BytecodeCacheParts {
     pub debug_info: BytecodeDebugInfo,
 }
 
-/// `instructions_multilinear`, `hash`, and `ending_pc` must be checked at initialization to match `code`.
+/// The table and ending PC are derived from `code`. Its hash is computed at initialization,
+/// or bound by an authenticated release cache whose table-to-hash linkage was audited offline.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Bytecode {
     unpadded_size: usize,
@@ -73,6 +74,17 @@ impl Bytecode {
         hint_name_to_index: BTreeMap<String, usize>,
         debug_info: BytecodeDebugInfo,
     ) -> Self {
+        Self::new_with_hash(code, unpadded_size, starting_frame_memory, hint_name_to_index, debug_info, None)
+    }
+
+    fn new_with_hash(
+        code: Vec<CodeEntry>,
+        unpadded_size: usize,
+        starting_frame_memory: usize,
+        hint_name_to_index: BTreeMap<String, usize>,
+        debug_info: BytecodeDebugInfo,
+        trusted_hash: Option<[F; DIGEST_ELEMS]>,
+    ) -> Self {
         assert!(
             code.len().is_power_of_two(),
             "bytecode must be padded to a power of two"
@@ -90,7 +102,7 @@ impl Bytecode {
             row[..N_INSTRUCTION_COLUMNS].copy_from_slice(fields);
         }
         init_profile_mark(4);
-        let hash = poseidon_hash_slice(&instructions_multilinear);
+        let hash = trusted_hash.unwrap_or_else(|| poseidon_hash_slice(&instructions_multilinear));
         init_profile_mark(5);
         let ending_pc = code.len() - 1;
 
@@ -115,6 +127,16 @@ impl Bytecode {
     }
     pub fn from_cache_parts(p: BytecodeCacheParts) -> Self {
         Self::new(p.code, p.unpadded_size, p.starting_frame_memory, p.hint_name_to_index, p.debug_info)
+    }
+
+    /// For authenticated release caches only. The caller must authenticate the exact serialized
+    /// parts against a trusted release digest and audit their table's linkage to `hash` offline.
+    /// Neither pin may come from the cache or an untrusted manifest. General/untrusted caches
+    /// must use `from_cache_parts`, which computes the Poseidon hash instead of trusting it.
+    /// This still derives every instruction-table cell and retains all execution/debug records.
+    pub fn from_cache_parts_with_trusted_hash(p: BytecodeCacheParts, hash: [F; DIGEST_ELEMS]) -> Self {
+        Self::new_with_hash(p.code, p.unpadded_size, p.starting_frame_memory,
+            p.hint_name_to_index, p.debug_info, Some(hash))
     }
 
     pub fn unpadded_size(&self) -> usize {

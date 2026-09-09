@@ -65,6 +65,7 @@ pub fn expected_leaf_digest(rows: &[SigRow], seg_index: usize, blob_id: &[F; 9])
 
 pub fn prove_ed25519_leaf(rows: &[SigRow], seg_index: usize, blob_id: &[F; 9], log_inv_rate: usize) -> Result<Ed25519LeafProof, String> {
     let bytecode = get_aggregation_bytecode();
+    let hints_span = prover_profile_span("leaf_hints", "all");
     let (rows, n_groups, meta, root, buffers) = leaf_hint_buffers(rows, seg_index, blob_id)?;
     let input_data = ed25519_leaf_input_data(rows.len(), &meta, &root);
     let public_input = poseidon_hash_slice(&input_data);
@@ -73,6 +74,7 @@ pub fn prove_ed25519_leaf(rows: &[SigRow], seg_index: usize, blob_id: &[F; 9], l
     hints.insert(bytecode, "input_data", arena_vec![ArenaVec::from_slice(&input_data)]);
     for (name, v) in &buffers { hints.insert(bytecode, name, arena_vec![ArenaVec::from_slice(v)]); }
     let witness = ExecutionWitness { preamble_memory_len: PREAMBLE_MEMORY_LEN, hints, min_table_log_n_rows: Default::default() };
+    drop(hints_span);
     let proof = prove_execution(bytecode, &public_input, &witness, &default_whir_config(log_inv_rate), vm_profiler()).map_err(|e| format!("{e:?}"))?;
     Ok(Ed25519LeafProof { input_data, n_seg: rows.len(), n_groups, proof })
 }

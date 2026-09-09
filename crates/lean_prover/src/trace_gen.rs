@@ -18,6 +18,7 @@ pub fn get_execution_trace(
 
     let n_cycles = execution_result.pcs.len();
     let memory = &execution_result.memory;
+    let execution_span = prover_profile_span("trace_fill", "execution");
     let mut main_trace: [ArenaVec<F>; N_TOTAL_EXECUTION_COLUMNS + N_TEMPORARY_EXEC_COLUMNS] =
         array::from_fn(|_| unsafe { ArenaVec::<F>::zeroed(n_cycles.next_power_of_two()) });
     for col in &mut main_trace {
@@ -92,6 +93,7 @@ pub fn get_execution_trace(
         *trace_row[EXEC_COL_ADDR_C] = addr_c;
     });
 
+    drop(execution_span);
     let mut memory_padded: ArenaVec<F> = ArenaVec::par_collect(memory.0.len(), |i| memory.0[i].unwrap_or(F::ZERO));
 
     // Write [0000000000000000 | poseidon_compress(0000000000000000)] (to make lookups work on padding-rows).
@@ -107,6 +109,7 @@ pub fn get_execution_trace(
     let ExecutionResult { mut traces, .. } = execution_result;
 
     let poseidon_trace = traces.get_mut(&Table::poseidon16()).unwrap();
+    let poseidon_span = prover_profile_span("trace_fill", "poseidon16");
     fill_trace_poseidon_16(&mut poseidon_trace.columns);
 
     // Override the output columns the AIR leaves unconstrained with the actual memory values,
@@ -140,11 +143,15 @@ pub fn get_execution_trace(
         });
     }
 
+    drop(poseidon_span);
+    let extension_span = prover_profile_span("trace_fill", "extension_op");
     let extension_op_trace = traces.get_mut(&Table::extension_op()).unwrap();
     fill_trace_extension_op(extension_op_trace, &memory_padded);
 
+    drop(extension_span);
     // EdAdd (T3) is a post-pass over the routing tuples of ScalarL/SignerScalar and the point records in memory.
-    lean_vm::ed25519::fill_trace_ed_add(&mut traces, &memory_padded, padding_zero_vec_ptr);
+    { let _p = prover_profile_span("trace_fill", "ed_add");
+    lean_vm::ed25519::fill_trace_ed_add(&mut traces, &memory_padded, padding_zero_vec_ptr); }
 
     traces.insert(
         Table::execution(),
@@ -185,6 +192,7 @@ fn pad_table(
     ending_pc: usize,
     min_log_n_rows: usize,
 ) {
+    let _p = prover_profile_span("trace_pad", table.name());
     let trace = traces.get_mut(table).unwrap();
     let h = trace.columns[0].len();
     trace
@@ -196,6 +204,13 @@ fn pad_table(
     trace.non_padded_n_rows = h;
     trace.log_n_rows = log2_ceil_usize(h + 1).max(min_log_n_rows);
     let n_rows = 1 << trace.log_n_rows;
+    if prover_profile_enabled() {
+        prover_profile_value("active_rows", table.name(), h);
+        prover_profile_value("padded_rows", table.name(), n_rows);
+        prover_profile_value("columns", table.name(), table.n_columns());
+        prover_profile_value("shift_columns", table.name(), table.n_shift_columns());
+        prover_profile_value("buses", table.name(), table.bus_interactions().len());
+    }
     let padding_row = table.padding_row(zero_vec_ptr, null_poseidon_16_hash_ptr, ending_pc);
     parallel::par_for_each_mut(&mut trace.columns, |i, col| {
         assert!(col.len() <= h); // potentially some columns have not been filled (in Poseidon -> we fill it later with SIMD + parallelism), but the first one should always be representative

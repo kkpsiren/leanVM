@@ -42,6 +42,7 @@ where
         witness: Witness<EF>,
         polynomial: &MleRef<'_, EF>,
     ) -> MultilinearPoint<EF> {
+        let _p = ::utils::prover_profile_span("whir_open", "all");
         assert!(self.validate_parameters());
         assert!(self.validate_witness(&witness, polynomial));
         self.validate_statement(&statement);
@@ -430,12 +431,14 @@ where
             .in_scope(|| build_lazy_combine_terms::<EF>(statement, combination_randomness));
         let (first_poly, weights_buf) =
             info_span!("combine_and_compute_first_round").in_scope(|| combine_and_compute_first_round(ev, &terms));
+        // The combined weight buffer now contains every term; the expansion tables are dead.
+        drop(terms);
         prover_state.add_sumcheck_polynomial(&first_poly.coeffs, None);
         prover_state.pow_grinding(pow_bits);
         let r1: EF = prover_state.sample();
         let sum1 = first_poly.evaluate(r1);
         let (challenges, new_sum, folded_evals, folded_weights) = if folding_factor >= 4 {
-            run_product_sumcheck_from_round1_delayed(ev, &weights_buf, prover_state, r1, sum1, folding_factor, pow_bits)
+            run_product_sumcheck_from_round1_delayed(ev, weights_buf, prover_state, r1, sum1, folding_factor, pow_bits)
         } else {
             let weights = Mle::Owned(MleOwned::ExtensionPacked(weights_buf));
             run_product_sumcheck_from_round1(

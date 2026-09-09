@@ -76,6 +76,29 @@ cargo run --release -- fancy-aggregation
 
 (Proven regime)
 
+## Farcaster prover profiling
+
+The full ed25519 proving tests exceed 4 GB even with small leaf counts; run only explicit test
+filters, one prover at a time, without a concurrent build. An unfiltered `--lib` suite includes
+a 6,745-row proof. `ed25519::tests::test_ed25519_node_of_leaves` uses `NODE_LEAF_N=16 NODE_K=2`
+for the small recursive check.
+
+When running a prebuilt libtest executable directly, set `RUST_MIN_STACK=8388608` before launch.
+Direct execution bypasses `.cargo/config.toml`, which already sets a larger `RUST_MIN_STACK`
+for Cargo-launched commands. The direct node test overflowed the default worker stack; operator
+runs passed at 8 MiB and 32 MiB. This reserves stack address space, not that much resident RAM
+for every thread. See the Farcaster repository's `docs/zk-prover-memory.md` for the before-build
+control, phase profiles and operator commands.
+
+Provers can load an audited full release cache without re-hashing its dense table with Poseidon.
+Run `audit-prover-cache EXISTING_FULL_CACHE OUTPUT` offline before distributing an artifact or
+pin. It compares the full execution records and every table field, and independently recomputes
+the Poseidon VK hash. Install its output as `prover-bytecode-v1.bin` inside `FB_ZK_CACHE` (default
+`~/.cache/fb-zk`). Startup checks the hardcoded SHA-512 pin before decoding; the stored VK and
+proof protocol are unchanged. Never source the trusted digest from the artifact or a manifest.
+The existing keyed cache/compiler remains a fallback. No verifier-only dictionary can serve as
+a prover's instruction cache.
+
 ## Security
 
 ### snark
@@ -95,5 +118,4 @@ It's important to mention that a security analysis in the ROM / QROM is not the 
 - [Plonky3](https://github.com/Plonky3/Plonky3) for its various performant crates
 - [whir-p3](https://github.com/tcoratger/whir-p3): a Plonky3-compatible WHIR implementation
 - [Whirlaway](https://github.com/TomWambsgans/Whirlaway): Multilinear snark for AIR + minimal zkVM
-
 

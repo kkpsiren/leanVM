@@ -61,6 +61,7 @@ pub fn prove_execution_with_profile(
     whir_config: &WhirConfigBuilder,
     vm_profiler: bool,
 ) -> Result<ExecutionProof, ProverError> {
+    let _profile = prover_profile_span("prove_execution", "all");
     check_rate(whir_config.starting_log_inv_rate).map_err(|_| ProverError::InvalidRate)?;
     let ExecutionTrace {
         mut traces,
@@ -68,9 +69,9 @@ pub fn prove_execution_with_profile(
         metadata,
     } = info_span!("Witness generation").in_scope(|| -> Result<_, ProverError> {
         let execution_result = info_span!("Executing bytecode")
-            .in_scope(|| try_execute_bytecode(bytecode, public_input, witness, vm_profiler))?;
+            .in_scope(|| { let _p = prover_profile_span("execute", "all"); try_execute_bytecode(bytecode, public_input, witness, vm_profiler) })?;
         Ok(info_span!("Building execution trace")
-            .in_scope(|| get_execution_trace(bytecode, execution_result, &witness.min_table_log_n_rows)))
+            .in_scope(|| { let _p = prover_profile_span("trace", "all"); get_execution_trace(bytecode, execution_result, &witness.min_table_log_n_rows) }))
     })?;
 
     // Tables outside the profile: must be empty (fail loud), then dropped from the commitment.
@@ -128,6 +129,7 @@ pub fn prove_execution_with_profile(
     // TODO parrallelize
     let mut memory_acc = unsafe { ArenaVec::<F>::zeroed(memory.len()) };
     info_span!("Building memory access count").in_scope(|| -> Result<(), ProverError> {
+        let _p = prover_profile_span("memory_counts", "all");
         for (table, trace) in &traces {
             let buses = table.bus_interactions();
             for group in memory_lookup_groups(&buses) {
@@ -148,6 +150,7 @@ pub fn prove_execution_with_profile(
     // // TODO parrallelize
     let mut bytecode_acc = unsafe { ArenaVec::<F>::zeroed(bytecode.padded_size()) };
     info_span!("Building bytecode access count").in_scope(|| -> Result<(), ProverError> {
+        let _p = prover_profile_span("bytecode_counts", "all");
         for pc in traces[&Table::execution()].columns[EXEC_COL_PC].iter() {
             *bytecode_acc.get_mut(pc.to_usize()).ok_or(RunnerError::PCOutOfBounds)? += F::ONE;
         }
@@ -156,6 +159,7 @@ pub fn prove_execution_with_profile(
 
     // Range-section multiplicities: count every range push (One-bus into a range section) per value.
     let range_accs: Vec<Vec<F>> = info_span!("Building range access counts").in_scope(|| {
+        let _p = prover_profile_span("range_counts", "all");
         let mut accs: Vec<Vec<F>> = RANGE_SECTIONS.iter().map(|s| vec![F::ZERO; 1 << s.log_rows]).collect();
         for (table, trace) in &traces {
             for bus in table.bus_interactions() {
@@ -232,7 +236,7 @@ pub fn prove_execution_with_profile(
     let shifted_rows: Vec<Vec<ArenaVec<F>>> = profile.tables
         .iter()
         .zip(&column_refs)
-        .map(|(table, cols)| compute_shifted_columns(table.n_shift_columns(), cols))
+        .map(|(table, cols)| { let _p = prover_profile_span("air_shift", table.name()); compute_shifted_columns(table.n_shift_columns(), cols) })
         .collect();
     std::mem::drop(_span);
     let mut sessions = Vec::with_capacity(profile.tables.len());
@@ -258,6 +262,7 @@ pub fn prove_execution_with_profile(
 
         let mut flat_and_shift: Vec<&[PF<EF>]> = column_refs[idx].to_vec();
         flat_and_shift.extend(shifted_rows[idx].iter().map(|c| c.as_slice()));
+        let _p = prover_profile_span("air_prepare", table.name());
         let packed = MleGroupRef::<EF>::Base(flat_and_shift).pack();
 
         let non_padded = traces[table].non_padded_n_rows;
@@ -273,7 +278,7 @@ pub fn prove_execution_with_profile(
     }
 
     let sumcheck_air_point =
-        info_span!("batched AIR sumcheck").in_scope(|| prove_batched_air_sumcheck(&mut prover_state, &mut sessions));
+        info_span!("batched AIR sumcheck").in_scope(|| { let _p = prover_profile_span("air", "all"); prove_batched_air_sumcheck(&mut prover_state, &mut sessions) });
 
     for (idx, table) in profile.tables.iter().enumerate() {
         let col_evals = sessions[idx].final_column_evals();
@@ -329,6 +334,18 @@ pub fn prove_execution_with_profile(
         &tables_log_heights,
         &committed_statements,
     );
+
+    // WHIR opens the owned stacked polynomial using the scalar claims above. None of the
+    // original trace, shift, or multiplicity buffers are needed during this memory-heavy step.
+    // Drop borrowers before their backing buffers; no arena phase is reset here.
+    drop(sessions);
+    drop(column_refs);
+    drop(shifted_rows);
+    drop(traces);
+    drop(memory);
+    drop(memory_acc);
+    drop(bytecode_acc);
+    drop(range_accs);
 
     WhirConfig::new(whir_config, stacked_pcs_witness.global_polynomial.by_ref().n_vars()).prove(
         &mut prover_state,
