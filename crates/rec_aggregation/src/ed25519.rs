@@ -8,13 +8,14 @@
 //! their bytecode claims; it does NOT bind positions or blob ids — the READER does (spec F7): it
 //! recomputes every leaf digest from its own (rows_k, seg_index = k, blob_id) and rebuilds the tree of
 //! node digests (`verify_ed25519_node`), so a reordered, duplicated, foreign or missing leaf is rejected
-//! there. This is what makes the tree shape free: a 49-leaf blob is e.g. 49 → 13 → 4 → 1 at fan-in 4,
-//! and an epoch is a node over per-blob nodes.
+//! there. The general node API still supports arbitrary statement trees. The single-blob v3 API
+//! requires the canonical fan-in-four tree: 49 → 13 → 4 → 1. V2 keeps its legacy bounded shape.
 
 use crate::bytecode_claims::{flatten_bytecode_claim, reduce_bytecode_claims};
 use crate::compilation::{BYTECODE_CLAIM_OFFSET, ED25519_LEAF_FLAG, ED25519_NODE_FLAG, MAX_RECURSIONS, PREAMBLE_MEMORY_LEN, get_aggregation_bytecode};
 use crate::single_message_aggregation::{extract_merkle_hint_blobs, rebuild_bytecode_claim};
 use crate::{InnerVerified, verify_inner, verify_inner_with};
+use crate::ed25519_tree::BlobTreeLayout;
 use backend::*;
 use lean_prover::ed25519_leaf::{MAX_LEAF_SIGS, SigRow, canonical_rows, leaf_hint_buffers, leaf_meta, root_seg};
 use lean_prover::prove_execution::{ExecutionProof, prove_execution, prove_execution_with_profile};
@@ -132,7 +133,7 @@ pub(crate) fn leaf_statements<'a>(rows_per_leaf: &[&'a [SigRow]], blob_id: &[F; 
     rows_per_leaf.iter().enumerate().map(|(k, rows)| Statement::Leaf { rows, seg_index: k, blob_id: *blob_id }).collect()
 }
 
-/// READER API for one blob. `rows` = every decoded signed message of the blob, in blob order;
+/// LEGACY V2 READER API for one blob. `rows` = every decoded signed message of the blob, in blob order;
 /// leaf k = rows[k·S, (k+1)·S). The leaves are assigned to the proof's tree shape in pre-order, so
 /// leaf k always gets seg_index k whatever the shape; a shape with a different number of leaves is
 /// rejected, so every decoded row is covered by exactly one leaf.
@@ -156,9 +157,17 @@ pub fn blob_statement_tree<'a>(rows: &'a [SigRow], leaf_size: usize, blob_id: &[
     if next != chunks.len() { return Err(ProofError::InvalidProof); }
     Ok(stmts)
 }
-/// Verify a node proof as the proof of one whole blob (see `blob_statement_tree`).
-pub fn verify_ed25519_blob(node: &Ed25519NodeProof, rows: &[SigRow], leaf_size: usize, blob_id: &[F; 9]) -> Result<InnerVerified, ProofError> {
+/// Legacy envelope v2: accepts the bounded, caller-carried tree shape.
+pub fn verify_ed25519_blob_legacy(node: &Ed25519NodeProof, rows: &[SigRow], leaf_size: usize, blob_id: &[F; 9]) -> Result<InnerVerified, ProofError> {
     let stmts = blob_statement_tree(rows, leaf_size, blob_id, &node.shape)?;
+    verify_ed25519_node(node, &stmts)
+}
+
+/// Verify a whole blob using the canonical fan-in-four tree (envelope v3).
+pub fn verify_ed25519_blob(node: &Ed25519NodeProof, rows: &[SigRow], leaf_size: usize, blob_id: &[F; 9]) -> Result<InnerVerified, ProofError> {
+    let layout = BlobTreeLayout::new(rows.len(), leaf_size).map_err(|_| ProofError::InvalidProof)?;
+    layout.claims(&node.shape).map_err(|_| ProofError::InvalidProof)?;
+    let stmts = layout.statements(rows, blob_id).map_err(|_| ProofError::InvalidProof)?;
     verify_ed25519_node(node, &stmts)
 }
 
@@ -194,7 +203,7 @@ pub fn expected_digest(stmt: &Statement<'_>, shape: &NodeShape) -> Result<[F; DI
 
 /// Reader-side verification of the PUBLISHED top node against the reader's own statement tree:
 /// rebuilds every child digest (leaves from data, inner nodes from their children + carried claim
-/// point with the value recomputed), the node's input data and its reduced claim, then verifies the
+/// point AND value), the node's input data and its reduced top claim, then verifies the
 /// proof under the TERMINAL profile (three base tables; a top node never runs an ed25519
 /// precompile). A proof made under the full profile does not verify here, by domain separation.
 pub fn verify_ed25519_node(node: &Ed25519NodeProof, children: &[Statement<'_>]) -> Result<InnerVerified, ProofError> {
@@ -234,11 +243,11 @@ pub const NODE_FAN_IN: usize = 4;
 /// shorter) are proved in order, then reduced by nodes of `NODE_FAN_IN` children until one node
 /// remains, which is proved at `top_log_inv_rate`. The returned node's shape is exactly what
 /// `verify_ed25519_blob(node, rows, leaf_size, blob_id)` rebuilds on the reader side (pre-order
-/// leaf assignment), so the reader needs nothing from the prover but the proof and `leaf_size`.
+/// leaf assignment under the canonical layout), so the reader needs the proof, inner claims and
+/// `leaf_size` in addition to its own rows and blob identifier.
 /// A single leaf still gets a top node, so the published artifact is always a node proof.
 pub fn prove_ed25519_blob(rows: &[SigRow], blob_id: &[F; 9], leaf_size: usize, leaf_log_inv_rate: usize, top_log_inv_rate: usize, log: &dyn Fn(String)) -> Result<Ed25519NodeProof, String> {
-    if rows.is_empty() { return Err("prove_ed25519_blob: no rows".into()); }
-    if leaf_size == 0 || leaf_size > MAX_LEAF_SIGS { return Err(format!("prove_ed25519_blob: leaf_size must be 1..={MAX_LEAF_SIGS}")); }
+    let layout = BlobTreeLayout::new(rows.len(), leaf_size)?;
     let leaves: Vec<Ed25519LeafProof> = rows.chunks(leaf_size).enumerate().map(|(k, chunk)| {
         let t = std::time::Instant::now();
         let leaf = prove_ed25519_leaf(chunk, k, blob_id, leaf_log_inv_rate)?;
@@ -247,10 +256,9 @@ pub fn prove_ed25519_blob(rows: &[SigRow], blob_id: &[F; 9], leaf_size: usize, l
     }).collect::<Result<_, String>>()?;
     // level 0 = the leaves; each further level groups NODE_FAN_IN consecutive children into a node
     let mut level: Vec<Ed25519NodeProof> = Vec::new();
-    let mut first = true;
-    loop {
-        let n_children = if first { leaves.len() } else { level.len() };
-        let top = n_children <= NODE_FAN_IN;
+    for (depth, &n_children) in layout.level_widths().iter().enumerate() {
+        let first = depth == 0;
+        let top = depth + 1 == layout.level_widths().len();
         let rate = if top { top_log_inv_rate } else { leaf_log_inv_rate };
         let mut next: Vec<Ed25519NodeProof> = Vec::new();
         for g in 0..n_children.div_ceil(NODE_FAN_IN) {
@@ -262,10 +270,10 @@ pub fn prove_ed25519_blob(rows: &[SigRow], blob_id: &[F; 9], leaf_size: usize, l
             log(format!("node over {} {}: rate 1/{}, {:.1} s, {} cycles, {} KiB{}", hi - lo, if first { "leaves" } else { "nodes" }, 1 << rate, t.elapsed().as_secs_f32(), node.proof.metadata.as_ref().map(|m| m.cycles).unwrap_or(0), node.proof.proof.proof_size_fe() * 4 / 1024, if top { " (top, terminal profile)" } else { "" }));
             next.push(node);
         }
-        first = false;
         if next.len() == 1 { return Ok(next.pop().unwrap()); }
         level = next;
     }
+    unreachable!("a validated canonical layout always ends in a top node")
 }
 
 /// An INNER node (full profile: it is verified in-circuit by its parent).
@@ -400,7 +408,8 @@ mod tests {
         init_aggregation_bytecode();
         let rows = dataset();
         let per_leaf = env("NODE_LEAF_N", 16);
-        let blob_id: [F; 9] = std::array::from_fn(|i| F::from_usize(100 + i));
+        let versioned_hash = [1u8; 32];
+        let blob_id = lean_prover::ed25519_leaf::blob_id_cells(&versioned_hash);
         let leaves = prove_leaves(&rows, per_leaf, 4, 0, &blob_id);
         let t = std::time::Instant::now();
         let a = prove_ed25519_node(&[Ed25519Child::Leaf(&leaves[0]), Ed25519Child::Leaf(&leaves[1])], 1).expect("node A");
@@ -411,7 +420,11 @@ mod tests {
         let leaf = |k: usize| Statement::Leaf { rows: per[k], seg_index: k, blob_id };
         let stmt = vec![Statement::Node(vec![leaf(0), leaf(1)]), Statement::Node(vec![leaf(2), leaf(3)])];
         verify_ed25519_node(&top, &stmt).expect("tree verifies from reader-recomputed digests");
-        verify_ed25519_blob(&top, &rows[..4 * per_leaf], per_leaf, &blob_id).expect("blob reader API assigns leaves to the tree in pre-order");
+        verify_ed25519_blob_legacy(&top, &rows[..4 * per_leaf], per_leaf, &blob_id).expect("v2 accepts a noncanonical tree");
+        assert!(verify_ed25519_blob(&top, &rows[..4 * per_leaf], per_leaf, &blob_id).is_err(), "v3 rejects noncanonical grouping even for a valid proof");
+        let legacy = crate::ed25519_envelope::tests::encode_v2(&top, 4 * per_leaf, per_leaf, versioned_hash);
+        crate::ed25519_envelope::BlobProofEnvelope::decode(&legacy).unwrap().verify(&rows[..4 * per_leaf], &versioned_hash).expect("noncanonical v2 envelope still verifies");
+        assert!(crate::ed25519_envelope::encode_ed25519_blob(&top, 4 * per_leaf, per_leaf, versioned_hash).is_err(), "v3 writer refuses noncanonical trees");
         // subtrees swapped
         let swapped = vec![Statement::Node(vec![leaf(2), leaf(3)]), Statement::Node(vec![leaf(0), leaf(1)])];
         assert!(verify_ed25519_node(&top, &swapped).is_err(), "subtree order must be bound");
@@ -521,6 +534,31 @@ mod tests {
         std::fs::create_dir_all(std::path::Path::new(&out).parent().unwrap()).unwrap();
         std::fs::write(&out, json).unwrap();
         println!("wrote {out}");
+        // Transport v3 does not change the leaf statement/VK. Publish a separate vector carrying
+        // the real one-leaf envelope (including proof bytes) and deterministic topology cases.
+        let envelope = crate::ed25519_envelope::encode_ed25519_blob(&node, seg.len(), seg.len(), vh).unwrap();
+        let tree_cases: Vec<_> = [1, 16, 64, 65, 256, 257, 769, 1025].iter().map(|&n| {
+            let layout = BlobTreeLayout::new(n, 16).unwrap();
+            fn shape_json(stmts: &[Statement<'_>]) -> serde_json::Value {
+                serde_json::Value::Array(stmts.iter().map(|s| match s {
+                    Statement::Leaf { seg_index, rows, .. } => serde_json::json!({ "seg_index": seg_index, "n_rows": rows.len() }),
+                    Statement::Node(children) => shape_json(children),
+                }).collect())
+            }
+            serde_json::json!({ "n_rows": n, "leaf_size": 16, "level_widths": layout.level_widths(), "n_inner_nodes": layout.n_inner_nodes(), "shape": shape_json(&layout.statements(&rows[..n], &blob_id).unwrap()) })
+        }).collect();
+        let path = std::path::Path::new(&out).with_file_name("envelope-v3.json");
+        let vectors = serde_json::json!({
+            "contract": "docs/zk-reader-contract.md v2, envelope v3",
+            "note": "Real one-leaf proof; claim cells are canonical integers, postcard varints. Proof cells are fixed-width canonical little-endian. Inner claims are in depth-first pre-order; topology cases below cover uneven and multilevel trees.",
+            "vk_bytecode_hash": bytecode.hash().iter().map(|c| c.as_canonical_u32()).collect::<Vec<_>>(),
+            "blob_id": hex(&vh), "leaf_size": seg.len(), "n_rows": seg.len(),
+            "top_point": point_cells.iter().map(|c| c.as_canonical_u32()).collect::<Vec<_>>(),
+            "inner_claims": [], "envelope_hex": hex(&envelope), "tree_cases": tree_cases,
+        });
+        std::fs::write(&path, serde_json::to_string_pretty(&vectors).unwrap() + "\n").unwrap();
+        crate::ed25519_envelope::BlobProofEnvelope::decode(&envelope).unwrap().verify(seg, &vh).unwrap();
+        println!("wrote {} ({} envelope bytes)", path.display(), envelope.len());
     }
 
     /// One whole blob through the production driver: BLOB_N rows (default one blob's worth) at
@@ -533,7 +571,8 @@ mod tests {
         let n = env("BLOB_N", 6745).min(rows.len());
         let leaf_size = env("LEAF_SIZE", DEFAULT_LEAF_SIGS);
         let top_rate = env("TOP_RATE", DEFAULT_TOP_LOG_INV_RATE);
-        let blob_id: [F; 9] = std::array::from_fn(|i| F::from_usize(0x1234 + i));
+        let versioned_hash: [u8; 32] = std::array::from_fn(|i| if i == 0 { 1 } else { (i * 7) as u8 });
+        let blob_id = lean_prover::ed25519_leaf::blob_id_cells(&versioned_hash);
         let t = std::time::Instant::now();
         let top = prove_ed25519_blob(&rows[..n], &blob_id, leaf_size, DEFAULT_LEAF_LOG_INV_RATE, top_rate, &|m| println!("  {m}")).expect("blob proof");
         println!("BLOB {n} rows, leaves of {leaf_size}: proved in {:.1} s, published proof {} KiB", t.elapsed().as_secs_f32(), top.proof.proof.proof_size_fe() * 4 / 1024);
@@ -542,6 +581,7 @@ mod tests {
         println!("BLOB verified reader-side in {:.3} s", tv.elapsed().as_secs_f32());
         assert!(verify_ed25519_blob(&top, &rows[1..n + 1], leaf_size, &blob_id).is_err(), "shifted rows must be rejected");
         assert!(verify_ed25519_blob(&top, &rows[..n], leaf_size + 1, &blob_id).is_err(), "a wrong leaf size must be rejected");
+        crate::ed25519_envelope::tests::roundtrips(&top, &rows[..n], leaf_size, versioned_hash);
     }
 
     /// IN-CIRCUIT negative: a child proof tampered after native verification must be rejected by the

@@ -2,6 +2,8 @@
 pub mod benchmark;
 mod bytecode_claims;
 pub mod ed25519;
+pub mod ed25519_envelope;
+pub mod ed25519_tree;
 mod compilation;
 mod error;
 mod multi_message_aggregation;
