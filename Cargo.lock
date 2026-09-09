@@ -1186,7 +1186,6 @@ dependencies = [
  "cfg-if",
  "libc",
  "r-efi 6.0.0",
- "rand_core 0.10.1",
  "wasip2",
  "wasip3",
 ]
@@ -1810,6 +1809,14 @@ dependencies = [
  "system-info",
  "utils",
  "zk-alloc",
+]
+
+[[package]]
+name = "portable_verifier"
+version = "0.1.0"
+dependencies = [
+ "lean_prover",
+ "rec_aggregation",
 ]
 
 [[package]]

@@ -66,6 +66,25 @@ pub fn init_aggregation_bytecode_cached(cache_dir: &std::path::Path) -> bool {
     false
 }
 
+/// Load a caller-supplied cache only after reconstructing and authenticating its instruction table.
+/// Used by the portable verifier; the CLI cache/compiler path remains unchanged.
+pub fn init_aggregation_bytecode_pinned(bytes: &[u8], expected_hash: [u32; 8]) -> Result<(), String> {
+    if BYTECODE.get().is_some() { return Err("bytecode already initialized".into()); }
+    if bytes.len() > 32 * 1024 * 1024 { return Err("bytecode cache exceeds limit".into()); }
+    let (parts, rest) = postcard::take_from_bytes::<lean_vm::BytecodeCacheParts>(bytes)
+        .map_err(|e| format!("bytecode cache: {e}"))?;
+    if !rest.is_empty() || parts.code.len() != 1 << 20
+        || parts.unpadded_size > parts.code.len()
+        || parts.debug_info.pc_to_location.len() != parts.code.len() {
+        return Err("invalid pinned bytecode dimensions or trailing bytes".into());
+    }
+    let bytecode = Bytecode::from_cache_parts(parts);
+    if bytecode.hash().map(|f| f.as_canonical_u32()) != expected_hash {
+        return Err("bytecode hash differs from the pinned VK".into());
+    }
+    BYTECODE.set(bytecode).map_err(|_| "bytecode already initialized".into())
+}
+
 /// FNV-1a over the running executable and every embedded zkDSL source (a cache key, not a security
 /// boundary: the loaded bytecode is re-hashed by `Bytecode::new`).
 fn cache_key() -> u64 {

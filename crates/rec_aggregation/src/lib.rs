@@ -12,7 +12,7 @@ mod single_message_aggregation;
 use backend::{Evaluation, Proof, ProofError, RawProof, poseidon_hash_slice};
 pub use compilation::{
     MAX_RECURSIONS, MAX_XMSS_AGGREGATED, MAX_XMSS_DUPLICATES, NUM_REPEATED_ONES, PREAMBLE_MEMORY_LEN, ZERO_VEC_LEN,
-    get_aggregation_bytecode, init_aggregation_bytecode, init_aggregation_bytecode_cached,
+    get_aggregation_bytecode, init_aggregation_bytecode, init_aggregation_bytecode_cached, init_aggregation_bytecode_pinned,
 };
 pub use error::AggregationError;
 pub use lean_prover::ProverError;

@@ -1,8 +1,10 @@
 use std::sync::OnceLock;
 
+#[cfg(not(target_arch = "wasm32"))]
 const _: () = assert!(usize::BITS == 64, "this project requires a 64-bit target (for now)");
 
 #[must_use]
+#[cfg(not(target_arch = "wasm32"))]
 pub fn num_threads() -> usize {
     static CACHE: OnceLock<usize> = OnceLock::new();
     *CACHE.get_or_init(|| {
@@ -23,6 +25,7 @@ pub fn l1_cache_size() -> usize {
     })
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub fn peak_rss_bytes() -> u64 {
     let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
     unsafe { libc::getrusage(libc::RUSAGE_SELF, &raw mut ru) };
@@ -59,3 +62,7 @@ fn detect_l1_cache_size() -> Option<usize> {
 fn detect_l1_cache_size() -> Option<usize> {
     None
 }
+
+/// The raw Wasm target has no threads.
+#[cfg(target_arch = "wasm32")]
+pub fn num_threads() -> usize { 1 }

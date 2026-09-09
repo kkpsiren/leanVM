@@ -3,7 +3,9 @@ use backend::{DIGEST_LEN_FE, KoalaBear, POSEIDON1_WIDTH, PrimeCharacteristicRing
 
 #[cfg(any(test, feature = "test-utils"))]
 pub mod signers_cache;
+#[cfg(feature = "ssz")]
 mod ssz_serialization;
+#[cfg(feature = "ssz")]
 pub use ssz_serialization::{PUB_KEY_SSZ_LEN, SIGNATURE_SSZ_LEN};
 mod wots;
 // The rest of the WOTS layer (one-time secret keys, chain walking, encoding) is a private
@@ -111,7 +113,7 @@ pub(crate) fn poseidon_prf(domain: u32, seed: &[u8; 32], indices: [usize; 2]) ->
     input[9] = F::from_usize(high_bits);
 
     for (i, &idx) in indices.iter().enumerate() {
-        assert!(idx < 1 << 60);
+        assert!((idx as u64) < 1u64 << 60);
         input[10 + 2 * i] = F::from_usize(idx & mask);
         input[11 + 2 * i] = F::from_usize(idx >> 30);
     }

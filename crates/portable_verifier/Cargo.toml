@@ -1,0 +1,14 @@
+[package]
+name = "portable_verifier"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+crate-type = ["cdylib", "staticlib"]
+
+[dependencies]
+rec_aggregation.workspace = true
+lean_prover.workspace = true
+
+[lints]
+workspace = true
