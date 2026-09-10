@@ -11,3 +11,13 @@ pub const ARTIFACT_SHA512: [u8; 64] = [
     11, 116, 172, 197, 71, 237, 232, 71, 185, 66, 117, 210, 126, 23, 11, 156,
     215, 212, 33, 79, 24, 175, 169, 209, 111, 84, 19, 101, 190, 15, 219, 78,
 ];
+
+/// On-wire VK identifier: the canonical Poseidon instruction-table hash, little-endian u32 cells.
+/// It is compared to the shipped pin before loading claims or interpreting a proof.
+pub fn vk_id() -> [u8; 32] {
+    let mut out = [0; 32];
+    for (i, cell) in VK_HASH.iter().enumerate() {
+        out[4 * i..4 * i + 4].copy_from_slice(&cell.to_le_bytes());
+    }
+    out
+}

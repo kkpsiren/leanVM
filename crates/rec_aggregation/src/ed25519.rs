@@ -17,7 +17,9 @@ use crate::single_message_aggregation::{extract_merkle_hint_blobs, rebuild_bytec
 use crate::{InnerVerified, verify_inner, verify_inner_with};
 use crate::ed25519_tree::BlobTreeLayout;
 use backend::*;
-use lean_prover::ed25519_leaf::{MAX_LEAF_SIGS, SigRow, canonical_rows, leaf_hint_buffers, leaf_meta, root_seg};
+use lean_prover::ed25519_leaf::{
+    ED25519_SCHEME_ID, MAX_LEAF_SIGS, SigRow, canonical_rows, leaf_hint_buffers, leaf_meta, root_seg,
+};
 use lean_prover::prove_execution::{ExecutionProof, prove_execution, prove_execution_with_profile};
 use lean_prover::*;
 use lean_vm::*;
@@ -110,6 +112,7 @@ pub enum NodeShape {
 }
 
 pub struct Ed25519NodeProof {
+    pub scheme_id: u32,
     pub input_data: Vec<F>,
     pub bytecode_claim: Evaluation<EF>,
     /// One entry per child, in input-data order.
@@ -125,14 +128,14 @@ pub enum Ed25519Child<'a> {
 /// Reader-side statement tree: what the reader believes each child is. Leaves carry the rows the
 /// reader decoded from the blob, in blob order, with their position and blob id.
 pub enum Statement<'a> {
-    Leaf { rows: &'a [SigRow], seg_index: usize, blob_id: [F; 9] },
+    Leaf { scheme_id: u32, rows: &'a [SigRow], seg_index: usize, blob_id: [F; 9] },
     Node(Vec<Statement<'a>>),
 }
 
 /// Leaf statements from explicit per-leaf slices (tests; a reader uses `verify_ed25519_blob`, which
 /// derives the leaves from the full decoded row list so no subset can be verified by accident).
 pub(crate) fn leaf_statements<'a>(rows_per_leaf: &[&'a [SigRow]], blob_id: &[F; 9]) -> Vec<Statement<'a>> {
-    rows_per_leaf.iter().enumerate().map(|(k, rows)| Statement::Leaf { rows, seg_index: k, blob_id: *blob_id }).collect()
+    rows_per_leaf.iter().enumerate().map(|(k, rows)| Statement::Leaf { scheme_id: ED25519_SCHEME_ID, rows, seg_index: k, blob_id: *blob_id }).collect()
 }
 
 /// LEGACY V2 READER API for one blob. `rows` = every decoded signed message of the blob, in blob order;
@@ -146,7 +149,7 @@ pub fn blob_statement_tree<'a>(rows: &'a [SigRow], leaf_size: usize, blob_id: &[
     fn build<'a>(shape: &NodeShape, chunks: &[&'a [SigRow]], next: &mut usize, blob_id: &[F; 9], depth: usize) -> Result<Statement<'a>, ProofError> {
         if depth > MAX_DEPTH { return Err(ProofError::InvalidProof); }
         match shape {
-            NodeShape::Leaf => { let k = *next; *next += 1; let rows = *chunks.get(k).ok_or(ProofError::InvalidProof)?; Ok(Statement::Leaf { rows, seg_index: k, blob_id: *blob_id }) }
+            NodeShape::Leaf => { let k = *next; *next += 1; let rows = *chunks.get(k).ok_or(ProofError::InvalidProof)?; Ok(Statement::Leaf { scheme_id: ED25519_SCHEME_ID, rows, seg_index: k, blob_id: *blob_id }) }
             NodeShape::Node { children, .. } => {
                 if children.is_empty() || children.len() > MAX_RECURSIONS { return Err(ProofError::InvalidProof); }
                 Ok(Statement::Node(children.iter().map(|c| build(c, chunks, next, blob_id, depth + 1)).collect::<Result<_, _>>()?))
@@ -189,7 +192,12 @@ pub fn ed25519_node_input_data(child_digests: &[[F; DIGEST_LEN]], bytecode_claim
 /// Reader side: the digest of a statement subtree, given the shape carried by the proof.
 pub fn expected_digest(stmt: &Statement<'_>, shape: &NodeShape) -> Result<[F; DIGEST_LEN], ProofError> {
     match (stmt, shape) {
-        (Statement::Leaf { rows, seg_index, blob_id }, NodeShape::Leaf) => expected_leaf_digest(rows, *seg_index, blob_id),
+        (Statement::Leaf { scheme_id, rows, seg_index, blob_id }, NodeShape::Leaf) => {
+            if *scheme_id != ED25519_SCHEME_ID {
+                return Err(ProofError::InvalidProof);
+            }
+            expected_leaf_digest(rows, *seg_index, blob_id)
+        }
         (Statement::Node(children), NodeShape::Node { claim, children: shapes }) => {
             if children.len() != shapes.len() || children.is_empty() || children.len() > MAX_RECURSIONS { return Err(ProofError::InvalidProof); }
             if claim.point.0.len() != crate::get_aggregation_verifier_program().cumulated_n_vars() { return Err(ProofError::InvalidProof); }
@@ -213,6 +221,9 @@ pub fn verify_ed25519_node(node: &Ed25519NodeProof, children: &[Statement<'_>]) 
 }
 
 pub(crate) fn verify_ed25519_node_with(profile: &Profile, node: &Ed25519NodeProof, children: &[Statement<'_>]) -> Result<InnerVerified, ProofError> {
+    if node.scheme_id != ED25519_SCHEME_ID {
+        return Err(ProofError::InvalidProof);
+    }
     if children.len() != node.shape.len() || children.is_empty() || children.len() > MAX_RECURSIONS { return Err(ProofError::InvalidProof); }
     let digests: Vec<[F; DIGEST_LEN]> = children.iter().zip(&node.shape).map(|(c, s)| expected_digest(c, s)).collect::<Result<_, _>>()?;
     let claim = rebuild_bytecode_claim(node.bytecode_claim.point.clone()).map_err(|_| ProofError::InvalidProof)?;
@@ -224,6 +235,9 @@ pub(crate) fn verify_ed25519_node_with(profile: &Profile, node: &Ed25519NodeProo
 /// Verify a node proof against the statement its own input data encodes (the node prover uses it for
 /// its children; the parent's reader re-binds everything).
 pub(crate) fn verify_ed25519_node_self(node: &Ed25519NodeProof) -> Result<InnerVerified, ProofError> {
+    if node.scheme_id != ED25519_SCHEME_ID {
+        return Err(ProofError::InvalidProof);
+    }
     if node.input_data.first() != Some(&F::from_usize(ED25519_NODE_FLAG)) { return Err(ProofError::InvalidProof); }
     let claim = rebuild_bytecode_claim(node.bytecode_claim.point.clone()).map_err(|_| ProofError::InvalidProof)?;
     let flat = flatten_bytecode_claim(&claim);
@@ -337,7 +351,7 @@ pub(crate) fn prove_node_from_verified(profile: &Profile, verified: Vec<InnerVer
     let witness = ExecutionWitness { preamble_memory_len: PREAMBLE_MEMORY_LEN, hints, min_table_log_n_rows: Default::default() };
     drop(hints_span);
     let proof = prove_execution_with_profile(profile, bytecode, &public_input, &witness, &default_whir_config(log_inv_rate), vm_profiler()).map_err(|e| format!("{e:?}"))?;
-    Ok(Ed25519NodeProof { input_data, bytecode_claim: reduced.final_claim, shape, proof })
+    Ok(Ed25519NodeProof { scheme_id: ED25519_SCHEME_ID, input_data, bytecode_claim: reduced.final_claim, shape, proof })
 }
 
 #[cfg(test)]
@@ -423,14 +437,16 @@ mod tests {
         let top = prove_ed25519_top(&[Ed25519Child::Node(&a), Ed25519Child::Node(&b)], 1).expect("top node");
         println!("tree 4 leaves → 2 nodes → top: {:.1} s (top {} cycles, {} KiB)", t.elapsed().as_secs_f32(), top.proof.metadata.as_ref().map(|m| m.cycles).unwrap_or(0), top.proof.proof.proof_size_fe() * 4 / 1024);
         let per: Vec<&[SigRow]> = (0..4).map(|c| &rows[c * per_leaf..(c + 1) * per_leaf]).collect();
-        let leaf = |k: usize| Statement::Leaf { rows: per[k], seg_index: k, blob_id };
+        let leaf = |k: usize| Statement::Leaf { scheme_id: ED25519_SCHEME_ID, rows: per[k], seg_index: k, blob_id };
         let stmt = vec![Statement::Node(vec![leaf(0), leaf(1)]), Statement::Node(vec![leaf(2), leaf(3)])];
         verify_ed25519_node(&top, &stmt).expect("tree verifies from reader-recomputed digests");
         verify_ed25519_blob_legacy(&top, &rows[..4 * per_leaf], per_leaf, &blob_id).expect("v2 accepts a noncanonical tree");
-        assert!(verify_ed25519_blob(&top, &rows[..4 * per_leaf], per_leaf, &blob_id).is_err(), "v3 rejects noncanonical grouping even for a valid proof");
-        let legacy = crate::ed25519_envelope::tests::encode_v2(&top, 4 * per_leaf, per_leaf, versioned_hash);
-        crate::ed25519_envelope::BlobProofEnvelope::decode(&legacy).unwrap().verify(&rows[..4 * per_leaf], &versioned_hash).expect("noncanonical v2 envelope still verifies");
-        assert!(crate::ed25519_envelope::encode_ed25519_blob(&top, 4 * per_leaf, per_leaf, versioned_hash).is_err(), "v3 writer refuses noncanonical trees");
+        assert!(verify_ed25519_blob(&top, &rows[..4 * per_leaf], per_leaf, &blob_id).is_err(),
+            "v4 rejects noncanonical grouping even for a valid proof"
+        );
+        assert!(crate::ed25519_envelope::encode_ed25519_blob(&top, 4 * per_leaf, per_leaf, versioned_hash).is_err(),
+            "v4 writer refuses noncanonical trees"
+        );
         // subtrees swapped
         let swapped = vec![Statement::Node(vec![leaf(2), leaf(3)]), Statement::Node(vec![leaf(0), leaf(1)])];
         assert!(verify_ed25519_node(&top, &swapped).is_err(), "subtree order must be bound");
@@ -540,7 +556,7 @@ mod tests {
         std::fs::create_dir_all(std::path::Path::new(&out).parent().unwrap()).unwrap();
         std::fs::write(&out, json).unwrap();
         println!("wrote {out}");
-        // Transport v3 does not change the leaf statement/VK. Publish a separate vector carrying
+        // Transport v4 does not change the leaf statement/VK. Publish a separate vector carrying
         // the real one-leaf envelope (including proof bytes) and deterministic topology cases.
         let envelope = crate::ed25519_envelope::encode_ed25519_blob(&node, seg.len(), seg.len(), vh).unwrap();
         let tree_cases: Vec<_> = [1, 16, 64, 65, 256, 257, 769, 1025].iter().map(|&n| {
@@ -553,10 +569,11 @@ mod tests {
             }
             serde_json::json!({ "n_rows": n, "leaf_size": 16, "level_widths": layout.level_widths(), "n_inner_nodes": layout.n_inner_nodes(), "shape": shape_json(&layout.statements(&rows[..n], &blob_id).unwrap()) })
         }).collect();
-        let path = std::path::Path::new(&out).with_file_name("envelope-v3.json");
+        let path = std::path::Path::new(&out).with_file_name("envelope-v4.json");
         let vectors = serde_json::json!({
-            "contract": "docs/zk-reader-contract.md v2, envelope v3",
+            "contract": "docs/zk-reader-contract.md leaf v2, envelope v4",
             "note": "Real one-leaf proof; claim cells are canonical integers, postcard varints. Proof cells are fixed-width canonical little-endian. Inner claims are in depth-first pre-order; topology cases below cover uneven and multilevel trees.",
+            "scheme_id": ED25519_SCHEME_ID, "vk_id": hex(&crate::verifier_artifact::vk_id()),
             "vk_bytecode_hash": bytecode.hash().iter().map(|c| c.as_canonical_u32()).collect::<Vec<_>>(),
             "blob_id": hex(&vh), "leaf_size": seg.len(), "n_rows": seg.len(),
             "top_point": point_cells.iter().map(|c| c.as_canonical_u32()).collect::<Vec<_>>(),

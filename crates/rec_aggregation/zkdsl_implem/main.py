@@ -92,7 +92,7 @@ def main():
         meta = data_buf + ED_LEAF_META_OFFSET
         assert meta[0] == n_seg
         assert meta[2] == ED25519_LEAF_VERSION
-        assert meta[3] == 0
+        assert meta[3] == ED25519_SCHEME_ID_PLACEHOLDER  # named leaf scheme; currently zero
         assert meta[13] == 0
         assert meta[14] == 0
         assert meta[15] == 0

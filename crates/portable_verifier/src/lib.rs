@@ -90,7 +90,8 @@ pub unsafe extern "C" fn fb_verify(
         let bytes = unsafe { std::slice::from_raw_parts(envelope, envelope_len) };
         let id: &[u8; 32] = unsafe { &*blob_id.cast() };
         let env = match BlobProofEnvelope::decode(bytes) { Ok(e) => e, Err(_) => return 1 };
-        if env.version != 3 || env.check_statement(rows_len / 52, id).is_err() { return 1; }
+        if env.version != rec_aggregation::ed25519_envelope::ENVELOPE_VERSION
+            || env.check_statement(rows_len / 52, id).is_err() { return 1; }
         let rows = unsafe { std::slice::from_raw_parts(rows, rows_len) }.chunks_exact(52)
             .map(|r| SigRow { pubkey: r[..32].try_into().unwrap(), digest: r[32..].try_into().unwrap(), sig: [0; 64] })
             .collect::<Vec<_>>();

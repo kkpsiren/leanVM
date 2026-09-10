@@ -1,3 +1,10 @@
+This is the maintained Farcaster ed25519 prover fork. It follows Farcaster's current signing
+method while retaining our own prover implementation. The named leaf statement is
+`farcaster-ed25519-blake3-20-air-v1` (scheme ID 0); envelope v4 carries that ID and the VK hash.
+The future signature seam is the leaf-to-recursion-digest boundary. Unknown schemes are rejected;
+no second scheme or negotiation system is implemented. See the sibling farcaster-blobs
+`docs/round8-reader.md` for the wire and reader contract.
+
 <h1 align="center">leanVM</h1>
 
 <p align="center">

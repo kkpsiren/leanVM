@@ -3,7 +3,7 @@
 //! Group consecutive children by four at every level, including a short (even unary) last group.
 //! Never promote a leftover child. Always wrap the final level in a published top node.
 use backend::Evaluation;
-use lean_prover::ed25519_leaf::{MAX_LEAF_SIGS, SigRow};
+use lean_prover::ed25519_leaf::{ED25519_SCHEME_ID, MAX_LEAF_SIGS, SigRow};
 use lean_vm::{EF, F};
 
 use crate::ed25519::{NODE_FAN_IN, NodeShape, Statement};
@@ -12,6 +12,7 @@ pub const MAX_BLOB_TREE_DEPTH: usize = 16;
 
 #[derive(Debug, Clone)]
 pub struct BlobTreeLayout {
+    pub scheme_id: u32,
     pub n_rows: usize,
     pub leaf_size: usize,
     // Width of each level below the published top, starting with the leaves.
@@ -20,6 +21,13 @@ pub struct BlobTreeLayout {
 
 impl BlobTreeLayout {
     pub fn new(n_rows: usize, leaf_size: usize) -> Result<Self, String> {
+        Self::for_scheme(ED25519_SCHEME_ID, n_rows, leaf_size)
+    }
+
+    pub fn for_scheme(scheme_id: u32, n_rows: usize, leaf_size: usize) -> Result<Self, String> {
+        if scheme_id != ED25519_SCHEME_ID {
+            return Err(format!("unsupported leaf scheme {scheme_id}"));
+        }
         if n_rows == 0 || n_rows > u32::MAX as usize {
             return Err("row count must be 1..=u32::MAX".into());
         }
@@ -38,6 +46,7 @@ impl BlobTreeLayout {
             return Err("tree is too deep".into());
         }
         Ok(Self {
+            scheme_id,
             n_rows,
             leaf_size,
             widths,
@@ -122,6 +131,9 @@ impl BlobTreeLayout {
 
     /// The statement is derived solely from the reader's rows, segmentation and blob identifier.
     pub fn statements<'a>(&self, rows: &'a [SigRow], blob_id: &[F; 9]) -> Result<Vec<Statement<'a>>, String> {
+        if self.scheme_id != ED25519_SCHEME_ID {
+            return Err("unsupported leaf scheme".into());
+        }
         if rows.len() != self.n_rows {
             return Err("row count differs from layout".into());
         }
@@ -135,6 +147,7 @@ impl BlobTreeLayout {
             if level == 0 {
                 let start = i * layout.leaf_size;
                 return Statement::Leaf {
+                    scheme_id: layout.scheme_id,
                     rows: &rows[start..(start + layout.leaf_size).min(rows.len())],
                     seg_index: i,
                     blob_id: *blob_id,
@@ -157,6 +170,36 @@ impl BlobTreeLayout {
 mod tests {
     use super::*;
     use backend::*;
+
+    #[test]
+    fn leaf_scheme_is_explicit_and_unknown_schemes_fail_before_vk_initialization() {
+        use crate::ed25519::expected_digest;
+        use lean_prover::ed25519_leaf::leaf_meta;
+        assert!(BlobTreeLayout::for_scheme(1, 1, 1).is_err());
+        let rows = [SigRow {
+            pubkey: [0; 32],
+            digest: [0; 20],
+            sig: [0; 64],
+        }];
+        let layout = BlobTreeLayout::for_scheme(ED25519_SCHEME_ID, 1, 1).unwrap();
+        let stmts = layout.statements(&rows, &[F::ZERO; 9]).unwrap();
+        assert!(matches!(
+            stmts[0],
+            Statement::Leaf {
+                scheme_id: ED25519_SCHEME_ID,
+                ..
+            }
+        ));
+        let unknown = Statement::Leaf {
+            scheme_id: 1,
+            rows: &rows,
+            seg_index: 0,
+            blob_id: [F::ZERO; 9],
+        };
+        assert!(expected_digest(&unknown, &NodeShape::Leaf).is_err());
+        let meta = leaf_meta(1, 0, &[F::ZERO; 9]);
+        assert_eq!(meta[3], F::ZERO); // Existing preimage unchanged; zero now explicitly names the scheme.
+    }
 
     #[test]
     fn canonical_boundaries_and_claim_order() {

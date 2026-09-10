@@ -8,9 +8,9 @@
 //! rows.json = the blob's signed messages IN BLOB ORDER: `[{"signer": hex32, "digest": hex20,
 //! "sig": hex64}, …]`. `sig` is needed to prove and ignored to verify (a reader has no signatures:
 //! that is the point). `--blob-id` is the blob's KZG versioned hash (docs/zk-reader-contract.md §5).
-//! The proof file is the envelope of docs/zk-reader-contract.md §10 (postcard): version, leaf size,
+//! The proof file is the envelope of docs/zk-reader-contract.md §10 (postcard): version, leaf scheme, VK identifier, leaf size,
 //! row count, blob id, top bytecode-claim point, canonical pre-order inner claims, and the top
-//! proof (terminal profile). Writers emit v3; readers also accept v2. Verification needs the rows, the blob
+//! proof (terminal profile). Writers and readers use v4; pre-mainnet v2/v3 are rejected. Verification needs the rows, the blob
 //! id, the leaf size (in the envelope) and the proof — nothing from the prover is trusted.
 
 use lean_prover::ed25519_leaf::{SigRow, blob_id_cells};
@@ -97,6 +97,7 @@ fn run() -> Result<(), String> {
             let path = arg(&args, "--proof").ok_or("--proof")?;
             let bytes = read_envelope(&path)?;
             let env = BlobProofEnvelope::decode(&bytes)?;
+            println!("leaf scheme {} ({}), vk {}", env.scheme_id, lean_prover::ed25519_leaf::ED25519_SCHEME_NAME, hexs(&env.vk_id));
             let proof: backend::Proof<lean_vm::F> = backend::Proof::from_bytes(&env.proof_bytes).map_err(|e| format!("bad proof bytes: {e}"))?;
             println!("envelope v{}: blob 0x{}, {} rows, leaf size {}, {} leaves, {} inner nodes, proof {} field elements ({} KiB), file {} bytes ({} KiB)", env.version, hexs(&env.blob_id), env.n_rows, env.leaf_size, env.n_leaves, env.n_inner_nodes, proof.proof_size_fe(), proof.proof_size_fe() * 4 / 1024, bytes.len(), bytes.len() / 1024);
             Ok(())

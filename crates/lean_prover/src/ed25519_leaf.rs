@@ -6,7 +6,7 @@
 //!   packed cells: 32 bytes → 11 cells of 3 bytes (little-endian, last cell 2 bytes); 20 bytes → 7 cells.
 //!   root_seg = chain over IV_ROOT=[DOMAIN_ROOT,0…] ‖ [n,0…], then per signature the 3 chunks
 //!             [A0..A7], [A8,A9,A10,D0..D4], [D5,D6,0×6] of (A packed 11 ‖ digest packed 7).
-//!   meta     = [n_seg, seg_index, version, 0 (H_excl, excl = ∅), blob_id0..3] ‖ [blob_id4..8, 0×3]
+//!   meta     = [n_seg, seg_index, version, scheme_id (ed25519 = 0), blob_id0..3] ‖ [blob_id4..8, 0×3]
 //!              (16 cells; blob_id = nine 30-bit chunks of the 32-byte versioned hash, all 256 bits — v2)
 //!   H_leaf   = step(P(root_seg ‖ meta[0..8]), meta[8..16])[8..16]  = the 8-cell public input.
 //!   ctx      = chain over IV_CTX=[DOMAIN_CTX,0…] ‖ root_seg, then meta, then per signature the 3 chunks
@@ -32,6 +32,11 @@ pub const DOMAIN_ROOT: usize = 7002;
 pub const DOMAIN_CTX: usize = 7001;
 pub const DOMAIN_RHO: usize = 7003;
 pub const LEAF_VERSION: usize = 2;
+/// One named leaf statement: Farcaster ed25519 / blake3-20, AIR leaf v2. This identifies
+/// the whole leaf predicate, not an independently swappable crypto plugin. ID zero uses
+/// the formerly reserved zero meta cell; the current preimage and VK do not change.
+pub const ED25519_SCHEME_ID: u32 = 0;
+pub const ED25519_SCHEME_NAME: &str = "farcaster-ed25519-blake3-20-air-v1";
 /// Largest leaf that is guaranteed to fit the table caps for ANY signer diversity. EdAdd binds:
 /// worst-case rows 39·N + 26,926 (G = N distinct signers) must stay under 2^17; SHA-512 (21·N) under
 /// 2^16 is looser. Raising this needs EdAdd log 19 / SHA log 17 in MAX_LOG_N_ROWS_PER_TABLE.
@@ -57,9 +62,9 @@ fn rate(state: &[F; 16]) -> [F; 8] { state[8..].try_into().unwrap() }
 pub fn pack11(b: &[u8]) -> [F; 11] { let mut o = [F::ZERO; 11]; for k in 0..10 { o[k] = f(b[3 * k] as usize + 256 * b[3 * k + 1] as usize + 65536 * b[3 * k + 2] as usize); } o[10] = f(b[30] as usize + 256 * b[31] as usize); o }
 pub fn pack7(b: &[u8]) -> [F; 7] { let mut o = [F::ZERO; 7]; for k in 0..6 { o[k] = f(b[3 * k] as usize + 256 * b[3 * k + 1] as usize + 65536 * b[3 * k + 2] as usize); } o[6] = f(b[18] as usize + 256 * b[19] as usize); o }
 
-/// meta = [n_seg, seg_index, version, 0, blob_id0..3] ‖ [blob_id4..8, 0, 0, 0] (two 8-cell blocks)
+/// meta = [n_seg, seg_index, version, scheme_id, blob_id0..3] ‖ [blob_id4..8, 0, 0, 0] (two 8-cell blocks)
 pub fn leaf_meta(n_seg: usize, seg_index: usize, blob_id: &[F; 9]) -> [F; 16] {
-    [f(n_seg), f(seg_index), f(LEAF_VERSION), F::ZERO, blob_id[0], blob_id[1], blob_id[2], blob_id[3], blob_id[4], blob_id[5], blob_id[6], blob_id[7], blob_id[8], F::ZERO, F::ZERO, F::ZERO]
+    [f(n_seg), f(seg_index), f(LEAF_VERSION), F::from_u32(ED25519_SCHEME_ID), blob_id[0], blob_id[1], blob_id[2], blob_id[3], blob_id[4], blob_id[5], blob_id[6], blob_id[7], blob_id[8], F::ZERO, F::ZERO, F::ZERO]
 }
 fn meta_blocks(meta: &[F; 16]) -> ([F; 8], [F; 8]) { (meta[..8].try_into().unwrap(), meta[8..].try_into().unwrap()) }
 

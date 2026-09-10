@@ -619,6 +619,10 @@ fn build_replacements(log_inner_bytecode: usize, bytecode_zero_eval: F) -> BTree
     replacements.insert("MAX_RECURSIONS_PLACEHOLDER".to_string(), MAX_RECURSIONS.to_string());
     replacements.insert("ED25519_LEAF_FLAG_PLACEHOLDER".to_string(), ED25519_LEAF_FLAG.to_string());
     replacements.insert("ED25519_NODE_FLAG_PLACEHOLDER".to_string(), ED25519_NODE_FLAG.to_string());
+    replacements.insert(
+        "ED25519_SCHEME_ID_PLACEHOLDER".to_string(),
+        lean_prover::ed25519_leaf::ED25519_SCHEME_ID.to_string(),
+    );
     replacements.insert("ED25519_LEAF_VERSION_PLACEHOLDER".to_string(), lean_prover::ed25519_leaf::LEAF_VERSION.to_string());
     for (k, v) in lean_prover::ed25519_leaf::leaf_program_replacements() { replacements.insert(k, v); }
 
