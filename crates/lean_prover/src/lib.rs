@@ -15,8 +15,13 @@ mod test_zkvm;
 
 use trace_gen::*;
 
-// Right now, hash digests = 8 koala-bear (p = 2^31 - 2^24 + 1, i.e. ≈ 31 bits per field element)
-pub const SECURITY_BITS: usize = 124; // TODO 128 bits security
+// Declared LogUp budget at the supported table maxima. The exact fraction count gives
+// 123.46 bits for that term; see sub_protocols/tests/soundness_logup.rs. This is a
+// component budget, not a new composition/Fiat-Shamir security proof.
+pub const SECURITY_BITS: usize = 123;
+// Preserve the existing WHIR parameters and all recursive proofs/VK artifacts. Reducing
+// this target would change query counts and require regenerated recursion bytecode/pins.
+pub const WHIR_SECURITY_BITS: usize = 124;
 
 pub const GRINDING_BITS: usize = 16;
 pub const MAX_NUM_VARIABLES_TO_SEND_COEFFS: usize = 8;
@@ -57,7 +62,7 @@ pub fn default_whir_config(starting_log_inv_rate: usize) -> WhirConfigBuilder {
         pow_bits: GRINDING_BITS,
         max_num_variables_to_send_coeffs: MAX_NUM_VARIABLES_TO_SEND_COEFFS,
         rs_domain_initial_reduction_factor: RS_DOMAIN_INITIAL_REDUCTION_FACTOR,
-        security_level: SECURITY_BITS,
+        security_level: WHIR_SECURITY_BITS,
         starting_log_inv_rate,
     }
 }

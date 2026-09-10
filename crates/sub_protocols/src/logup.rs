@@ -50,7 +50,7 @@ pub fn prove_generic_logup(
     let tables_log_heights = traces.iter().map(|(table, trace)| (*table, trace.log_n_rows)).collect();
     let tables_log_heights_sorted = sort_tables_by_height(&tables_log_heights);
 
-    let total_active_len = compute_total_active_len(
+    let total_active_len = compute_total_logup_length(
         log2_strict_usize(memory.len()),
         log_bytecode,
         &tables_log_heights_sorted,
@@ -584,13 +584,16 @@ pub fn compute_total_logup_log_size(
     log_bytecode: usize,
     tables_heights_sorted: &[(Table, VarCount)],
 ) -> VarCount {
-    log2_ceil_usize(compute_total_active_len(
+    log2_ceil_usize(compute_total_logup_length(
         log_memory,
         log_bytecode,
         tables_heights_sorted,
     ))
 }
-fn compute_total_active_len(
+/// Number of LogUp fraction slots before GKR power-of-two padding. Includes the
+/// bytecode/range alignment slots (zero/one fractions), so it also bounds the number
+/// of nonconstant denominators used in the LogUp rational identity.
+pub fn compute_total_logup_length(
     log_memory: usize,
     log_bytecode: usize,
     tables_heights_sorted: &[(Table, VarCount)],

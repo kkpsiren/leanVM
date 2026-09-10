@@ -290,6 +290,7 @@ pub fn prove_ed25519_top(children: &[Ed25519Child<'_>], log_inv_rate: usize) -> 
 
 pub fn prove_ed25519_node_with(profile: &Profile, children: &[Ed25519Child<'_>], log_inv_rate: usize) -> Result<Ed25519NodeProof, String> {
     if children.is_empty() || children.len() > MAX_RECURSIONS { return Err(format!("node: 1..={MAX_RECURSIONS} children")); }
+    let verify_span = prover_profile_span("node_verify_children", "all");
     let mut verified = Vec::with_capacity(children.len());
     let mut shape = Vec::with_capacity(children.len());
     for (i, child) in children.iter().enumerate() {
@@ -298,6 +299,7 @@ pub fn prove_ed25519_node_with(profile: &Profile, children: &[Ed25519Child<'_>],
             Ed25519Child::Node(n) => { verified.push(verify_ed25519_node_self(n).map_err(|e| format!("child {i} (node): {e:?}"))?); shape.push(NodeShape::Node { claim: n.bytecode_claim.clone(), children: n.shape.clone() }); }
         }
     }
+    drop(verify_span);
     prove_node_from_verified(profile, verified, shape, log_inv_rate)
 }
 
@@ -306,6 +308,7 @@ pub fn prove_ed25519_node_with(profile: &Profile, children: &[Ed25519Child<'_>],
 /// the FULL profile (their transcripts are re-verified in-circuit by the full-set recursion program);
 /// `profile` is the profile of THIS node's proof.
 pub(crate) fn prove_node_from_verified(profile: &Profile, verified: Vec<InnerVerified>, shape: Vec<NodeShape>, log_inv_rate: usize) -> Result<Ed25519NodeProof, String> {
+    let hints_span = prover_profile_span("node_hints", "all");
     if verified.len() != shape.len() || verified.is_empty() || verified.len() > MAX_RECURSIONS { return Err("node: children and shape must match, 1..=MAX_RECURSIONS".into()); }
     for v in &verified { assert_eq!(v.sorted_table_perm.len(), N_TABLES, "a child must be a full-profile proof"); }
     let bytecode = get_aggregation_bytecode();
@@ -332,6 +335,7 @@ pub(crate) fn prove_node_from_verified(profile: &Profile, verified: Vec<InnerVer
     hints.insert(bytecode, "merkle_path", merkle_path_blobs);
     hints.insert(bytecode, "bytecode_sumcheck_proof", arena_vec![ArenaVec::from_slice(&reduced.sumcheck_transcript)]);
     let witness = ExecutionWitness { preamble_memory_len: PREAMBLE_MEMORY_LEN, hints, min_table_log_n_rows: Default::default() };
+    drop(hints_span);
     let proof = prove_execution_with_profile(profile, bytecode, &public_input, &witness, &default_whir_config(log_inv_rate), vm_profiler()).map_err(|e| format!("{e:?}"))?;
     Ok(Ed25519NodeProof { input_data, bytecode_claim: reduced.final_claim, shape, proof })
 }

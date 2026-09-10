@@ -103,7 +103,7 @@ a prover's instruction cache.
 
 ### snark
 
-≈ 124 bits of provable security, given by Johnson bound + degree 5 extension of koala-bear. (128 bits requires bigger hash digests (8 koalabears ≈ 248 bits) -> TODO). In the benchmarks, we also display performance with conjectured security, even though leanVM targets the proven regime by default.
+The declared LogUp component budget is **123 bits** at the supported table maxima (derived bound 123.463485326 bits). WHIR retains its **124-bit configuration target**, using JohnsonBound and the quintic KoalaBear extension, so existing proof parameters and recursion/VK artifacts remain compatible. These component budgets are not a new composed or Fiat-Shamir security proof. `sub_protocols/tests/soundness_logup.rs` checks the exact fraction count against the exact field order; `EF::bits()` rounds up and is not entropy. The earlier blanket 124-bit claim was unsupported at the declared maxima. The separately documented XMSS/hash widths below have not changed. Conjectured-security benchmarks remain explicitly distinct from the default JohnsonBound configuration.
 
 ### XMSS
 
