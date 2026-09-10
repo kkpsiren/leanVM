@@ -1,0 +1,42 @@
+{
+  "profile": "Farcaster AIR leaf-v2: non-small-order, torsion-free, canonical R, raw A challenge",
+  "note": "Public algebraic test fixtures. ZIP-215 accepts every row; the AIR profile rejects torsion.",
+  "rows": [
+    {
+      "name": "prime-order",
+      "data": "0801100718642001",
+      "digest": "df0641fd11119b25478d6aab0bd58274260f9425",
+      "signer": "5866666666666666666666666666666666666666666666666666666666666666",
+      "signature": "c9a3f86aae465f0e56513864510f3997561fa2c9e85ea21dc2292309f3cd60224a193656568ea44b228bda6a14312bb97be5891a17472b6a6d2ddf788536b406",
+      "accepted": true,
+      "zip215": true
+    },
+    {
+      "name": "torsion-A",
+      "data": "0801100718642001",
+      "digest": "df0641fd11119b25478d6aab0bd58274260f9425",
+      "signer": "9599999999999999999999999999999999999999999999999999999999999999",
+      "signature": "c9a3f86aae465f0e56513864510f3997561fa2c9e85ea21dc2292309f3cd6022f156888e20059a68b99196341ad0a618cc9a9e4f7526067b919d7be718226f0c",
+      "accepted": false,
+      "zip215": true
+    },
+    {
+      "name": "torsion-R",
+      "data": "0801100718642001",
+      "digest": "df0641fd11119b25478d6aab0bd58274260f9425",
+      "signer": "5866666666666666666666666666666666666666666666666666666666666666",
+      "signature": "245c079551b9a0f1a9aec79baef0c668a9e05d3617a15de23dd6dcf60c329fddfcd1803055fa373e18cfcc62b02e02174a7c153cedb0eded23bd6a0e722a1406",
+      "accepted": false,
+      "zip215": true
+    },
+    {
+      "name": "torsion-A-and-R",
+      "data": "0801100718642001",
+      "digest": "df0641fd11119b25478d6aab0bd58274260f9425",
+      "signer": "9599999999999999999999999999999999999999999999999999999999999999",
+      "signature": "245c079551b9a0f1a9aec79baef0c668a9e05d3617a15de23dd6dcf60c329fdd1759892f62e07e24ce2354a71c9d0e9c3564e286efffb7b4ac79a2a6de6a070e",
+      "accepted": false,
+      "zip215": true
+    }
+  ]
+}

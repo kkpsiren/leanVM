@@ -22,6 +22,8 @@ pub const SECURITY_BITS: usize = 123;
 // Preserve the existing WHIR parameters and all recursive proofs/VK artifacts. Reducing
 // this target would change query counts and require regenerated recursion bytecode/pins.
 pub const WHIR_SECURITY_BITS: usize = 124;
+/// Exposed so a release consumer can reject this feature even when enabled transitively.
+pub const PROX_GAPS_CONJECTURE: bool = cfg!(feature = "prox-gaps-conjecture");
 
 pub const GRINDING_BITS: usize = 16;
 pub const MAX_NUM_VARIABLES_TO_SEND_COEFFS: usize = 8;
@@ -54,7 +56,7 @@ pub fn default_whir_config(starting_log_inv_rate: usize) -> WhirConfigBuilder {
     assert!(starting_log_inv_rate <= MAX_WHIR_LOG_INV_RATE);
     WhirConfigBuilder {
         folding_factor: FoldingFactor::new(WHIR_INITIAL_FOLDING_FACTOR, WHIR_SUBSEQUENT_FOLDING_FACTOR),
-        soundness_type: if cfg!(feature = "prox-gaps-conjecture") {
+        soundness_type: if PROX_GAPS_CONJECTURE {
             SecurityAssumption::CapacityBound // TODO update formula with State of the Art Conjecture
         } else {
             SecurityAssumption::JohnsonBound

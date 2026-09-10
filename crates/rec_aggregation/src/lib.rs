@@ -1,4 +1,8 @@
 #![cfg_attr(not(test), allow(unused_crate_dependencies))]
+// Existing envelopes and release pins have no soundness-profile discriminator. Refuse a
+// different assumption, including Cargo feature unification through another dependency.
+const _: () = assert!(!lean_prover::PROX_GAPS_CONJECTURE,
+    "rec_aggregation release envelopes require JohnsonBound; prox-gaps-conjecture has no wire identity");
 pub mod benchmark;
 mod bytecode_claims;
 pub mod ed25519;

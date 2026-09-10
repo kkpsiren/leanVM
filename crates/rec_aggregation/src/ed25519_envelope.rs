@@ -60,6 +60,34 @@ pub struct BlobProofEnvelope {
 pub(crate) mod tests {
     use super::*;
 
+    #[test]
+    fn release_profile_is_johnson_bound() {
+        assert!(!lean_prover::PROX_GAPS_CONJECTURE);
+        assert!(matches!(lean_prover::default_whir_config(1).soundness_type,
+            backend::SecurityAssumption::JohnsonBound));
+    }
+
+    #[test]
+    fn signature_profile_rejects_torsion_before_proving() {
+        use lean_prover::ed25519_leaf::{SigRow, leaf_hint_buffers};
+        let fixture: serde_json::Value = serde_json::from_str(include_str!("../test-vectors/ed25519-profile.json")).unwrap();
+        let hex = |s: &str| -> Vec<u8> { (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect() };
+        for v in fixture["rows"].as_array().unwrap() {
+            let row = SigRow {
+                pubkey: hex(v["signer"].as_str().unwrap()).try_into().unwrap(),
+                digest: hex(v["digest"].as_str().unwrap()).try_into().unwrap(),
+                sig: hex(v["signature"].as_str().unwrap()).try_into().unwrap(),
+            };
+            let result = leaf_hint_buffers(&[row], 0, &[F::ZERO; 9]);
+            if v["accepted"].as_bool().unwrap() {
+                assert!(result.is_ok(), "{}", v["name"]);
+            } else {
+                assert!(result.unwrap_err().contains("torsion component"), "{}", v["name"]);
+            }
+        }
+        // This is witness-profile preflight, not a proof-verification or soundness test.
+    }
+
     // Frozen v2 field order and serde cell representation, retained only to exercise compatibility.
     #[derive(Serialize)]
     struct ShapeV2 {

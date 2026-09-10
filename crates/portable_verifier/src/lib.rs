@@ -4,10 +4,9 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
 use lean_prover::ed25519_leaf::SigRow;
 use rec_aggregation::{ed25519_envelope::BlobProofEnvelope, init_aggregation_bytecode_pinned};
+use rec_aggregation::verifier_artifact::VK_HASH;
 
 const MAX_BUFFER: usize = 32 * 1024 * 1024;
-const VK_HASH: [u32; 8] = [1153961582, 1250141101, 1638904970, 1982146112,
-    763994888, 2126617202, 1686598344, 1973457087];
 static READY: AtomicBool = AtomicBool::new(false);
 static POISONED: AtomicBool = AtomicBool::new(false);
 static LIVE: AtomicUsize = AtomicUsize::new(0);
