@@ -12,7 +12,7 @@
 //!   ctx      = chain over IV_CTX=[DOMAIN_CTX,0…] ‖ root_seg, then meta, then per signature the 3 chunks
 //!             [R0..R7], [R8,R9,R10,s0..s4], [s5..s10,0,0] of (R packed 11 ‖ s packed 11) — R and s are
 //!             absorbed before ρ (spec §5, F2).
-//!   ρ_i      = P(ctx ‖ [i, DOMAIN_RHO, 0×6])[8..12]  (4 cells, 124 bits, read by scalar_l).
+//!   ρ_i      = P(ctx ‖ [i, DOMAIN_RHO, 0×6])[8..12]  (4 field cells, about 123.955 bits under uniform sampling, read by scalar_l).
 //! Signer groups: hinted start flags; every signature asserts its column key equals its group's key (F8);
 //! per group: ed_decompress(A), ed_sig(Q'_j) with A = 8Q' asserted cell by cell, a K chain, signer_scalar.
 //! The base point record is a constant array in the bytecode (F5).

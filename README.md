@@ -5,6 +5,14 @@ The future signature seam is the leaf-to-recursion-digest boundary. Unknown sche
 no second scheme or negotiation system is implemented. See the sibling farcaster-blobs
 `docs/round8-reader.md` for the wire and reader contract.
 
+Current operator procedure: [the sibling runbook](../../farcaster-blobs/docs/backfill-runbook.md).
+A clone does not contain the generated prover/verifier artifacts or a proof hosting service.
+The benchmarks below are historical upstream XMSS/recursion measurements, not Farcaster archive
+throughput or a resource allowance. Multi-blob publication epochs are not the shipped envelope-v4
+reader. No crate-level Cargo test or build is assumed safe under a 4 GB / 3 minute budget.
+Current proving tests can require substantially more memory; use an explicit operator-approved
+command and bounded measurement. A local proof test does not establish nonzero on-chain registration.
+
 <h1 align="center">leanVM</h1>
 
 <p align="center">
