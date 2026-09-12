@@ -1,7 +1,7 @@
 //! Fresh-process startup measurement, no counting allocator and no proof generation.
 //! legacy/release take an existing full cache file; cached takes a directory containing the
-//! audited release cache under PROVER_CACHE_FILENAME. Never use cached with an unprepared dir:
-//! it exercises the production API, whose normal fallback compiles bytecode.
+//! audited release cache under PROVER_CACHE_FILENAME, written by prepare-prover-cache. The
+//! production API refuses an unprepared directory instead of compiling.
 use backend::PrimeField32;
 use lean_vm::{Bytecode, BytecodeCacheParts};
 use rec_aggregation::{get_aggregation_bytecode, init_aggregation_bytecode_cached,

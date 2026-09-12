@@ -138,37 +138,7 @@ pub(crate) fn leaf_statements<'a>(rows_per_leaf: &[&'a [SigRow]], blob_id: &[F; 
     rows_per_leaf.iter().enumerate().map(|(k, rows)| Statement::Leaf { scheme_id: ED25519_SCHEME_ID, rows, seg_index: k, blob_id: *blob_id }).collect()
 }
 
-/// LEGACY V2 READER API for one blob. `rows` = every decoded signed message of the blob, in blob order;
-/// leaf k = rows[k·S, (k+1)·S). The leaves are assigned to the proof's tree shape in pre-order, so
-/// leaf k always gets seg_index k whatever the shape; a shape with a different number of leaves is
-/// rejected, so every decoded row is covered by exactly one leaf.
-pub fn blob_statement_tree<'a>(rows: &'a [SigRow], leaf_size: usize, blob_id: &[F; 9], shape: &[NodeShape]) -> Result<Vec<Statement<'a>>, ProofError> {
-    if rows.is_empty() || leaf_size == 0 || leaf_size > MAX_LEAF_SIGS { return Err(ProofError::InvalidProof); }
-    let chunks: Vec<&'a [SigRow]> = rows.chunks(leaf_size).collect();
-    const MAX_DEPTH: usize = 16; // an attacker-chosen shape must not drive the reader's recursion
-    fn build<'a>(shape: &NodeShape, chunks: &[&'a [SigRow]], next: &mut usize, blob_id: &[F; 9], depth: usize) -> Result<Statement<'a>, ProofError> {
-        if depth > MAX_DEPTH { return Err(ProofError::InvalidProof); }
-        match shape {
-            NodeShape::Leaf => { let k = *next; *next += 1; let rows = *chunks.get(k).ok_or(ProofError::InvalidProof)?; Ok(Statement::Leaf { scheme_id: ED25519_SCHEME_ID, rows, seg_index: k, blob_id: *blob_id }) }
-            NodeShape::Node { children, .. } => {
-                if children.is_empty() || children.len() > MAX_RECURSIONS { return Err(ProofError::InvalidProof); }
-                Ok(Statement::Node(children.iter().map(|c| build(c, chunks, next, blob_id, depth + 1)).collect::<Result<_, _>>()?))
-            }
-        }
-    }
-    if shape.is_empty() || shape.len() > MAX_RECURSIONS { return Err(ProofError::InvalidProof); }
-    let mut next = 0;
-    let stmts = shape.iter().map(|s| build(s, &chunks, &mut next, blob_id, 1)).collect::<Result<Vec<_>, _>>()?;
-    if next != chunks.len() { return Err(ProofError::InvalidProof); }
-    Ok(stmts)
-}
-/// Legacy envelope v2: accepts the bounded, caller-carried tree shape.
-pub fn verify_ed25519_blob_legacy(node: &Ed25519NodeProof, rows: &[SigRow], leaf_size: usize, blob_id: &[F; 9]) -> Result<InnerVerified, ProofError> {
-    let stmts = blob_statement_tree(rows, leaf_size, blob_id, &node.shape)?;
-    verify_ed25519_node(node, &stmts)
-}
-
-/// Verify a whole blob using the canonical fan-in-four tree (envelope v3).
+/// Verify every decoded row of one blob using the canonical fan-in-four tree (envelope v4).
 pub fn verify_ed25519_blob(node: &Ed25519NodeProof, rows: &[SigRow], leaf_size: usize, blob_id: &[F; 9]) -> Result<InnerVerified, ProofError> {
     let layout = BlobTreeLayout::new(rows.len(), leaf_size).map_err(|_| ProofError::InvalidProof)?;
     layout.claims(&node.shape).map_err(|_| ProofError::InvalidProof)?;
@@ -440,7 +410,6 @@ mod tests {
         let leaf = |k: usize| Statement::Leaf { scheme_id: ED25519_SCHEME_ID, rows: per[k], seg_index: k, blob_id };
         let stmt = vec![Statement::Node(vec![leaf(0), leaf(1)]), Statement::Node(vec![leaf(2), leaf(3)])];
         verify_ed25519_node(&top, &stmt).expect("tree verifies from reader-recomputed digests");
-        verify_ed25519_blob_legacy(&top, &rows[..4 * per_leaf], per_leaf, &blob_id).expect("v2 accepts a noncanonical tree");
         assert!(verify_ed25519_blob(&top, &rows[..4 * per_leaf], per_leaf, &blob_id).is_err(),
             "v4 rejects noncanonical grouping even for a valid proof"
         );

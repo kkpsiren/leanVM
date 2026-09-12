@@ -111,8 +111,10 @@ pin. It compares the full execution records and every table field, and independe
 the Poseidon VK hash. Install its output as `prover-bytecode-v1.bin` inside `FB_ZK_CACHE` (default
 `~/.cache/fb-zk`). Startup checks the hardcoded SHA-512 pin before decoding; the stored VK and
 proof protocol are unchanged. Never source the trusted digest from the artifact or a manifest.
-The existing keyed cache/compiler remains a fallback. No verifier-only dictionary can serve as
-a prover's instruction cache.
+There is no fallback: prepare the cache once with
+`cargo run --release -p rec_aggregation --example prepare-prover-cache -- CACHE_DIR` (compiles,
+checks the VK and the SHA-512 pin, installs atomically); proving refuses to start without it.
+No verifier-only dictionary can serve as a prover's instruction cache.
 
 ## Security
 

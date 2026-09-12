@@ -105,8 +105,8 @@ fn run() -> Result<(), String> {
         _ => Err("usage: fb-zk prove --rows rows.json --blob-id <hex32> --out proof.bin [--leaf-size N] [--leaf-rate R] [--top-rate R]\n       fb-zk verify --rows rows.json --blob-id <hex32> --proof proof.bin\n       fb-zk info --proof proof.bin".into()),
     }
 }
-/// FB_ZK_CACHE, else ~/.cache/fb-zk. An audited prover-bytecode-v1.bin is preferred; otherwise
-/// compiled recursion bytecode is cached under the executable/source key.
+/// FB_ZK_CACHE, else ~/.cache/fb-zk. Must hold the authenticated prover-bytecode-v1.bin written by
+/// the prepare-prover-cache example; nothing is compiled or cached implicitly.
 fn cache_dir() -> std::path::PathBuf {
     if let Ok(d) = std::env::var("FB_ZK_CACHE") { return d.into(); }
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());

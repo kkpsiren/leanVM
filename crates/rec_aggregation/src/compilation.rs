@@ -51,38 +51,15 @@ pub fn init_aggregation_bytecode() {
     BYTECODE.get_or_init(compile_main_program_self_referential);
 }
 
-/// Prefer the authenticated full release cache at `PROVER_CACHE_FILENAME`, independent of the
-/// executable's cache key. Otherwise use the existing executable/source-keyed cache or compiler.
-/// Exact pinned release bytes skip Poseidon; other legacy caches still compute their table hash.
-/// Returns whether the cache was hit.
+/// Load only an explicitly prepared, authenticated release prover cache. No implicit compilation.
 pub fn init_aggregation_bytecode_cached(cache_dir: &std::path::Path) -> bool {
     if BYTECODE.get().is_some() { return true; }
-    if let Ok(bytes) = read_cache_bounded(&cache_dir.join(crate::prover_artifact::PROVER_CACHE_FILENAME)) {
-        if let Ok(bc) = crate::prover_artifact::load_prover_cache(&bytes) {
-            let _ = BYTECODE.set(bc);
-            return true;
-        }
-    }
-    let key = cache_key();
-    let path = cache_dir.join(format!("aggregation-bytecode-{key:016x}.bin"));
-    if let Ok(bytes) = read_cache_bounded(&path) {
-        if let Ok(bc) = crate::prover_artifact::load_prover_cache(&bytes) {
-            let _ = BYTECODE.set(bc);
-            return true;
-        }
-        if let Ok(parts) = postcard::from_bytes::<lean_vm::BytecodeCacheParts>(&bytes) {
-            let bc = Bytecode::from_cache_parts(parts);
-            let _ = BYTECODE.set(bc);
-            return true;
-        }
-    }
-    init_aggregation_bytecode();
-    if let Ok(bytes) = postcard::to_allocvec(&get_aggregation_bytecode().cache_parts()) {
-        let _ = std::fs::create_dir_all(cache_dir);
-        let tmp = path.with_extension("tmp");
-        if std::fs::write(&tmp, bytes).is_ok() { let _ = std::fs::rename(&tmp, &path); }
-    }
-    false
+    let bytes = read_cache_bounded(&cache_dir.join(crate::prover_artifact::PROVER_CACHE_FILENAME))
+        .expect("prepare and audit the release prover cache explicitly before proving");
+    let bytecode = crate::prover_artifact::load_prover_cache(&bytes)
+        .expect("prover cache must match the release pin");
+    BYTECODE.set(bytecode).unwrap_or_else(|_| panic!("bytecode already initialized"));
+    true
 }
 
 fn read_cache_bounded(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
@@ -96,58 +73,13 @@ fn read_cache_bounded(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
-/// Authenticate a caller-supplied verifier artifact against the trusted release digest, or
-/// authenticate the full release cache, or reconstruct a legacy cache and check its Poseidon hash.
-/// Linkage audits: `export-verifier-artifact` and `audit-prover-cache`. Calls must be serialized.
+/// Portable release loader: only the authenticated dictionary artifact is accepted.
+/// Independent table linkage is checked by the standalone rehash-verifier-artifact command.
 pub fn init_aggregation_bytecode_pinned(bytes: &[u8], expected_hash: [u32; 8]) -> Result<(), String> {
-    init_profile_mark(0);
     if try_get_aggregation_verifier_program().is_some() { return Err("bytecode already initialized".into()); }
-    if bytes.len() > 32 * 1024 * 1024 { return Err("bytecode cache exceeds limit".into()); }
-    if bytes.starts_with(VERIFIER_ARTIFACT_MAGIC) {
-        if expected_hash != crate::verifier_artifact::VK_HASH { return Err("unsupported release pin".into()); }
-        let program = DictionaryProgram::from_pinned_bytes(bytes, &crate::verifier_artifact::ARTIFACT_SHA512, expected_hash)?;
-        let result = VERIFIER_BYTECODE.set(program).map_err(|_| "bytecode already initialized".into());
-        init_profile_mark(6);
-        return result;
-    }
-    if expected_hash == crate::verifier_artifact::VK_HASH {
-        if let Ok(bytecode) = crate::prover_artifact::load_prover_cache(bytes) {
-            let result = BYTECODE.set(bytecode).map_err(|_| "bytecode already initialized".into());
-            init_profile_mark(6);
-            return result;
-        }
-    }
-    let (parts, rest) = postcard::take_from_bytes::<lean_vm::BytecodeCacheParts>(bytes)
-        .map_err(|e| format!("bytecode cache: {e}"))?;
-    init_profile_mark(1);
-    if !rest.is_empty() || parts.code.len() != 1 << 20
-        || parts.unpadded_size > parts.code.len()
-        || parts.debug_info.pc_to_location.len() != parts.code.len() {
-        return Err("invalid pinned bytecode dimensions or trailing bytes".into());
-    }
-    let bytecode = Bytecode::from_cache_parts(parts);
-    if bytecode.hash().map(|f| f.as_canonical_u32()) != expected_hash {
-        return Err("bytecode hash differs from the pinned VK".into());
-    }
-    let result = BYTECODE.set(bytecode).map_err(|_| "bytecode already initialized".into());
-    init_profile_mark(6);
-    result
-}
-
-/// FNV-1a over the executable and embedded zkDSL sources. This is only a cache key: release
-/// bytes are authenticated independently, and other cached bytecode recomputes its table hash.
-fn cache_key() -> u64 {
-    let mut h: u64 = 0xcbf29ce484222325;
-    let mut feed = |bytes: &[u8]| { for &b in bytes { h ^= b as u64; h = h.wrapping_mul(0x100000001b3); } };
-    if let Ok(exe) = std::env::current_exe().and_then(std::fs::read) { feed(&exe); }
-    fn walk(dir: &include_dir::Dir<'_>, feed: &mut dyn FnMut(&[u8])) {
-        let mut files: Vec<_> = dir.files().collect();
-        files.sort_by_key(|f| f.path().to_path_buf());
-        for f in files { feed(f.path().to_string_lossy().as_bytes()); feed(f.contents()); }
-        for d in dir.dirs() { walk(d, feed); }
-    }
-    walk(&EMBEDDED_ZK_DSL, &mut feed);
-    h
+    if expected_hash != crate::verifier_artifact::VK_HASH { return Err("unsupported release pin".into()); }
+    let program = DictionaryProgram::from_pinned_bytes(bytes, &crate::verifier_artifact::ARTIFACT_SHA512, expected_hash)?;
+    VERIFIER_BYTECODE.set(program).map_err(|_| "bytecode already initialized".into())
 }
 
 static EMBEDDED_ZK_DSL: include_dir::Dir<'_> = include_dir::include_dir!("$CARGO_MANIFEST_DIR/zkdsl_implem");

@@ -9,12 +9,14 @@ use crate::verifier_artifact::VK_HASH;
 pub const PROVER_CACHE_FILENAME: &str = "prover-bytecode-v1.bin";
 pub const MAX_PROVER_CACHE_BYTES: usize = 32 * 1024 * 1024;
 
-// Full cache, audited by `audit-prover-cache`. No supplied hash or manifest is trusted.
+// SHA-512 of the deterministic full cache compiled from this crate's embedded zkDSL sources by
+// `prepare-prover-cache` (2026-09-12); `audit-prover-cache` re-derives its Poseidon VK independently.
+// No supplied hash or manifest is trusted.
 pub const PROVER_CACHE_SHA512: [u8; 64] = [
-    65, 103, 36, 130, 241, 30, 123, 110, 175, 215, 25, 38, 72, 139, 89, 249,
-    249, 24, 150, 70, 163, 51, 198, 76, 27, 149, 43, 152, 131, 97, 158, 143,
-    185, 32, 29, 76, 146, 106, 6, 235, 159, 55, 100, 98, 122, 199, 144, 80,
-    147, 32, 78, 156, 117, 232, 251, 124, 253, 158, 52, 253, 0, 247, 222, 146,
+    47, 2, 139, 231, 239, 235, 245, 219, 143, 160, 191, 109, 211, 158, 155, 103,
+    157, 2, 218, 182, 32, 64, 76, 58, 35, 200, 209, 162, 12, 84, 109, 194,
+    234, 90, 38, 157, 56, 150, 75, 241, 53, 31, 185, 187, 211, 189, 131, 72,
+    65, 41, 18, 62, 187, 137, 16, 123, 27, 127, 233, 126, 14, 51, 152, 52,
 ];
 
 /// Authenticate before postcard sees any file-controlled lengths, then derive the dense table
