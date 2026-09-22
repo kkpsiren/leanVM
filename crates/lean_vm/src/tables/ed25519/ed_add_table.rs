@@ -340,26 +340,46 @@ pub fn fill_trace_ed_add(traces: &mut BTreeMap<Table, TableTrace>, memory: &[F],
     };
     let mut buckets: BTreeMap<(usize, usize), Vec<Step>> = BTreeMap::new();
     for (j, b, sgn, ptr) in tuples { assert!(b >= 1 && b <= N_BUCKETS && j < N_WINDOWS, "ed_add: routing tuple out of range"); buckets.entry((j, b)).or_default().push(Step { kind: Kind::Bucket, j, b, sgn, ptr, empty: false, cnt: 0, p: point(ptr, sgn) }); }
-    let mut rows: Vec<[F; N_COLS]> = vec![];
-    let mut totals: BTreeMap<(usize, usize), Affine> = BTreeMap::new();
-    for ((j, b), steps) in &buckets { let (r, total) = chain_rows(steps, zero_ptr, false); rows.extend(r); totals.insert((*j, *b), total); }
-    let mut tj: Vec<Affine> = vec![];
-    for j in 0..N_WINDOWS {
+    // Every bucket chain is independent, and so is every window's red1/red2 pair once the bucket totals
+    // are known: both run across the pool. Each chain is the same pure function of the same steps as
+    // before and the rows are concatenated in the original order (buckets in BTreeMap order, then red1
+    // and red2 per window, then Horner), so the trace is identical cell for cell; only scheduling changed.
+    let bucket_list: Vec<((usize, usize), Vec<Step>)> = buckets.into_iter().collect();
+    let bucket_out: Vec<(Vec<[F; N_COLS]>, Affine)> =
+        parallel::par_map_collect(bucket_list.len(), |i| chain_rows(&bucket_list[i].1, zero_ptr, false));
+    let totals: BTreeMap<(usize, usize), Affine> = bucket_list.iter().zip(&bucket_out).map(|((k, _), (_, t))| (*k, *t)).collect();
+    let window_out: Vec<(Vec<[F; N_COLS]>, Vec<[F; N_COLS]>, Affine)> = parallel::par_map_collect(N_WINDOWS, |j| {
         let mut red1 = vec![]; let mut sb = vec![];
         let mut s = NEUTRAL;
         for b in (1..=N_BUCKETS).rev() { let p = totals.get(&(j, b)).copied(); red1.push(Step { kind: Kind::Red1, j, b, sgn: 0, ptr: 0, empty: p.is_none(), cnt: 0, p: p.unwrap_or(NEUTRAL) }); s = affine_add(&s, &p.unwrap_or(NEUTRAL)); sb.push(s); }
-        let (r, _) = chain_rows(&red1, zero_ptr, false); rows.extend(r);
+        let (r1, _) = chain_rows(&red1, zero_ptr, false);
         let red2: Vec<Step> = (1..=N_BUCKETS).rev().enumerate().map(|(i, b)| Step { kind: Kind::Red2, j, b, sgn: 0, ptr: 0, empty: false, cnt: 0, p: sb[i] }).collect();
-        let (r, t) = chain_rows(&red2, zero_ptr, false); rows.extend(r); tj.push(t);
-    }
+        let (r2, t) = chain_rows(&red2, zero_ptr, false);
+        (r1, r2, t)
+    });
+    let tj: Vec<Affine> = window_out.iter().map(|w| w.2).collect();
     let mut horner = vec![Step { kind: Kind::Horner, j: N_WINDOWS - 1, b: 0, sgn: 0, ptr: 0, empty: false, cnt: 0, p: tj[N_WINDOWS - 1] }];
     let mut acc = tj[N_WINDOWS - 1];
     for j in (0..N_WINDOWS - 1).rev() {
         for cnt in (1..=N_DBL).rev() { horner.push(Step { kind: Kind::Horner, j, b: 0, sgn: 0, ptr: 0, empty: false, cnt, p: acc }); acc = affine_add(&acc, &acc); }
         horner.push(Step { kind: Kind::Horner, j, b: 0, sgn: 0, ptr: 0, empty: false, cnt: 0, p: tj[j] }); acc = affine_add(&acc, &tj[j]);
     }
-    let (r, total) = chain_rows(&horner, zero_ptr, true); rows.extend(r);
+    let (horner_rows, total) = chain_rows(&horner, zero_ptr, true);
     let Some(trace) = traces.get_mut(&Table::ed_add()) else { return total; };
-    for row in &rows { for (i, v) in row.iter().enumerate() { trace.columns[i].push(*v); } }
+    let mut all: Vec<&[F; N_COLS]> = vec![];
+    for (r, _) in &bucket_out { all.extend(r.iter()); }
+    for (r1, r2, _) in &window_out { all.extend(r1.iter()); all.extend(r2.iter()); }
+    all.extend(horner_rows.iter());
+    // Row-major rows into column-major storage: groups of 16 columns (one cache line of F per row) per
+    // task, each column extended exactly as the per-element pushes did.
+    let n = all.len();
+    parallel::par_chunks_mut(&mut trace.columns[..N_COLS], 16, |g, cols| {
+        let c0 = g * 16;
+        for col in cols.iter_mut() { let base = col.len(); col.resize(base + n, F::ZERO); }
+        let bases: Vec<usize> = cols.iter().map(|c| c.len() - n).collect();
+        for (r, row) in all.iter().enumerate() {
+            for (k, col) in cols.iter_mut().enumerate() { col[bases[k] + r] = row[c0 + k]; }
+        }
+    });
     total
 }

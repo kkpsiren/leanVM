@@ -181,9 +181,12 @@ pub fn leaf_hint_buffers(rows_in: &[SigRow], seg_index: usize, blob_id: &[F; 9])
     if n == 0 { return Err("empty leaf".into()); }
     if n > MAX_LEAF_SIGS { return Err(format!("leaf has {n} signatures; the table caps guarantee a fit only up to {MAX_LEAF_SIGS} (see MAX_LEAF_SIGS)")); }
     let inv8 = Scalar::from(8u64).invert();
-    let (mut q, mut s, mut cols, mut gstart, mut qa) = (vec![], vec![], vec![], vec![], vec![]);
-    let mut n_groups = 0;
-    for (i, r) in rows.iter().enumerate() {
+    // Each row's checks and point work are independent (a group start depends only on the previous
+    // row's key), so rows are processed across the pool and assembled in order. The first failing
+    // row by index is reported, with R's checks before A's, exactly as the sequential loop did.
+    struct RowHints { q: [F; 64], s: [F; 32], start: bool, qa: Option<[F; 64]> }
+    let per_row = |i: usize| -> Result<RowHints, String> {
+        let r = &rows[i];
         let s_bytes: [u8; 32] = r.sig[32..].try_into().unwrap();
         let s_opt: Option<Scalar> = Scalar::from_canonical_bytes(s_bytes).into();
         s_opt.ok_or_else(|| format!("signature {i}: s >= L"))?;
@@ -193,19 +196,33 @@ pub fn leaf_hint_buffers(rows_in: &[SigRow], seg_index: usize, blob_id: &[F; 9])
         if !r_pt.is_torsion_free() { return Err(format!("signature {i}: R has a torsion component (dalek verify_strict may accept it; the R = 8·Q certificate cannot)")); }
         let qp = r_pt * inv8;
         let qa_ff = decompress_affine(&qp.compress().to_bytes()).ok_or("Q decode")?;
-        q.extend(cells(&qa_ff.x)); q.extend(cells(&qa_ff.y));
-        s.extend(cells(&s_bytes));
-        cols.extend(cells(&r.pubkey)); cols.extend(cells(&r.digest));
+        let mut q = [F::ZERO; 64];
+        for (k, c) in cells(&qa_ff.x).into_iter().chain(cells(&qa_ff.y)).enumerate() { q[k] = c; }
+        let mut sc = [F::ZERO; 32];
+        for (k, c) in cells(&s_bytes).into_iter().enumerate() { sc[k] = c; }
         let start = i == 0 || rows[i - 1].pubkey != r.pubkey;
-        gstart.push(F::from_bool(start));
-        if start {
-            n_groups += 1;
+        let qa = if start {
             let a_pt = CompressedEdwardsY(r.pubkey).decompress().ok_or_else(|| format!("signer of {i}: A does not decompress"))?;
             if a_pt.is_small_order() { return Err(format!("signer of {i}: A small order")); }
             if !a_pt.is_torsion_free() { return Err(format!("signer of {i}: A has a torsion component (dalek verify_strict may accept it; the A = 8·Q' certificate cannot)")); }
             let qap = decompress_affine(&(a_pt * inv8).compress().to_bytes()).ok_or("Q' decode")?;
-            qa.extend(cells(&qap.x)); qa.extend(cells(&qap.y));
-        } else { qa.extend(std::iter::repeat_n(F::ZERO, 64)); }
+            let mut a = [F::ZERO; 64];
+            for (k, c) in cells(&qap.x).into_iter().chain(cells(&qap.y)).enumerate() { a[k] = c; }
+            Some(a)
+        } else { None };
+        Ok(RowHints { q, s: sc, start, qa })
+    };
+    let per: Vec<Result<RowHints, String>> = if n < 64 || parallel::is_in_pool_task() { (0..n).map(per_row).collect() } else { parallel::par_map_collect(n, per_row) };
+    let (mut q, mut s, mut cols, mut gstart, mut qa) = (Vec::with_capacity(64 * n), Vec::with_capacity(32 * n), vec![], Vec::with_capacity(n), Vec::with_capacity(64 * n));
+    let mut n_groups = 0;
+    for (i, h) in per.into_iter().enumerate() {
+        let h = h?;
+        let r = &rows[i];
+        q.extend_from_slice(&h.q);
+        s.extend_from_slice(&h.s);
+        cols.extend(cells(&r.pubkey)); cols.extend(cells(&r.digest));
+        gstart.push(F::from_bool(h.start));
+        match h.qa { Some(a) => { n_groups += 1; qa.extend_from_slice(&a); } None => qa.extend(std::iter::repeat_n(F::ZERO, 64)) }
     }
     let root = root_seg(&rows);
     let meta = leaf_meta(n, seg_index, blob_id);

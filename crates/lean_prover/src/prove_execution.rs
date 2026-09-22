@@ -160,16 +160,38 @@ pub fn prove_execution_with_profile(
     // Range-section multiplicities: count every range push (One-bus into a range section) per value.
     let range_accs: Vec<Vec<F>> = info_span!("Building range access counts").in_scope(|| {
         let _p = prover_profile_span("range_counts", "all");
-        let mut accs: Vec<Vec<F>> = RANGE_SECTIONS.iter().map(|s| vec![F::ZERO; 1 << s.log_rows]).collect();
+        // Every (section, column) push list is counted into per-worker integer histograms that are
+        // summed at the end. Counts are exact integers far below the field order, so F::from(count)
+        // equals the repeated F::ONE additions of the sequential loop.
+        let mut work: Vec<(usize, &ArenaVec<F>)> = vec![];
         for (table, trace) in &traces {
             for bus in table.bus_interactions() {
                 let Some(s) = bus.range_section() else { continue };
                 let BusData::Column(col) = bus.data[0] else { panic!("range push data must be a column") };
-                let n = 1 << RANGE_SECTIONS[s].log_rows;
-                for v in trace.columns[col].iter() {
-                    let v = v.as_canonical_u32() as usize;
-                    if v < n { accs[s][v] += F::ONE; } // an out-of-range value simply has no matching row: the proof fails
-                }
+                work.push((s, &trace.columns[col]));
+            }
+        }
+        let count_into = |hist: &mut Vec<Vec<u32>>, (s, col): &(usize, &ArenaVec<F>)| {
+            let n = 1usize << RANGE_SECTIONS[*s].log_rows;
+            let h = &mut hist[*s];
+            for v in col.iter() {
+                let v = v.as_canonical_u32() as usize;
+                if v < n { h[v] += 1; } // an out-of-range value simply has no matching row: the proof fails
+            }
+        };
+        let fresh = || -> Vec<Vec<u32>> { RANGE_SECTIONS.iter().map(|s| vec![0u32; 1 << s.log_rows]).collect() };
+        let workers = if backend::parallel::is_in_pool_task() { 1 } else { backend::parallel::num_threads().max(1).min(work.len().max(1)) };
+        let partial: Vec<Vec<Vec<u32>>> = if workers == 1 {
+            let mut h = fresh(); for w in &work { count_into(&mut h, w); } vec![h]
+        } else {
+            backend::parallel::par_map_collect(workers, |g| { let mut h = fresh(); for w in work.iter().skip(g).step_by(workers) { count_into(&mut h, w); } h })
+        };
+        let mut accs: Vec<Vec<F>> = RANGE_SECTIONS.iter().map(|s| vec![F::ZERO; 1 << s.log_rows]).collect();
+        for (sec, acc) in accs.iter_mut().enumerate() {
+            for (v, slot) in acc.iter_mut().enumerate() {
+                let c: u64 = partial.iter().map(|h| h[sec][v] as u64).sum();
+                assert!(c < 2_130_706_433, "range count exceeds the KoalaBear field order");
+                *slot = F::from_usize(c as usize);
             }
         }
         accs
