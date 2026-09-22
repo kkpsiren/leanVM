@@ -7,9 +7,9 @@ use field::PrimeField64;
 use field::integers::QuotientMap;
 use koala_bear::KoalaBearExtension;
 use koala_bear::symmetric::Permutation;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
-use std::{fmt::Debug, sync::Mutex, time::Instant};
+use std::{fmt::Debug, time::Instant};
 use symetric::CAPACITY;
 use symetric::RATE;
 use symetric::WIDTH;
@@ -121,22 +121,24 @@ impl<EF: KoalaBearExtension, P: Permutation<[PF<EF>; WIDTH]> + Permutation<[<PF<
         type Packed<EF> = <PF<EF> as Field>::Packing;
         let lanes = Packed::<EF>::WIDTH;
 
-        let witness_found = Mutex::<Option<PF<EF>>>::new(None);
-        // each batch tests lanes witnesses simultaneously
+        // Deterministic: the result is the SMALLEST valid nonce, which is what a one-thread search
+        // returns. Batches are claimed in increasing order, so once some thread has found a nonce,
+        // any batch that starts at or above it cannot improve on it and is skipped, while every batch
+        // below it is still searched in full. The verifier accepts any valid nonce; this only removes
+        // the run-to-run variation that made proofs differ between otherwise identical runs.
         let num_batches = PF::<EF>::ORDER_U64.div_ceil(lanes as u64);
-
         let next_batch = AtomicU64::new(0);
-        let found = AtomicBool::new(false);
+        let best = AtomicU64::new(u64::MAX);
         parallel::for_each_index(parallel::num_threads(), |_| {
             loop {
-                if found.load(Ordering::Relaxed) {
-                    return;
-                }
                 let batch = next_batch.fetch_add(1, Ordering::Relaxed);
                 if batch >= num_batches {
                     return;
                 }
                 let base = batch * lanes as u64;
+                if base >= best.load(Ordering::Relaxed) {
+                    return;
+                }
 
                 let packed_witnesses = Packed::<EF>::from_fn(|lane| {
                     let candidate = base + lane as u64;
@@ -156,19 +158,18 @@ impl<EF: KoalaBearExtension, P: Permutation<[PF<EF>; WIDTH]> + Permutation<[<PF<
                 self.challenger.permutation.permute_mut(&mut packed_state);
 
                 let samples = packed_state[CAPACITY].as_slice();
-                for (sample, witness) in samples.iter().zip(packed_witnesses.as_slice()) {
+                for (lane, sample) in samples.iter().enumerate() {
                     let rand_usize = sample.as_canonical_u64() as usize;
                     if (rand_usize & ((1 << bits) - 1)) == 0 {
-                        *witness_found.lock().unwrap() = Some(*witness);
-                        found.store(true, Ordering::Relaxed);
+                        best.fetch_min(base + lane as u64, Ordering::Relaxed);
                         return;
                     }
                 }
             }
         });
-        assert!(found.load(Ordering::Relaxed), "failed to find witness");
-
-        let witness = witness_found.lock().unwrap().unwrap();
+        let best = best.load(Ordering::Relaxed);
+        assert!(best != u64::MAX, "failed to find witness");
+        let witness = unsafe { PF::<EF>::from_canonical_unchecked(best) };
 
         self.challenger.observe_many(&[witness]);
         assert!(self.challenger.state[CAPACITY].as_canonical_u64() & ((1 << bits) - 1) == 0);
