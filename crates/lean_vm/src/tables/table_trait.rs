@@ -202,6 +202,10 @@ pub struct TableTrace {
     pub columns: Vec<ArenaVec<F>>,
     pub non_padded_n_rows: usize,
     pub log_n_rows: VarCount,
+    /// Precompile calls whose witness rows are built after execution, in call order: a flat buffer of
+    /// fixed-size call records (the call's pointers and input cells). Only the deferred tables use it
+    /// (ed_sig, sha512); `ed25519::fill_deferred_precompile_traces` turns it into `columns` and empties it.
+    pub deferred_calls: ArenaVec<F>,
 }
 
 impl TableTrace {
@@ -210,6 +214,7 @@ impl TableTrace {
             columns: (0..air.n_columns_total()).map(|_| ArenaVec::new()).collect(),
             non_padded_n_rows: 0, // filled later
             log_n_rows: 0,        // filled later
+            deferred_calls: ArenaVec::new(),
         }
     }
 }

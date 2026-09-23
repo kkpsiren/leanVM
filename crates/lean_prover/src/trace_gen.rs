@@ -149,6 +149,9 @@ pub fn get_execution_trace(
     fill_trace_extension_op(extension_op_trace, &memory_padded);
 
     drop(extension_span);
+    // ed_sig / sha512 rows are built here from the calls recorded during execution (in call order),
+    // before anything reads those traces (fill_trace_ed_add below, pad_table) and outside any pool task.
+    lean_vm::ed25519::fill_deferred_precompile_traces(&mut traces);
     // EdAdd (T3) is a post-pass over the routing tuples of ScalarL/SignerScalar and the point records in memory.
     { let _p = prover_profile_span("trace_fill", "ed_add");
     lean_vm::ed25519::fill_trace_ed_add(&mut traces, &memory_padded, padding_zero_vec_ptr); }
@@ -159,6 +162,7 @@ pub fn get_execution_trace(
             columns: Vec::from(main_trace),
             non_padded_n_rows: n_cycles,
             log_n_rows: log2_ceil_usize(n_cycles),
+            deferred_calls: ArenaVec::new(),
         },
     );
     for table in traces.keys().copied().collect::<Vec<_>>() {

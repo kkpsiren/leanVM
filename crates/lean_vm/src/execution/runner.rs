@@ -126,6 +126,8 @@ impl Trace {
             for (col, new_data) in mine.columns.iter_mut().zip(&other_t.columns) {
                 col.extend_from_slice(new_data);
             }
+            // deferred precompile calls keep call order exactly like the rows they stand for
+            mine.deferred_calls.extend_from_slice(&other_t.deferred_calls);
         }
     }
 }

@@ -62,17 +62,47 @@ pub fn prove_execution_with_profile(
     vm_profiler: bool,
 ) -> Result<ExecutionProof, ProverError> {
     let _profile = prover_profile_span("prove_execution", "all");
+    let trace = build_trace(bytecode, public_input, witness, whir_config, vm_profiler)?;
+    prove_trace(profile, bytecode, public_input, trace, whir_config)
+}
+
+/// Witness generation only: execute the bytecode and build the execution trace (the first half of
+/// [`prove_execution_with_profile`]). Touches no transcript; the result is fed to [`prove_trace`]
+/// with the same `bytecode`, `public_input` and `whir_config`. `build_trace` followed by
+/// `prove_trace` is exactly `prove_execution_with_profile` (same checks in the same order, same
+/// proof), which lets a caller build the next trace on another thread while one is being proved.
+pub fn build_trace(
+    bytecode: &Bytecode,
+    public_input: &[F; PUBLIC_INPUT_LEN],
+    witness: &ExecutionWitness,
+    whir_config: &WhirConfigBuilder,
+    vm_profiler: bool,
+) -> Result<ExecutionTrace, ProverError> {
+    check_rate(whir_config.starting_log_inv_rate).map_err(|_| ProverError::InvalidRate)?;
+    info_span!("Witness generation").in_scope(|| -> Result<_, ProverError> {
+        let execution_result = info_span!("Executing bytecode")
+            .in_scope(|| { let _p = prover_profile_span("execute", "all"); try_execute_bytecode(bytecode, public_input, witness, vm_profiler) })?;
+        Ok(info_span!("Building execution trace")
+            .in_scope(|| { let _p = prover_profile_span("trace", "all"); get_execution_trace(bytecode, execution_result, &witness.min_table_log_n_rows) }))
+    })
+}
+
+/// Proving only (the second half of [`prove_execution_with_profile`]): commitments, GKR, AIR
+/// sumcheck and WHIR over a trace from [`build_trace`]. A fresh `ProverState` per call.
+pub fn prove_trace(
+    profile: &Profile,
+    bytecode: &Bytecode,
+    public_input: &[F; PUBLIC_INPUT_LEN],
+    trace: ExecutionTrace,
+    whir_config: &WhirConfigBuilder,
+) -> Result<ExecutionProof, ProverError> {
+    // `build_trace` already checked the rate; repeated so a direct caller cannot skip it.
     check_rate(whir_config.starting_log_inv_rate).map_err(|_| ProverError::InvalidRate)?;
     let ExecutionTrace {
         mut traces,
         mut memory, // padded with zeros to next power of two
         metadata,
-    } = info_span!("Witness generation").in_scope(|| -> Result<_, ProverError> {
-        let execution_result = info_span!("Executing bytecode")
-            .in_scope(|| { let _p = prover_profile_span("execute", "all"); try_execute_bytecode(bytecode, public_input, witness, vm_profiler) })?;
-        Ok(info_span!("Building execution trace")
-            .in_scope(|| { let _p = prover_profile_span("trace", "all"); get_execution_trace(bytecode, execution_result, &witness.min_table_log_n_rows) }))
-    })?;
+    } = trace;
 
     // Tables outside the profile: must be empty (fail loud), then dropped from the commitment.
     for table in ALL_TABLES {

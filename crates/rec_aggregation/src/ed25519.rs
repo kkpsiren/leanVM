@@ -20,7 +20,8 @@ use backend::*;
 use lean_prover::ed25519_leaf::{
     ED25519_SCHEME_ID, MAX_LEAF_SIGS, SigRow, canonical_rows, leaf_hint_buffers, leaf_meta, root_seg,
 };
-use lean_prover::prove_execution::{ExecutionProof, prove_execution, prove_execution_with_profile};
+use lean_prover::prove_execution::{ExecutionProof, build_trace, prove_execution_with_profile, prove_trace};
+use lean_prover::trace_gen::ExecutionTrace;
 use lean_prover::*;
 use lean_vm::*;
 
@@ -66,6 +67,21 @@ pub fn expected_leaf_digest(rows: &[SigRow], seg_index: usize, blob_id: &[F; 9])
 }
 
 pub fn prove_ed25519_leaf(rows: &[SigRow], seg_index: usize, blob_id: &[F; 9], log_inv_rate: usize) -> Result<Ed25519LeafProof, String> {
+    let witness = build_ed25519_leaf_witness(rows, seg_index, blob_id, log_inv_rate)?;
+    prove_ed25519_leaf_witness(witness, log_inv_rate)
+}
+
+/// A leaf after witness generation (hints, VM execution, trace), before proving.
+struct Ed25519LeafWitness {
+    input_data: Vec<F>,
+    public_input: [F; PUBLIC_INPUT_LEN],
+    n_seg: usize,
+    n_groups: usize,
+    trace: ExecutionTrace,
+}
+
+/// First half of `prove_ed25519_leaf`: hints -> VM execution -> execution trace. No transcript.
+fn build_ed25519_leaf_witness(rows: &[SigRow], seg_index: usize, blob_id: &[F; 9], log_inv_rate: usize) -> Result<Ed25519LeafWitness, String> {
     let bytecode = get_aggregation_bytecode();
     let hints_span = prover_profile_span("leaf_hints", "all");
     let (rows, n_groups, meta, root, buffers) = leaf_hint_buffers(rows, seg_index, blob_id)?;
@@ -77,15 +93,30 @@ pub fn prove_ed25519_leaf(rows: &[SigRow], seg_index: usize, blob_id: &[F; 9], l
     for (name, v) in &buffers { hints.insert(bytecode, name, arena_vec![ArenaVec::from_slice(v)]); }
     let witness = ExecutionWitness { preamble_memory_len: PREAMBLE_MEMORY_LEN, hints, min_table_log_n_rows: Default::default() };
     drop(hints_span);
-    let proof = prove_execution(bytecode, &public_input, &witness, &default_whir_config(log_inv_rate), vm_profiler()).map_err(|e| format!("{e:?}"))?;
-    Ok(Ed25519LeafProof { input_data, n_seg: rows.len(), n_groups, proof })
+    let trace = build_trace(bytecode, &public_input, &witness, &default_whir_config(log_inv_rate), vm_profiler()).map_err(|e| format!("{e:?}"))?;
+    Ok(Ed25519LeafWitness { input_data, public_input, n_seg: rows.len(), n_groups, trace })
+}
+
+/// Second half of `prove_ed25519_leaf`: prove the trace (full profile, fresh transcript).
+fn prove_ed25519_leaf_witness(witness: Ed25519LeafWitness, log_inv_rate: usize) -> Result<Ed25519LeafProof, String> {
+    let Ed25519LeafWitness { input_data, public_input, n_seg, n_groups, trace } = witness;
+    let proof = {
+        let _p = prover_profile_span("prove_execution", "all");
+        prove_trace(&PROFILE_FULL, get_aggregation_bytecode(), &public_input, trace, &default_whir_config(log_inv_rate)).map_err(|e| format!("{e:?}"))?
+    };
+    Ok(Ed25519LeafProof { input_data, n_seg, n_groups, proof })
 }
 /// Verify a leaf proof WITHOUT binding it to a statement: proves only that SOME (rows, seg_index,
 /// blob_id) produced a valid leaf. Used by the node prover (the node's reader re-binds every leaf);
 /// a caller who cares which rows were signed must use `verify_ed25519_leaf_for`.
 pub(crate) fn verify_ed25519_leaf(leaf: &Ed25519LeafProof) -> Result<InnerVerified, ProofError> {
-    if leaf.input_data.first() != Some(&F::from_usize(ED25519_LEAF_FLAG)) { return Err(ProofError::InvalidProof); }
-    verify_inner(leaf.input_data.clone(), leaf.proof.proof.clone())
+    verify_ed25519_leaf_parts(leaf.input_data.clone(), leaf.proof.proof.clone())
+}
+
+/// `verify_ed25519_leaf` on owned parts (the blob pipeline moves them to its side thread).
+fn verify_ed25519_leaf_parts(input_data: Vec<F>, proof: Proof<F>) -> Result<InnerVerified, ProofError> {
+    if input_data.first() != Some(&F::from_usize(ED25519_LEAF_FLAG)) { return Err(ProofError::InvalidProof); }
+    verify_inner(input_data, proof)
 }
 
 /// Verify a leaf proof AND bind it to the caller's statement: the proof must be for exactly these
@@ -234,12 +265,8 @@ pub const NODE_FAN_IN: usize = 4;
 /// A single leaf still gets a top node, so the published artifact is always a node proof.
 pub fn prove_ed25519_blob(rows: &[SigRow], blob_id: &[F; 9], leaf_size: usize, leaf_log_inv_rate: usize, top_log_inv_rate: usize, log: &dyn Fn(String)) -> Result<Ed25519NodeProof, String> {
     let layout = BlobTreeLayout::new(rows.len(), leaf_size)?;
-    let leaves: Vec<Ed25519LeafProof> = rows.chunks(leaf_size).enumerate().map(|(k, chunk)| {
-        let t = std::time::Instant::now();
-        let leaf = prove_ed25519_leaf(chunk, k, blob_id, leaf_log_inv_rate)?;
-        log(format!("leaf {k}: {} sigs, {} signers, {:.1} s, {} KiB", leaf.n_seg, leaf.n_groups, t.elapsed().as_secs_f32(), leaf.proof.proof.proof_size_fe() * 4 / 1024));
-        Ok(leaf)
-    }).collect::<Result<_, String>>()?;
+    // one natively-verified child per leaf, in leaf order (see `prove_ed25519_leaves_pipelined`)
+    let mut leaf_checks: Vec<Option<LeafCheck>> = prove_ed25519_leaves_pipelined(rows, blob_id, leaf_size, leaf_log_inv_rate, log)?.into_iter().map(Some).collect();
     // level 0 = the leaves; each further level groups NODE_FAN_IN consecutive children into a node
     let mut level: Vec<Ed25519NodeProof> = Vec::new();
     for (depth, &n_children) in layout.level_widths().iter().enumerate() {
@@ -250,9 +277,16 @@ pub fn prove_ed25519_blob(rows: &[SigRow], blob_id: &[F; 9], leaf_size: usize, l
         for g in 0..n_children.div_ceil(NODE_FAN_IN) {
             let lo = g * NODE_FAN_IN;
             let hi = (lo + NODE_FAN_IN).min(n_children);
-            let children: Vec<Ed25519Child<'_>> = if first { leaves[lo..hi].iter().map(Ed25519Child::Leaf).collect() } else { level[lo..hi].iter().map(Ed25519Child::Node).collect() };
             let t = std::time::Instant::now();
-            let node = if top { prove_ed25519_top(&children, rate)? } else { prove_ed25519_node(&children, rate)? };
+            let node = if first {
+                // same as prove_ed25519_top/node over these leaves, with the child verification
+                // already done (identically) on the pipeline's side thread
+                let checks: Vec<LeafCheck> = leaf_checks[lo..hi].iter_mut().map(|c| c.take().expect("each leaf is used by exactly one node")).collect();
+                prove_ed25519_node_over_checked_leaves(if top { &PROFILE_TERMINAL } else { &PROFILE_FULL }, checks, rate)?
+            } else {
+                let children: Vec<Ed25519Child<'_>> = level[lo..hi].iter().map(Ed25519Child::Node).collect();
+                if top { prove_ed25519_top(&children, rate)? } else { prove_ed25519_node(&children, rate)? }
+            };
             log(format!("node over {} {}: rate 1/{}, {:.1} s, {} cycles, {} KiB{}", hi - lo, if first { "leaves" } else { "nodes" }, 1 << rate, t.elapsed().as_secs_f32(), node.proof.metadata.as_ref().map(|m| m.cycles).unwrap_or(0), node.proof.proof.proof_size_fe() * 4 / 1024, if top { " (top, terminal profile)" } else { "" }));
             next.push(node);
         }
@@ -260,6 +294,106 @@ pub fn prove_ed25519_blob(rows: &[SigRow], blob_id: &[F; 9], leaf_size: usize, l
         level = next;
     }
     unreachable!("a validated canonical layout always ends in a top node")
+}
+
+/// The native verification of one leaf as a node child would run it (`verify_ed25519_leaf`),
+/// including a panic payload, so the node can raise it at the point the serial path would.
+type LeafCheck = std::thread::Result<Result<InnerVerified, ProofError>>;
+
+/// Prove every leaf of the blob, in order, overlapping leaf k+1's witness generation (hints, VM
+/// execution, trace; mostly serial) with leaf k's proving (parallel) on ONE side thread, and
+/// natively verifying each finished leaf there too (what the first node level would otherwise do
+/// serially before proving). Returns the per-leaf verification results in leaf order.
+///
+/// - Output: each leaf keeps its own witness, `ProverState` and transcript, and is proved on this
+///   thread in index order, so every leaf proof, every `InnerVerified` and therefore every node
+///   proof is byte-identical to the serial path. Only scheduling changes.
+/// - Memory: the witness channel is a rendezvous (capacity 0), so the side thread holds at most
+///   one witness (being built, or built and waiting) while this thread proves another.
+/// - Errors: leaf k's witness error or panic is handed over as item k and raised here only after
+///   leaves 0..k-1 are proved and logged, exactly as serially; the side thread builds nothing past a
+///   failed leaf. A proving error on leaf k returns at once (the side thread stops at its next
+///   channel operation; a prefetched leaf k+1 is discarded, including its error or panic, since the
+///   serial path never reaches it). Verification errors/panics are deferred to the node, where
+///   `prove_ed25519_node_over_checked_leaves` raises them in child order.
+/// - The side thread is a plain OS thread, never a pool task: its pool dispatches (VM trace fill,
+///   verifier kernels) queue on the pool's dispatch mutex behind this thread's; none nest.
+fn prove_ed25519_leaves_pipelined(rows: &[SigRow], blob_id: &[F; 9], leaf_size: usize, log_inv_rate: usize, log: &dyn Fn(String)) -> Result<Vec<LeafCheck>, String> {
+    use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
+    use std::sync::mpsc;
+    type WitnessItem = std::thread::Result<Result<Ed25519LeafWitness, String>>;
+    enum Stop { Err(String), SideGone }
+    let n_leaves = rows.chunks(leaf_size).len();
+    std::thread::scope(|s| {
+        // Channels live inside the scope closure: if this thread unwinds, they drop before the scope
+        // joins the side thread, which then sees a closed channel and exits (no deadlock).
+        let (wit_tx, wit_rx) = mpsc::sync_channel::<WitnessItem>(0);
+        let (ver_tx, ver_rx) = mpsc::channel::<(Vec<F>, Proof<F>)>();
+        // Stack: at least what this thread may have (.cargo/config.toml sets RUST_MIN_STACK = 512 MiB
+        // for cargo-run threads; a spawned thread otherwise gets 2 MiB). Reserved lazily, no RSS cost.
+        let side = std::thread::Builder::new().name("ed25519-leaf-witness".into()).stack_size(512 << 20).spawn_scoped(s, move || -> Vec<LeafCheck> {
+            let mut checks: Vec<LeafCheck> = Vec::with_capacity(n_leaves);
+            let verify = |checks: &mut Vec<LeafCheck>, (input_data, proof): (Vec<F>, Proof<F>)| {
+                checks.push(catch_unwind(AssertUnwindSafe(|| verify_ed25519_leaf_parts(input_data, proof))));
+            };
+            for (k, chunk) in rows.chunks(leaf_size).enumerate() {
+                let item: WitnessItem = catch_unwind(AssertUnwindSafe(|| build_ed25519_leaf_witness(chunk, k, blob_id, log_inv_rate)));
+                let failed = !matches!(item, Ok(Ok(_)));
+                // blocks until the prover takes it, i.e. until leaf k-1 is proved (memory bound)
+                if wit_tx.send(item).is_err() || failed { return checks; }
+                // leaf k-1's proof was queued before the prover took item k: verify it while leaf k proves
+                while let Ok(job) = ver_rx.try_recv() { verify(&mut checks, job); }
+            }
+            drop(wit_tx);
+            while let Ok(job) = ver_rx.recv() { verify(&mut checks, job); }
+            checks
+        }).expect("failed to spawn the leaf witness thread");
+
+        let proved = (|| -> Result<(), Stop> {
+            for k in 0..n_leaves {
+                let t = std::time::Instant::now();
+                let witness = match wit_rx.recv().map_err(|_| Stop::SideGone)? {
+                    Ok(built) => built.map_err(Stop::Err)?,
+                    Err(payload) => resume_unwind(payload),
+                };
+                let leaf = prove_ed25519_leaf_witness(witness, log_inv_rate).map_err(Stop::Err)?;
+                log(format!("leaf {k}: {} sigs, {} signers, {:.1} s, {} KiB", leaf.n_seg, leaf.n_groups, t.elapsed().as_secs_f32(), leaf.proof.proof.proof_size_fe() * 4 / 1024));
+                // the side thread only exits early after a failed witness, which already returned above
+                ver_tx.send((leaf.input_data, leaf.proof.proof)).map_err(|_| Stop::SideGone)?;
+            }
+            Ok(())
+        })();
+        drop(wit_rx);
+        drop(ver_tx);
+        let joined = side.join();
+        match proved {
+            Ok(()) => {
+                let checks = joined.unwrap_or_else(|payload| resume_unwind(payload));
+                assert_eq!(checks.len(), n_leaves, "one verification per leaf");
+                Ok(checks)
+            }
+            Err(Stop::Err(e)) => Err(e),
+            Err(Stop::SideGone) => match joined {
+                Err(payload) => resume_unwind(payload),
+                Ok(_) => unreachable!("the leaf witness thread exited early without an error"),
+            },
+        }
+    })
+}
+
+/// `prove_ed25519_node_with` over leaf children whose native verification already ran
+/// (`LeafCheck`, in child order): same checks, same error strings, same panics in the same order,
+/// then the same `prove_node_from_verified`, so the node proof is identical.
+fn prove_ed25519_node_over_checked_leaves(profile: &Profile, checks: Vec<LeafCheck>, log_inv_rate: usize) -> Result<Ed25519NodeProof, String> {
+    if checks.is_empty() || checks.len() > MAX_RECURSIONS { return Err(format!("node: 1..={MAX_RECURSIONS} children")); }
+    let mut verified = Vec::with_capacity(checks.len());
+    let mut shape = Vec::with_capacity(checks.len());
+    for (i, check) in checks.into_iter().enumerate() {
+        let result = check.unwrap_or_else(|payload| std::panic::resume_unwind(payload));
+        verified.push(result.map_err(|e| format!("child {i} (leaf): {e:?}"))?);
+        shape.push(NodeShape::Leaf);
+    }
+    prove_node_from_verified(profile, verified, shape, log_inv_rate)
 }
 
 /// An INNER node (full profile: it is verified in-circuit by its parent).
@@ -275,13 +409,29 @@ pub fn prove_ed25519_top(children: &[Ed25519Child<'_>], log_inv_rate: usize) -> 
 pub fn prove_ed25519_node_with(profile: &Profile, children: &[Ed25519Child<'_>], log_inv_rate: usize) -> Result<Ed25519NodeProof, String> {
     if children.is_empty() || children.len() > MAX_RECURSIONS { return Err(format!("node: 1..={MAX_RECURSIONS} children")); }
     let verify_span = prover_profile_span("node_verify_children", "all");
+    // Native child verifications are independent, deterministic and (mostly) single-threaded, so
+    // they run on one scoped thread per child; results are consumed in child order, so the verified
+    // list, the shape and the first reported error are exactly those of the sequential loop. Any
+    // pool dispatch inside a verifier is serialized by the pool's dispatch lock.
+    let outcomes: Vec<Result<(InnerVerified, NodeShape), String>> = std::thread::scope(|s| {
+        let handles: Vec<_> = children.iter().enumerate().map(|(i, child)| {
+            std::thread::Builder::new()
+                .name(format!("node-verify-{i}"))
+                .stack_size(64 << 20)
+                .spawn_scoped(s, move || match child {
+                    Ed25519Child::Leaf(l) => verify_ed25519_leaf(l).map(|v| (v, NodeShape::Leaf)).map_err(|e| format!("child {i} (leaf): {e:?}")),
+                    Ed25519Child::Node(n) => verify_ed25519_node_self(n).map(|v| (v, NodeShape::Node { claim: n.bytecode_claim.clone(), children: n.shape.clone() })).map_err(|e| format!("child {i} (node): {e:?}")),
+                })
+                .expect("failed to spawn a child-verification thread")
+        }).collect();
+        handles.into_iter().map(|h| h.join().unwrap_or_else(|payload| std::panic::resume_unwind(payload))).collect()
+    });
     let mut verified = Vec::with_capacity(children.len());
     let mut shape = Vec::with_capacity(children.len());
-    for (i, child) in children.iter().enumerate() {
-        match child {
-            Ed25519Child::Leaf(l) => { verified.push(verify_ed25519_leaf(l).map_err(|e| format!("child {i} (leaf): {e:?}"))?); shape.push(NodeShape::Leaf); }
-            Ed25519Child::Node(n) => { verified.push(verify_ed25519_node_self(n).map_err(|e| format!("child {i} (node): {e:?}"))?); shape.push(NodeShape::Node { claim: n.bytecode_claim.clone(), children: n.shape.clone() }); }
-        }
+    for outcome in outcomes {
+        let (v, sh) = outcome?;
+        verified.push(v);
+        shape.push(sh);
     }
     drop(verify_span);
     prove_node_from_verified(profile, verified, shape, log_inv_rate)

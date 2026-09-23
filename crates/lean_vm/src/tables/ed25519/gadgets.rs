@@ -134,9 +134,131 @@ pub fn mod_mul(a: &[u8], b: &[u8], m: &[u8; 32]) -> [u8; 32] { int_to_limbs(&((l
 pub fn mod_add(a: &[u8], b: &[u8], m: &[u8; 32]) -> [u8; 32] { int_to_limbs(&((limbs_to_int(a) + limbs_to_int(b)).mod_floor(&modulus_int(m))), 32).try_into().unwrap() }
 pub fn mod_sub(a: &[u8], b: &[u8], m: &[u8; 32]) -> [u8; 32] { int_to_limbs(&((limbs_to_int(a) - limbs_to_int(b)).mod_floor(&modulus_int(m))), 32).try_into().unwrap() }
 pub fn mod_inv(a: &[u8], m: &[u8; 32]) -> [u8; 32] {
+    // p = 2^255 - 19 (every current caller): fixed-width Fermat inversion, the same a^(p-2) mod p in
+    // canonical form, without BigInt allocations. Any other modulus keeps the generic path.
+    if *m == P_25519 && a.len() == 32 {
+        let fast = fe25519::invert_bytes(a.try_into().unwrap());
+        debug_assert_eq!(fast, mod_inv_bigint(a, m), "fe25519 inversion disagrees with the BigInt reference");
+        return fast;
+    }
+    mod_inv_bigint(a, m)
+}
+
+/// Reference inversion (Fermat a^(m-2) mod m over BigInt); also the check for [`fe25519`].
+pub fn mod_inv_bigint(a: &[u8], m: &[u8; 32]) -> [u8; 32] {
     let mi = modulus_int(m); let ai = limbs_to_int(a).mod_floor(&mi);
     let e = &mi - BigInt::from(2); // Fermat: a^(m-2)
     int_to_limbs(&ai.modpow(&e, &mi), 32).try_into().unwrap()
+}
+
+/// Arithmetic mod p = 2^255 - 19 in radix 2^51 (five u64 limbs, u128 products), only what the
+/// witness generator's inversion needs. Witness-side only: it computes exactly the value the BigInt
+/// Fermat path computes (the inverse mod p is unique; 0 maps to 0), so traces are unchanged.
+mod fe25519 {
+    const MASK: u64 = (1u64 << 51) - 1;
+
+    /// Limbs are kept below 2^52 between operations.
+    #[derive(Clone, Copy)]
+    struct Fe([u64; 5]);
+
+    /// Little-endian 32 bytes (any value below 2^256) to a field element (reduced mod p lazily).
+    fn from_bytes(b: &[u8; 32]) -> Fe {
+        let w = |i: usize| u64::from_le_bytes(b[8 * i..8 * i + 8].try_into().unwrap());
+        let (w0, w1, w2, w3) = (w(0), w(1), w(2), w(3));
+        let l0 = w0 & MASK;
+        let l1 = ((w0 >> 51) | (w1 << 13)) & MASK;
+        let l2 = ((w1 >> 38) | (w2 << 26)) & MASK;
+        let l3 = ((w2 >> 25) | (w3 << 39)) & MASK;
+        let l4 = (w3 >> 12) & MASK; // bits 204..=254
+        // bit 255: 2^255 = 19 (mod p)
+        Fe([l0 + 19 * (w3 >> 63), l1, l2, l3, l4])
+    }
+
+    fn mul(a: &Fe, b: &Fe) -> Fe {
+        let (a, b) = (&a.0, &b.0);
+        let m = |x: u64, y: u64| (x as u128) * (y as u128);
+        let (b1_19, b2_19, b3_19, b4_19) = (b[1] * 19, b[2] * 19, b[3] * 19, b[4] * 19);
+        let c0 = m(a[0], b[0]) + m(a[4], b1_19) + m(a[3], b2_19) + m(a[2], b3_19) + m(a[1], b4_19);
+        let mut c1 = m(a[1], b[0]) + m(a[0], b[1]) + m(a[4], b2_19) + m(a[3], b3_19) + m(a[2], b4_19);
+        let mut c2 = m(a[2], b[0]) + m(a[1], b[1]) + m(a[0], b[2]) + m(a[4], b3_19) + m(a[3], b4_19);
+        let mut c3 = m(a[3], b[0]) + m(a[2], b[1]) + m(a[1], b[2]) + m(a[0], b[3]) + m(a[4], b4_19);
+        let mut c4 = m(a[4], b[0]) + m(a[3], b[1]) + m(a[2], b[2]) + m(a[1], b[3]) + m(a[0], b[4]);
+        let mask = MASK as u128;
+        c1 += c0 >> 51;
+        c2 += c1 >> 51;
+        c3 += c2 >> 51;
+        c4 += c3 >> 51;
+        // fold 2^255 = 19 back in (all in u128: no overflow for limbs below 2^52)
+        let t0 = (c0 & mask) + (c4 >> 51) * 19;
+        let r1 = (c1 & mask) + (t0 >> 51);
+        Fe([(t0 & mask) as u64, r1 as u64, (c2 & mask) as u64, (c3 & mask) as u64, (c4 & mask) as u64])
+    }
+
+    fn sq_n(a: &Fe, n: usize) -> Fe {
+        let mut x = *a;
+        for _ in 0..n {
+            x = mul(&x, &x);
+        }
+        x
+    }
+
+    /// Canonical little-endian bytes (value fully reduced into [0, p)).
+    fn to_bytes(a: &Fe) -> [u8; 32] {
+        // weak reduction: limbs < 2^51 except limb 0 < 2^51 + 19·2^13
+        let mut l = a.0;
+        let c = [l[0] >> 51, l[1] >> 51, l[2] >> 51, l[3] >> 51, l[4] >> 51];
+        l[0] = (l[0] & MASK) + c[4] * 19;
+        l[1] = (l[1] & MASK) + c[0];
+        l[2] = (l[2] & MASK) + c[1];
+        l[3] = (l[3] & MASK) + c[2];
+        l[4] = (l[4] & MASK) + c[3];
+        // now value < 2p: q = 1 iff value >= p
+        let mut q = (l[0] + 19) >> 51;
+        q = (l[1] + q) >> 51;
+        q = (l[2] + q) >> 51;
+        q = (l[3] + q) >> 51;
+        q = (l[4] + q) >> 51;
+        l[0] += 19 * q;
+        l[1] += l[0] >> 51;
+        l[0] &= MASK;
+        l[2] += l[1] >> 51;
+        l[1] &= MASK;
+        l[3] += l[2] >> 51;
+        l[2] &= MASK;
+        l[4] += l[3] >> 51;
+        l[3] &= MASK;
+        l[4] &= MASK; // drops 2^255, i.e. subtracts p together with the +19 above
+        let w0 = l[0] | (l[1] << 51);
+        let w1 = (l[1] >> 13) | (l[2] << 38);
+        let w2 = (l[2] >> 26) | (l[3] << 25);
+        let w3 = (l[3] >> 39) | (l[4] << 12);
+        let mut out = [0u8; 32];
+        out[0..8].copy_from_slice(&w0.to_le_bytes());
+        out[8..16].copy_from_slice(&w1.to_le_bytes());
+        out[16..24].copy_from_slice(&w2.to_le_bytes());
+        out[24..32].copy_from_slice(&w3.to_le_bytes());
+        out
+    }
+
+    /// a^(p-2) mod p, p - 2 = 2^255 - 21 (the ref10 addition chain: 254 squarings, 11 products).
+    pub(super) fn invert_bytes(a: &[u8; 32]) -> [u8; 32] {
+        let z = from_bytes(a);
+        let z2 = mul(&z, &z); // 2
+        let z8 = sq_n(&z2, 2); // 8
+        let z9 = mul(&z, &z8); // 9
+        let z11 = mul(&z2, &z9); // 11
+        let z22 = mul(&z11, &z11); // 22
+        let z_5_0 = mul(&z9, &z22); // 2^5 - 1
+        let z_10_0 = mul(&sq_n(&z_5_0, 5), &z_5_0); // 2^10 - 1
+        let z_20_0 = mul(&sq_n(&z_10_0, 10), &z_10_0); // 2^20 - 1
+        let z_40_0 = mul(&sq_n(&z_20_0, 20), &z_20_0); // 2^40 - 1
+        let z_50_0 = mul(&sq_n(&z_40_0, 10), &z_10_0); // 2^50 - 1
+        let z_100_0 = mul(&sq_n(&z_50_0, 50), &z_50_0); // 2^100 - 1
+        let z_200_0 = mul(&sq_n(&z_100_0, 100), &z_100_0); // 2^200 - 1
+        let z_250_0 = mul(&sq_n(&z_200_0, 50), &z_50_0); // 2^250 - 1
+        let r = mul(&sq_n(&z_250_0, 5), &z11); // 2^255 - 32 + 11 = 2^255 - 21
+        to_bytes(&r)
+    }
 }
 
 #[cfg(test)]
@@ -178,6 +300,29 @@ mod tests {
                 assert!(!dbg.fails.is_empty());
             }
         }
+    }
+
+    #[test]
+    fn fe25519_inverse_matches_bigint_reference() {
+        let p = P_25519;
+        let from_u64 = |x: u64| { let mut o = [0u8; 32]; o[..8].copy_from_slice(&x.to_le_bytes()); o };
+        let add_small = |a: [u8; 32], k: u64| -> [u8; 32] { int_to_limbs(&((limbs_to_int(&a) + BigInt::from(k)) % BigInt::from(2u8).pow(256)), 32).try_into().unwrap() };
+        let sub_small = |a: [u8; 32], k: u64| -> [u8; 32] { int_to_limbs(&(limbs_to_int(&a) - BigInt::from(k)), 32).try_into().unwrap() };
+        let mut edge: Vec<[u8; 32]> = vec![[0u8; 32], [0xFFu8; 32], from_u64(1), from_u64(2), from_u64(19), from_u64(u64::MAX), p, add_small(p, 1), add_small(p, 2), sub_small(p, 1), sub_small(p, 2)];
+        let mut top = [0u8; 32]; top[31] = 0x80; edge.push(top); edge.push(add_small(top, 1)); edge.push(sub_small(top, 1));
+        edge.push(add_small(add_small(p, 0), 0x7FFF_FFFF)); // p + small multiple region
+        let two_p: [u8; 32] = int_to_limbs(&(limbs_to_int(&p) * BigInt::from(2u8)), 32).try_into().unwrap();
+        edge.extend([two_p, add_small(two_p, 1), sub_small(two_p, 1)]);
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        for _ in 0..2000 { edge.push(rnd(&mut seed)); }
+        for a in edge {
+            let fast = fe25519::invert_bytes(&a);
+            assert_eq!(fast, mod_inv_bigint(&a, &p), "inverse mismatch for {a:?}");
+            assert_eq!(mod_inv(&a, &p), fast);
+        }
+        // the non-p modulus keeps the reference path
+        let a = rnd(&mut seed);
+        assert_eq!(mod_inv(&a, &L_25519), mod_inv_bigint(&a, &L_25519));
     }
 
     #[test]

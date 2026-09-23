@@ -15,6 +15,47 @@ pub use scalar_table::{SCALAR_L_NAME, ScalarLTable};
 pub use sha512_table::{SHA512_NAME, Sha512Table};
 pub use signer_scalar_table::{SIGNER_SCALAR_NAME, SignerScalarTable};
 
+use crate::{F, Table, TableTrace};
+use backend::*;
+use std::collections::BTreeMap;
+
+/// Post-pass for the deferred precompile tables (ed_sig, sha512): during execution their `execute`
+/// computes only the memory outputs and records each call in `TableTrace::deferred_calls`; here the
+/// full witness rows are built from those records, in call order, in parallel, column-major. Must run
+/// before anything reads these traces (`fill_trace_ed_add`, `pad_table`) and outside any pool task
+/// (it falls back to a sequential loop inside one).
+pub fn fill_deferred_precompile_traces(traces: &mut BTreeMap<Table, TableTrace>) {
+    if let Some(tr) = traces.get_mut(&Table::ed_sig()) {
+        let _p = prover_profile_span("trace_fill", "ed_sig");
+        edsig_table::fill_trace_ed_sig(tr);
+    }
+    if let Some(tr) = traces.get_mut(&Table::sha512()) {
+        let _p = prover_profile_span("trace_fill", "sha512");
+        sha512_table::fill_trace_sha512(tr);
+    }
+}
+
+/// `f(i)` for every `i` in `0..n`: on the pool when dispatching is allowed, else sequentially.
+pub(crate) fn for_each_call(n: usize, f: impl Fn(usize) + Sync) {
+    if parallel::is_in_pool_task() || parallel::parallelism_forbidden() {
+        (0..n).for_each(f);
+    } else {
+        parallel::for_each_index(n, f);
+    }
+}
+
+/// Replace every (still empty) column of `trace` by a zeroed column of `n_rows` rows and return one
+/// shareable base pointer per column, for disjoint per-row writes from pool tasks.
+pub(crate) fn alloc_deferred_columns(trace: &mut TableTrace, name: &str, n_cols: usize, n_rows: usize) -> Vec<parallel::SendPtr<F>> {
+    assert_eq!(trace.columns.len(), n_cols, "{name}: unexpected column count");
+    for col in trace.columns.iter_mut() {
+        assert!(col.is_empty(), "{name}: rows were pushed outside the deferred path");
+        // SAFETY: the all-zero bit pattern is F::ZERO (Montgomery form), as in trace_gen's `zeroed` columns.
+        *col = unsafe { ArenaVec::<F>::zeroed(n_rows) };
+    }
+    trace.columns.iter_mut().map(|c| parallel::SendPtr(c.as_mut_ptr())).collect()
+}
+
 #[cfg(test)]
 mod range_coverage {
     #[test]
