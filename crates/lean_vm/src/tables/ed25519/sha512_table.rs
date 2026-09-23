@@ -9,6 +9,7 @@
 //! Carries of the round additions are U4 range pushes; the digest bytes are U8 pushes.
 
 use crate::execution::memory::MemoryAccess;
+use crate::tables::ed25519::{alloc_deferred_columns, for_each_call};
 use crate::*;
 use backend::*;
 
@@ -314,12 +315,44 @@ impl<const BUS: bool> TableT for Sha512Table<BUS> {
         let mut cells = [F::ZERO; 128];
         ctx.memory.get_slice_into(in_ptr, &mut cells)?;
         let block: [u8; 128] = std::array::from_fn(|i| { let v = cells[i].as_canonical_u32(); assert!(v < 256, "sha512: block cell is not a byte"); v as u8 });
-        let rows = block_rows(&block_words(&block), in_ptr, out_ptr, zero_ptr);
-        ctx.memory.set_slice(out_ptr, &rows[ROUND_ROWS][COL_OUT..COL_OUT + 64])?;
+        // only what the program reads back: the digest cells (= block_rows(..)[ROUND_ROWS][COL_OUT..COL_OUT + 64],
+        // which block_rows fills with the bytes of the same `digest_bytes(&sha512_block(words))`); the 21
+        // rows are built after execution by `fill_trace_sha512` from the recorded call
+        let digest = digest_bytes(&sha512_block(&block_words(&block)));
+        let out: [F; 64] = std::array::from_fn(|j| F::from_usize(digest[j] as usize));
+        ctx.memory.set_slice(out_ptr, &out[..])?;
         let trace = ctx.traces.get_mut(&self.table()).unwrap();
-        for row in &rows { for (i, v) in row.iter().enumerate() { trace.columns[i].push(*v); } }
+        trace.deferred_calls.push(arg_a);
+        trace.deferred_calls.push(arg_b);
+        trace.deferred_calls.push(arg_c);
+        trace.deferred_calls.extend_from_slice(&cells);
+        let _ = (in_ptr, zero_ptr);
         Ok(())
     }
+}
+
+/// One recorded call in `TableTrace::deferred_calls`: [in_ptr, out_ptr, zero_ptr, block cells (128)].
+pub const CALL_RECORD_LEN: usize = 3 + 128;
+
+/// Post-pass: the sha512 trace = the 21 `block_rows` of every recorded call, in call order (the rows
+/// `execute` used to push one by one), built in parallel and written column-major into preallocated columns.
+pub fn fill_trace_sha512(trace: &mut TableTrace) {
+    let rec = std::mem::take(&mut trace.deferred_calls);
+    assert_eq!(rec.len() % CALL_RECORD_LEN, 0, "sha512: truncated call record");
+    let n = rec.len() / CALL_RECORD_LEN;
+    if n == 0 { return; }
+    let bases = alloc_deferred_columns(trace, "sha512", N_COLS, n * ROWS_PER_BLOCK);
+    for_each_call(n, |call| {
+        let c = &rec[call * CALL_RECORD_LEN..(call + 1) * CALL_RECORD_LEN];
+        let block: [u8; 128] = std::array::from_fn(|i| { let v = c[3 + i].as_canonical_u32(); assert!(v < 256, "sha512: block cell is not a byte"); v as u8 });
+        let rows = block_rows(&block_words(&block), c[0].to_usize(), c[1].to_usize(), c[2].to_usize());
+        // SAFETY: rows call*21 .. call*21+21 of every column are written by this task only; the columns
+        // hold n*21 rows and are not otherwise accessed until the dispatch returns.
+        for (j, row) in rows.iter().enumerate() {
+            let r = call * ROWS_PER_BLOCK + j;
+            for (k, v) in row.iter().enumerate() { unsafe { *bases[k].add(r) = *v; } }
+        }
+    });
 }
 
 /// Range classes: round carries (≤ 7) are U4, digest bytes U8. Everything else is boolean or a
@@ -412,5 +445,39 @@ mod tests {
         let d = digest_bytes(&sha512_block(&block_words(&pad_single_block(b"abc"))));
         let hex: String = d.iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(hex, "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f", "digest = {hex}");
+    }
+}
+
+#[cfg(test)]
+mod deferred_tests {
+    use super::*;
+
+    /// The post-pass rebuilds exactly the rows `execute` used to push, in call order, and the digest
+    /// `execute` writes equals the digest row's output cells.
+    #[test]
+    fn deferred_fill_matches_pushed_rows() {
+        let msgs: [&[u8]; 3] = [b"abc", b"", &[0xa5u8; 111]];
+        let mut trace = TableTrace::new(&Table::sha512());
+        let mut expect: Vec<[F; N_COLS]> = vec![];
+        for (i, msg) in msgs.iter().enumerate() {
+            let block = pad_single_block(msg);
+            let (in_ptr, out_ptr, zero_ptr) = (4096 + 128 * i, 90_000 + 64 * i, 7);
+            trace.deferred_calls.push(F::from_usize(in_ptr));
+            trace.deferred_calls.push(F::from_usize(out_ptr));
+            trace.deferred_calls.push(F::from_usize(zero_ptr));
+            for b in block { trace.deferred_calls.push(F::from_usize(b as usize)); }
+            let rows = block_rows(&block_words(&block), in_ptr, out_ptr, zero_ptr);
+            let digest = digest_bytes(&sha512_block(&block_words(&block)));
+            let out: Vec<F> = digest.iter().map(|&b| F::from_usize(b as usize)).collect();
+            assert_eq!(out[..], rows[ROUND_ROWS][COL_OUT..COL_OUT + 64]);
+            expect.extend(rows);
+        }
+        fill_trace_sha512(&mut trace);
+        assert!(trace.deferred_calls.is_empty());
+        assert_eq!(trace.columns.len(), N_COLS);
+        for c in 0..N_COLS {
+            assert_eq!(trace.columns[c].len(), expect.len());
+            for (r, row) in expect.iter().enumerate() { assert_eq!(trace.columns[c][r], row[c], "cell ({r}, {c})"); }
+        }
     }
 }

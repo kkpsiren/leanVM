@@ -8,6 +8,7 @@
 use crate::execution::memory::MemoryAccess;
 use crate::tables::ed25519::curve::*;
 use crate::tables::ed25519::gadgets::*;
+use crate::tables::ed25519::{alloc_deferred_columns, for_each_call};
 use crate::*;
 use backend::*;
 
@@ -155,13 +156,82 @@ impl<const BUS: bool> TableT for EdSigTable<BUS> {
         ctx.memory.get_slice_into(q_ptr, &mut cells)?;
         let byte = |x: F| -> u8 { let v = x.as_canonical_u32(); assert!(v < 256, "ed_sig: Q limb is not a byte"); v as u8 };
         let q = Affine { x: std::array::from_fn(|i| byte(cells[i])), y: std::array::from_fn(|i| byte(cells[32 + i])) };
-        let row = make_row(&q, q_ptr, out_ptr);
-        ctx.memory.set_slice(out_ptr, &row[COL_OUT..COL_OUT + N_OUT])?;
+        // only what the program reads back: the 97 output cells (= make_row(..)[COL_OUT..COL_OUT + N_OUT]);
+        // the full row is built after execution by `fill_trace_ed_sig` from the recorded call
+        let out = output_cells(&q);
+        ctx.memory.set_slice(out_ptr, &out[..])?;
         let trace = ctx.traces.get_mut(&self.table()).unwrap();
-        for (i, v) in row.iter().enumerate() { trace.columns[i].push(*v); }
+        trace.deferred_calls.push(arg_a);
+        trace.deferred_calls.push(arg_b);
+        trace.deferred_calls.extend_from_slice(&cells);
         let _ = arg_c;
         Ok(())
     }
+}
+
+/// One recorded call in `TableTrace::deferred_calls`: [q_ptr, out_ptr, Q cells (64)].
+pub const CALL_RECORD_LEN: usize = 2 + 64;
+
+/// Post-pass: the ed_sig trace = `make_row` of every recorded call, in call order (the rows `execute`
+/// used to push one by one), built in parallel and written column-major into preallocated columns.
+pub fn fill_trace_ed_sig(trace: &mut TableTrace) {
+    let rec = std::mem::take(&mut trace.deferred_calls);
+    assert_eq!(rec.len() % CALL_RECORD_LEN, 0, "ed_sig: truncated call record");
+    let n = rec.len() / CALL_RECORD_LEN;
+    if n == 0 { return; }
+    let bases = alloc_deferred_columns(trace, "ed_sig", N_COLS, n);
+    for_each_call(n, |r| {
+        let c = &rec[r * CALL_RECORD_LEN..(r + 1) * CALL_RECORD_LEN];
+        let byte = |x: F| -> u8 { let v = x.as_canonical_u32(); assert!(v < 256, "ed_sig: Q limb is not a byte"); v as u8 };
+        let q = Affine { x: std::array::from_fn(|i| byte(c[2 + i])), y: std::array::from_fn(|i| byte(c[2 + 32 + i])) };
+        let row = make_row(&q, c[0].to_usize(), c[1].to_usize());
+        // SAFETY: row r of every column is written by this task only; the columns hold n rows and
+        // are not otherwise accessed until the dispatch returns.
+        for (k, v) in row.iter().enumerate() { unsafe { *bases[k].add(r) = *v; } }
+    });
+}
+
+/// The 97 output cells P.x ‖ P.y ‖ b ‖ nx exactly as `make_row(q, ..)[COL_OUT..COL_OUT + N_OUT]`, without
+/// the witness. `make_row` doubles three times with the complete affine formula (two inversions each);
+/// here P = 8Q comes from three projective doublings (RFC 8032 §5.1.4, a = −1) and ONE inversion. For Q on
+/// the curve the affine doubling formula is the group doubling (its denominators 1 ± d·x²·y² never vanish,
+/// d a non-square), and so is the projective one (Z3 = F·G with G = −Z²(1 + d x² y²), F = Z²(1 − d x² y²),
+/// never 0), so both give the same point and its canonical affine coordinates are the same bytes. The
+/// panics `make_row` raises on a bad Q are raised here first, with the same messages.
+pub fn output_cells(q: &Affine) -> [F; N_OUT] {
+    use num_bigint::BigInt;
+    use num_integer::Integer;
+    use num_traits::Zero;
+    assert!(is_on_curve(q), "ed_sig: Q is not on the curve");
+    assert!(q.x[31] < 128, "x must be < 2^255"); // make_row's carry check on u = 2·x at doubling 0
+    let m = modulus_int(&P_25519);
+    let md = |x: BigInt| -> BigInt { x.mod_floor(&m) };
+    let (mut x, mut y, mut z) = (limbs_to_int(&q.x), limbs_to_int(&q.y), BigInt::from(1u8));
+    for _ in 0..3 {
+        let a = md(&x * &x);
+        let b = md(&y * &y);
+        let c = md(BigInt::from(2u8) * &z * &z);
+        let h = md(&a + &b);
+        let xy = &x + &y;
+        let e = md(&h - &xy * &xy);
+        let g = md(&a - &b);
+        let f = md(&c + &g);
+        x = md(&e * &f);
+        y = md(&g * &h);
+        z = md(&f * &g);
+    }
+    assert!(!z.is_zero(), "ed_sig: degenerate doubling (Q is not on the curve)");
+    let zi = z.modpow(&(&m - BigInt::from(2u8)), &m);
+    let px: [u8; 32] = int_to_limbs(&md(&x * &zi), 32).try_into().unwrap();
+    let py: [u8; 32] = int_to_limbs(&md(&y * &zi), 32).try_into().unwrap();
+    let one = { let mut o = [0u8; 32]; o[0] = 1; o };
+    assert!(!(px == [0u8; 32] && py == one), "P is the identity"); // make_row: target = P.y − 1 = 0 iff P = (0, 1)
+    let fu = |b: u8| F::from_usize(b as usize);
+    let mut out = [F::ZERO; N_OUT];
+    for i in 0..32 { out[COL_PX - COL_OUT + i] = fu(px[i]); out[COL_PY - COL_OUT + i] = fu(py[i]); }
+    out[COL_B - COL_OUT] = fu(px[0] & 1);
+    { let mut borrow = 0i32; for i in 0..32 { let mut dd = P_25519[i] as i32 - px[i] as i32 - borrow; borrow = 0; if dd < 0 { dd += 256; borrow = 1; } out[COL_NX - COL_OUT + i] = fu(dd as u8); } assert_eq!(borrow, 0); }
+    out
 }
 
 /// Every limb column by range class: (bytes, u16 witness limbs, 7-bit).
@@ -237,3 +307,43 @@ pub fn make_row(q: &Affine, q_ptr: usize, out_ptr: usize) -> [F; N_COLS] {
 
 /// R bytes as the driver assembles them: P.y with byte 31 |= 128·b.
 pub fn r_bytes_of(row: &[F]) -> [u8; 32] { let mut r = [0u8; 32]; for i in 0..32 { r[i] = row[COL_PY + i].as_canonical_u32() as u8; } r[31] |= (row[COL_B].as_canonical_u32() as u8) << 7; r }
+
+#[cfg(test)]
+mod deferred_tests {
+    use super::*;
+
+    /// The execution-time output (projective 8Q, one inversion) equals make_row's output block cell for cell.
+    #[test]
+    fn output_cells_match_make_row() {
+        let mut pts = random_points(24, 11);
+        // a point with a small-order component: Q + (0, −1) (order-2 torsion), still on the curve
+        let t2 = Affine { x: [0u8; 32], y: mod_sub(&[0u8; 32], &NEUTRAL.y, &P_25519) };
+        pts.push(affine_add(&pts[0], &t2));
+        for q in &pts {
+            let row = make_row(q, 0, 0);
+            assert_eq!(output_cells(q)[..], row[COL_OUT..COL_OUT + N_OUT], "output mismatch for {q:?}");
+        }
+    }
+
+    /// The post-pass rebuilds exactly the rows `execute` used to push, in call order.
+    #[test]
+    fn deferred_fill_matches_pushed_rows() {
+        let pts = random_points(9, 5);
+        let mut trace = TableTrace::new(&Table::ed_sig());
+        let mut expect: Vec<[F; N_COLS]> = vec![];
+        for (i, q) in pts.iter().enumerate() {
+            let (q_ptr, out_ptr) = (1000 + 200 * i, 50_000 + 97 * i);
+            trace.deferred_calls.push(F::from_usize(q_ptr));
+            trace.deferred_calls.push(F::from_usize(out_ptr));
+            for b in q.x.iter().chain(q.y.iter()) { trace.deferred_calls.push(F::from_usize(*b as usize)); }
+            expect.push(make_row(q, q_ptr, out_ptr));
+        }
+        fill_trace_ed_sig(&mut trace);
+        assert!(trace.deferred_calls.is_empty());
+        assert_eq!(trace.columns.len(), N_COLS);
+        for c in 0..N_COLS {
+            assert_eq!(trace.columns[c].len(), expect.len());
+            for (r, row) in expect.iter().enumerate() { assert_eq!(trace.columns[c][r], row[c], "cell ({r}, {c})"); }
+        }
+    }
+}

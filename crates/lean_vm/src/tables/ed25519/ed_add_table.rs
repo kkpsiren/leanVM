@@ -258,6 +258,12 @@ struct Step { kind: Kind, j: usize, b: usize, sgn: u8, ptr: usize, empty: bool, 
 
 /// One chain (forward order); returns its rows in REVERSE order (head first) and the total.
 fn chain_rows(steps: &[Step], zero_ptr: usize, is_final: bool) -> (Vec<[F; N_COLS]>, Affine) {
+    chain_rows_with_partials(steps, zero_ptr, is_final, None)
+}
+
+/// [`chain_rows`], optionally also recording every partial sum `acc_k = acc_{k-1} + p_k` (forward
+/// order, `acc_{-1}` = the neutral element) into `partials`.
+fn chain_rows_with_partials(steps: &[Step], zero_ptr: usize, is_final: bool, mut partials: Option<&mut Vec<Affine>>) -> (Vec<[F; N_COLS]>, Affine) {
     let fu = |b: u8| F::from_usize(b as usize);
     let m = &P_25519;
     let mut acc = NEUTRAL; let mut rows = vec![];
@@ -305,6 +311,7 @@ fn chain_rows(steps: &[Step], zero_ptr: usize, is_final: bool) -> (Vec<[F; N_COL
             }
         }
         rows.push(row); acc = out;
+        if let Some(p) = partials.as_deref_mut() { p.push(out); }
     }
     rows.reverse();
     (rows, acc)
@@ -349,10 +356,13 @@ pub fn fill_trace_ed_add(traces: &mut BTreeMap<Table, TableTrace>, memory: &[F],
         parallel::par_map_collect(bucket_list.len(), |i| chain_rows(&bucket_list[i].1, zero_ptr, false));
     let totals: BTreeMap<(usize, usize), Affine> = bucket_list.iter().zip(&bucket_out).map(|((k, _), (_, t))| (*k, *t)).collect();
     let window_out: Vec<(Vec<[F; N_COLS]>, Vec<[F; N_COLS]>, Affine)> = parallel::par_map_collect(N_WINDOWS, |j| {
-        let mut red1 = vec![]; let mut sb = vec![];
-        let mut s = NEUTRAL;
-        for b in (1..=N_BUCKETS).rev() { let p = totals.get(&(j, b)).copied(); red1.push(Step { kind: Kind::Red1, j, b, sgn: 0, ptr: 0, empty: p.is_none(), cnt: 0, p: p.unwrap_or(NEUTRAL) }); s = affine_add(&s, &p.unwrap_or(NEUTRAL)); sb.push(s); }
-        let (r1, _) = chain_rows(&red1, zero_ptr, false);
+        let mut red1 = Vec::with_capacity(N_BUCKETS);
+        for b in (1..=N_BUCKETS).rev() { let p = totals.get(&(j, b)).copied(); red1.push(Step { kind: Kind::Red1, j, b, sgn: 0, ptr: 0, empty: p.is_none(), cnt: 0, p: p.unwrap_or(NEUTRAL) }); }
+        // The red1 chain's partial sums ARE the running sums s_b (s = NEUTRAL, then s = s + p_b in the
+        // same order and argument order), so take them from the chain instead of a second chain of
+        // 512 identical additions per window.
+        let mut sb = Vec::with_capacity(N_BUCKETS);
+        let (r1, _) = chain_rows_with_partials(&red1, zero_ptr, false, Some(&mut sb));
         let red2: Vec<Step> = (1..=N_BUCKETS).rev().enumerate().map(|(i, b)| Step { kind: Kind::Red2, j, b, sgn: 0, ptr: 0, empty: false, cnt: 0, p: sb[i] }).collect();
         let (r2, t) = chain_rows(&red2, zero_ptr, false);
         (r1, r2, t)
